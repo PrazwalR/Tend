@@ -1,0 +1,35 @@
+# Docs dumps — reference only, never commit/push
+uniswapv4.md
+*.docs.md
+docs-*.md
+/docs-reference/
+
+# Secrets
+.env
+.env.*
+
+
+# Rust
+/target/
+**/target/
+
+# Foundry
+/contracts/out/
+/contracts/cache/
+/contracts/broadcast/
+
+# Node / TS
+node_modules/
+dist/
+*.tsbuildinfo
+packages/sdk/src/generated/
+
+# Local data
+*.sqlite
+*.sqlite-*
+*.db
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

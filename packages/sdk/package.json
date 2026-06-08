@@ -1,0 +1,32 @@
+{
+  "name": "@lp-autopilot/sdk",
+  "version": "0.1.0",
+  "description": "TypeScript Connect-ES client for the LP Autopilot strategy engine",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": ["dist", "src/generated"],
+  "scripts": {
+    "generate": "buf generate ../../proto",
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "ping": "tsx src/ping-check.ts"
+  },
+  "dependencies": {
+    "@bufbuild/protobuf": "^2",
+    "@connectrpc/connect": "^2",
+    "@connectrpc/connect-web": "^2"
+  },
+  "devDependencies": {
+    "@bufbuild/buf": "^1",
+    "@bufbuild/protoc-gen-es": "^2",
+    "tsx": "^4",
+    "typescript": "^5"
+  }
+}

@@ -1,0 +1,130 @@
+syntax = "proto3";
+package autopilot.v1;
+
+message PoolKey {
+  string currency0 = 1;
+  string currency1 = 2;
+  uint32 fee = 3;
+  int32 tick_spacing = 4;
+  string hooks = 5;
+}
+
+message TickRange {
+  int32 tick_lower = 1;
+  int32 tick_upper = 2;
+}
+
+message PositionState {
+  string position_id = 1;
+  string owner = 2;
+  PoolKey pool_key = 3;
+  TickRange current_range = 4;
+  int32 current_tick = 5;
+  string liquidity = 6;
+  string token0_amount = 7;
+  string token1_amount = 8;
+  string fees_earned_0 = 9;
+  string fees_earned_1 = 10;
+  double il_percent = 11;
+  double fee_apr = 12;
+  bool in_range = 13;
+  uint64 last_updated_at = 14;
+  string chain_id = 15;
+}
+
+message RebalanceCommand {
+  string position_id = 1;
+  TickRange new_range = 2;
+  string reason = 3;
+  Strategy strategy_used = 4;
+  double estimated_gas_usd = 5;
+  uint32 slippage_bps = 6;
+  bool collect_fees = 7;
+}
+
+enum Strategy {
+  STRATEGY_UNSPECIFIED = 0;
+  STRATEGY_BOLLINGER = 1;
+  STRATEGY_IL_THRESHOLD = 2;
+  STRATEGY_FEE_CAPTURE = 3;
+  STRATEGY_MANUAL = 4;
+}
+
+message RebalanceResult {
+  string position_id = 1;
+  bool success = 2;
+  string tx_hash = 3;
+  string gas_used = 4;
+  string error_message = 5;
+  TickRange new_range = 6;
+  uint64 executed_at = 7;
+}
+
+service AutopilotMonitor {
+  rpc StreamPositions(StreamPositionsRequest) returns (stream PositionState);
+  rpc ExecuteRebalance(RebalanceCommand) returns (RebalanceResult);
+  rpc Ping(PingRequest) returns (PingResponse);
+}
+
+service AutopilotStrategy {
+  rpc Ping(PingRequest) returns (PingResponse);
+  rpc RegisterPosition(RegisterPositionRequest) returns (RegisterPositionResponse);
+  rpc DeregisterPosition(DeregisterPositionRequest) returns (DeregisterPositionResponse);
+  rpc GetPositionConfig(GetPositionConfigRequest) returns (PositionConfig);
+  rpc UpdateConfig(UpdateConfigRequest) returns (UpdateConfigResponse);
+}
+
+message StreamPositionsRequest {
+  repeated string position_ids = 1;
+}
+
+message PingRequest {}
+message PingResponse {
+  uint64 timestamp = 1;
+}
+
+message PositionConfig {
+  string position_id = 1;
+  Strategy strategy = 2;
+  double il_threshold_pct = 3;
+  double fee_capture_ratio = 4;
+  uint32 bollinger_period = 5;
+  double bollinger_stddev = 6;
+  double max_gas_usd = 7;
+  bool auto_compound_fees = 8;
+  bool use_flashbots = 9;
+}
+
+message RegisterPositionRequest {
+  string owner = 1;
+  PoolKey pool_key = 2;
+  TickRange tick_range = 3;
+  PositionConfig config = 4;
+  string chain_id = 5;
+}
+
+message RegisterPositionResponse {
+  string position_id = 1;
+  bool success = 2;
+}
+
+message DeregisterPositionRequest {
+  string position_id = 1;
+}
+
+message DeregisterPositionResponse {
+  bool success = 1;
+}
+
+message GetPositionConfigRequest {
+  string position_id = 1;
+}
+
+message UpdateConfigRequest {
+  string position_id = 1;
+  PositionConfig config = 2;
+}
+
+message UpdateConfigResponse {
+  bool success = 1;
+}
