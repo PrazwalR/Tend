@@ -19,6 +19,13 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 dotenvy = { workspace = true }
+alloy = { workspace = true }
+rusqlite = { workspace = true }
+dashmap = { workspace = true }
+futures-util = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [build-dependencies]
 tonic-prost-build = { workspace = true }

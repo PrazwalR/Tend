@@ -21,3 +21,8 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 dotenvy = "0.15"
+alloy = { version = "1", features = ["full"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+dashmap = "6"
+futures-util = "0.3"
+tempfile = "3"
