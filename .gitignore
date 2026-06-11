@@ -1,5 +1,5 @@
 # Docs dumps — reference only, never commit/push
-uniswapv4.md
+
 *.docs.md
 docs-*.md
 /docs-reference/
