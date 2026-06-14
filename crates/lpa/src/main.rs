@@ -4,6 +4,9 @@ mod proto;
 mod serve;
 mod strategy;
 
+#[cfg(test)]
+mod pipeline_tests;
+
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};

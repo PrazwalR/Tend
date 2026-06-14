@@ -33,7 +33,7 @@ impl ChainConfig {
                 name: "ethereum",
                 addrs: ChainAddrs {
                     pool_manager: address!("0x000000000004444c5dc75cb358380d2e3de08a90"),
-                    state_view: address!("0x7ffe42c4a5deea5b0fec41c94c136cf115597ea0"),
+                    state_view: address!("0x7ffe42c4a5deea5b0fec41c94c136cf115597227"),
                     position_manager: address!("0xbd216513d74c8cf14cf4747e6aaa6420ff64ee9e"),
                 },
             }),
@@ -50,5 +50,27 @@ impl ChainConfig {
     pub fn http_url(&self) -> Result<String> {
         let key = if self.name == "base" { "RPC_BASE" } else { "RPC_ETHEREUM" };
         std::env::var(key).map_err(|_| anyhow!("{key} not set in env"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ChainConfig;
+
+    #[test]
+    fn known_chains_resolve() {
+        assert_eq!(ChainConfig::from_name("base").unwrap().chain_id, 8453);
+        assert_eq!(ChainConfig::from_name("eth").unwrap().chain_id, 1);
+        assert_eq!(ChainConfig::from_name("MAINNET").unwrap().chain_id, 1);
+        assert!(ChainConfig::from_name("solana").is_err());
+    }
+
+    #[test]
+    fn addresses_distinct_per_chain() {
+        let b = ChainConfig::from_name("base").unwrap().addrs;
+        assert_ne!(b.pool_manager, b.state_view);
+        assert_ne!(b.pool_manager, b.position_manager);
+        let e = ChainConfig::from_name("ethereum").unwrap().addrs;
+        assert_ne!(e.state_view, b.state_view);
     }
 }

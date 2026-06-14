@@ -142,3 +142,18 @@ fn propose_rebalance(
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Swap;
+    use alloy::primitives::b256;
+    use alloy::sol_types::SolEvent;
+
+    #[test]
+    fn swap_signature_matches_mainnet_topic0() {
+        assert_eq!(
+            Swap::SIGNATURE_HASH,
+            b256!("0x40e9cecb9f5f1f1c5b9c97dec2917b7ee92e57ba5563708daca94dd84ad7112f")
+        );
+    }
+}
