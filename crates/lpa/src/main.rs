@@ -2,6 +2,7 @@ mod chain;
 mod position;
 mod proto;
 mod serve;
+mod strategy;
 
 use std::sync::Arc;
 
@@ -45,7 +46,18 @@ enum Command {
         db: String,
     },
     Rebalance,
-    Simulate,
+    Simulate {
+        #[arg(long)]
+        position_id: String,
+        #[arg(long, default_value_t = 60)]
+        tick_spacing: i32,
+        #[arg(long, default_value_t = 3000)]
+        fee: u32,
+        #[arg(long, default_value_t = 200)]
+        window: usize,
+        #[arg(long, env = "LPA_DB", default_value = "lpa.sqlite")]
+        db: String,
+    },
     Config,
 }
 
@@ -93,11 +105,49 @@ async fn main() -> anyhow::Result<()> {
                 tick_upper,
                 current_tick: None,
                 in_range: false,
+                entry_tick: None,
             })?;
             println!("registered position {position_id} on {}", cfg.name);
         }
         Command::Rebalance => println!("rebalance (unimplemented)"),
-        Command::Simulate => println!("simulate (unimplemented)"),
+        Command::Simulate {
+            position_id,
+            tick_spacing,
+            fee,
+            window,
+            db,
+        } => {
+            let tracker = Tracker::open(&db)?;
+            let pos = tracker
+                .get_position(&position_id)?
+                .ok_or_else(|| anyhow::anyhow!("position not found: {position_id}"))?;
+            let ticks = tracker.recent_ticks(&pos.pool_id, window)?;
+            let current_tick = pos
+                .current_tick
+                .or_else(|| ticks.last().copied())
+                .ok_or_else(|| anyhow::anyhow!("no tick data for pool {}", pos.pool_id))?;
+            let entry_tick = pos.entry_tick.unwrap_or((pos.tick_lower + pos.tick_upper) / 2);
+            let config = strategy::default_config();
+            let input = strategy::DecideInput {
+                pool_id: &pos.pool_id,
+                chain_id: &pos.chain_id,
+                current_tick,
+                entry_tick,
+                cur_lower: pos.tick_lower,
+                cur_upper: pos.tick_upper,
+                tick_spacing,
+                fee_pips: fee,
+                ticks: &ticks,
+                config: &config,
+            };
+            match strategy::StrategyEngine::default().decide(&input, &strategy::StubCostModel) {
+                Some(d) => println!(
+                    "REBALANCE [{}, {}] -> [{}, {}] | {} | ~${:.2} | {:?}",
+                    pos.tick_lower, pos.tick_upper, d.new_lower, d.new_upper, d.reason, d.est_cost_usd, d.strategy
+                ),
+                None => println!("HOLD: no EV-positive rebalance for {position_id}"),
+            }
+        }
         Command::Config => println!("config (unimplemented)"),
     }
     Ok(())

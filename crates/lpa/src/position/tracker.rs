@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS positions (
     tick_upper      INTEGER NOT NULL,
     current_tick    INTEGER,
     in_range        INTEGER NOT NULL DEFAULT 0,
+    entry_tick      INTEGER,
     last_updated_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_positions_pool ON positions(pool_id);
@@ -37,6 +38,7 @@ pub struct PositionRow {
     pub tick_upper: i32,
     pub current_tick: Option<i32>,
     pub in_range: bool,
+    pub entry_tick: Option<i32>,
 }
 
 #[derive(Debug, Clone)]
@@ -65,14 +67,15 @@ impl Tracker {
     }
 
     pub fn register(&self, p: &PositionRow) -> Result<()> {
+        let entry = p.entry_tick.unwrap_or((p.tick_lower + p.tick_upper) / 2);
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT OR REPLACE INTO positions
-             (position_id, owner, pool_id, chain_id, tick_lower, tick_upper, current_tick, in_range, last_updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, strftime('%s','now'))",
+             (position_id, owner, pool_id, chain_id, tick_lower, tick_upper, current_tick, in_range, entry_tick, last_updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, strftime('%s','now'))",
             params![
                 p.position_id, p.owner, p.pool_id, p.chain_id,
-                p.tick_lower, p.tick_upper, p.current_tick, p.in_range as i64
+                p.tick_lower, p.tick_upper, p.current_tick, p.in_range as i64, entry
             ],
         )?;
         Ok(())
@@ -82,7 +85,7 @@ impl Tracker {
     pub fn get_position(&self, position_id: &str) -> Result<Option<PositionRow>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT position_id, owner, pool_id, chain_id, tick_lower, tick_upper, current_tick, in_range
+            "SELECT position_id, owner, pool_id, chain_id, tick_lower, tick_upper, current_tick, in_range, entry_tick
              FROM positions WHERE position_id = ?1",
         )?;
         let mut rows = stmt.query_map(params![position_id], row_to_position)?;
@@ -95,7 +98,7 @@ impl Tracker {
     pub fn positions_for_pool(&self, pool_id: &str) -> Result<Vec<PositionRow>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT position_id, owner, pool_id, chain_id, tick_lower, tick_upper, current_tick, in_range
+            "SELECT position_id, owner, pool_id, chain_id, tick_lower, tick_upper, current_tick, in_range, entry_tick
              FROM positions WHERE pool_id = ?1",
         )?;
         let rows = stmt.query_map(params![pool_id], row_to_position)?;
@@ -136,6 +139,20 @@ impl Tracker {
         Ok(())
     }
 
+    pub fn recent_ticks(&self, pool_id: &str, n: usize) -> Result<Vec<i32>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT tick FROM tick_history WHERE pool_id = ?1 ORDER BY block_number DESC, id DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![pool_id, n as i64], |r| r.get::<_, i32>(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        out.reverse();
+        Ok(out)
+    }
+
     pub fn count_positions(&self) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM positions", [], |r| r.get(0))?;
@@ -153,6 +170,7 @@ fn row_to_position(row: &Row) -> rusqlite::Result<PositionRow> {
         tick_upper: row.get(5)?,
         current_tick: row.get(6)?,
         in_range: row.get::<_, i64>(7)? != 0,
+        entry_tick: row.get(8)?,
     })
 }
 
@@ -186,6 +204,7 @@ mod tests {
             tick_upper: upper,
             current_tick: None,
             in_range: false,
+            entry_tick: None,
         }
     }
 

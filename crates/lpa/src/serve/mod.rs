@@ -12,7 +12,7 @@ pub async fn run(port: u16) -> anyhow::Result<()> {
     Server::builder()
         .accept_http1(true)
         .layer(GrpcWebLayer::new())
-        .add_service(AutopilotStrategyServer::new(StrategyService::default()))
+        .add_service(AutopilotStrategyServer::new(StrategyService))
         .serve(addr)
         .await?;
     Ok(())

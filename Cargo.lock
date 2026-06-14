@@ -2821,6 +2821,7 @@ dependencies = [
  "dashmap",
  "dotenvy",
  "futures-util",
+ "proptest",
  "prost",
  "rusqlite",
  "tempfile",
