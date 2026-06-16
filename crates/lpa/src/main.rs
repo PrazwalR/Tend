@@ -1,4 +1,5 @@
 mod chain;
+mod exec;
 mod position;
 mod proto;
 mod serve;
@@ -48,7 +49,25 @@ enum Command {
         #[arg(long, env = "LPA_DB", default_value = "lpa.sqlite")]
         db: String,
     },
-    Rebalance,
+    #[command(allow_negative_numbers = true)]
+    Rebalance {
+        #[arg(long, default_value = "base")]
+        chain: String,
+        #[arg(long)]
+        position_id: String,
+        #[arg(long)]
+        new_lower: i32,
+        #[arg(long)]
+        new_upper: i32,
+        #[arg(long, env = "AUTOPILOT_HOOK_ADDRESS")]
+        hook: String,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long, env = "DEFAULT_MAX_GAS_USD", default_value_t = 50.0)]
+        max_gas_usd: f64,
+        #[arg(long, env = "ETH_PRICE_USD", default_value_t = 3000.0)]
+        eth_price_usd: f64,
+    },
     Simulate {
         #[arg(long)]
         position_id: String,
@@ -112,7 +131,51 @@ async fn main() -> anyhow::Result<()> {
             })?;
             println!("registered position {position_id} on {}", cfg.name);
         }
-        Command::Rebalance => println!("rebalance (unimplemented)"),
+        Command::Rebalance {
+            chain,
+            position_id,
+            new_lower,
+            new_upper,
+            hook,
+            dry_run,
+            max_gas_usd,
+            eth_price_usd,
+        } => {
+            if new_lower >= new_upper {
+                anyhow::bail!("new_lower must be < new_upper");
+            }
+            let cfg = ChainConfig::from_name(&chain)?;
+            let rpc = cfg.http_url()?;
+            let pk = std::env::var("REBALANCER_PRIVATE_KEY")
+                .map_err(|_| anyhow::anyhow!("REBALANCER_PRIVATE_KEY not set"))?;
+            let hook_addr: alloy::primitives::Address =
+                hook.parse().map_err(|_| anyhow::anyhow!("invalid --hook address: {hook}"))?;
+            let pid: alloy::primitives::B256 = position_id
+                .parse()
+                .map_err(|_| anyhow::anyhow!("invalid --position-id (expect 0x + 64 hex)"))?;
+            let private = std::env::var("FLASHBOTS_RPC").ok();
+            let executor = exec::Executor::connect(&rpc, &pk, hook_addr, private).await?;
+            tracing::info!(signer = %executor.signer(), hook = %hook_addr, chain = cfg.name, "executor ready");
+
+            if dry_run {
+                let s = executor.simulate(pid, new_lower, new_upper).await?;
+                if s.ok {
+                    println!("DRY-RUN OK | est_gas={}", s.gas_estimate);
+                } else {
+                    println!("DRY-RUN REVERT | {}", s.revert.unwrap_or_default());
+                }
+            } else {
+                let r = executor
+                    .execute(pid, new_lower, new_upper, max_gas_usd, eth_price_usd)
+                    .await?;
+                println!(
+                    "{} | tx={} | gas_used={}",
+                    if r.success { "SUCCESS" } else { "FAILED" },
+                    r.tx_hash,
+                    r.gas_used
+                );
+            }
+        }
         Command::Simulate {
             position_id,
             tick_spacing,
