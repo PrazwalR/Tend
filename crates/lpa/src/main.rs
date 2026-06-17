@@ -27,6 +27,8 @@ enum Command {
     Serve {
         #[arg(long, env = "LPA_GRPC_PORT", default_value_t = 50051)]
         port: u16,
+        #[arg(long, env = "LPA_GRPC_HOST", default_value = "127.0.0.1")]
+        host: String,
     },
     Watch {
         #[arg(long, default_value = "base")]
@@ -63,6 +65,8 @@ enum Command {
         hook: String,
         #[arg(long)]
         dry_run: bool,
+        #[arg(long, default_value_t = 100)]
+        slippage_bps: u32,
         #[arg(long, env = "DEFAULT_MAX_GAS_USD", default_value_t = 50.0)]
         max_gas_usd: f64,
         #[arg(long, env = "ETH_PRICE_USD", default_value_t = 3000.0)]
@@ -93,7 +97,7 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        Command::Serve { port } => serve::run(port).await?,
+        Command::Serve { port, host } => serve::run(&host, port).await?,
         Command::Watch { chain, db } => {
             let cfg = ChainConfig::from_name(&chain)?;
             let tracker = Arc::new(Tracker::open(&db)?);
@@ -138,6 +142,7 @@ async fn main() -> anyhow::Result<()> {
             new_upper,
             hook,
             dry_run,
+            slippage_bps,
             max_gas_usd,
             eth_price_usd,
         } => {
@@ -148,25 +153,26 @@ async fn main() -> anyhow::Result<()> {
             let rpc = cfg.http_url()?;
             let pk = std::env::var("REBALANCER_PRIVATE_KEY")
                 .map_err(|_| anyhow::anyhow!("REBALANCER_PRIVATE_KEY not set"))?;
+            tracing::warn!("rebalancer key loaded from env (plaintext) — testnet only; use a keystore or external signer in production");
             let hook_addr: alloy::primitives::Address =
                 hook.parse().map_err(|_| anyhow::anyhow!("invalid --hook address: {hook}"))?;
             let pid: alloy::primitives::B256 = position_id
                 .parse()
                 .map_err(|_| anyhow::anyhow!("invalid --position-id (expect 0x + 64 hex)"))?;
-            let private = std::env::var("FLASHBOTS_RPC").ok();
+            let private = std::env::var("FLASHBOTS_RPC").ok().filter(|s| !s.trim().is_empty());
             let executor = exec::Executor::connect(&rpc, &pk, hook_addr, private).await?;
             tracing::info!(signer = %executor.signer(), hook = %hook_addr, chain = cfg.name, "executor ready");
 
             if dry_run {
                 let s = executor.simulate(pid, new_lower, new_upper).await?;
                 if s.ok {
-                    println!("DRY-RUN OK | est_gas={}", s.gas_estimate);
+                    println!("DRY-RUN OK | est_gas={} | quoted_liquidity={}", s.gas_estimate, s.quoted_liquidity);
                 } else {
                     println!("DRY-RUN REVERT | {}", s.revert.unwrap_or_default());
                 }
             } else {
                 let r = executor
-                    .execute(pid, new_lower, new_upper, max_gas_usd, eth_price_usd)
+                    .execute(pid, new_lower, new_upper, slippage_bps, max_gas_usd, eth_price_usd)
                     .await?;
                 println!(
                     "{} | tx={} | gas_used={}",

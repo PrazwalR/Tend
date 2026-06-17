@@ -18,10 +18,11 @@ import {SwapParams, ModifyLiquidityParams} from "@uniswap/v4-core/src/types/Pool
 import {LiquidityAmounts} from "@uniswap/v4-periphery/src/libraries/LiquidityAmounts.sol";
 
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
-contract AutopilotHook is BaseHook, Ownable, Pausable, ReentrancyGuard, IUnlockCallback {
+contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUnlockCallback {
     using StateLibrary for IPoolManager;
     using PoolIdLibrary for PoolKey;
     using CurrencySettler for Currency;
@@ -52,10 +53,15 @@ contract AutopilotHook is BaseHook, Ownable, Pausable, ReentrancyGuard, IUnlockC
         int24 newTickLower;
         int24 newTickUpper;
         uint128 liquidity;
+        uint128 minLiquidity;
         address owner;
     }
 
+    uint64 public constant MAX_REBALANCE_INTERVAL = 365 days;
+
     mapping(bytes32 => Position) public positions;
+    mapping(bytes32 => int24) public boundLower;
+    mapping(bytes32 => int24) public boundUpper;
     mapping(PoolId => uint256) public poolPositionCount;
     mapping(address => bool) public isRebalancer;
     uint64 public minRebalanceInterval;
@@ -91,6 +97,12 @@ contract AutopilotHook is BaseHook, Ownable, Pausable, ReentrancyGuard, IUnlockC
     error RebalanceTooSoon(uint64 readyAt);
     error ZeroLiquidity();
     error NothingFreed();
+    error HookMismatch();
+    error SlippageExceeded(uint128 got, uint128 min);
+    error IntervalTooLong();
+    error OutOfBounds();
+    error RenounceDisabled();
+    error NativeNotSupported();
 
     constructor(IPoolManager pm, address initialRebalancer, uint64 cooldown)
         BaseHook(pm)
@@ -100,6 +112,7 @@ contract AutopilotHook is BaseHook, Ownable, Pausable, ReentrancyGuard, IUnlockC
             isRebalancer[initialRebalancer] = true;
             emit RebalancerSet(initialRebalancer, true);
         }
+        if (cooldown > MAX_REBALANCE_INTERVAL) revert IntervalTooLong();
         minRebalanceInterval = cooldown;
         emit MinRebalanceIntervalSet(cooldown);
     }
@@ -122,17 +135,25 @@ contract AutopilotHook is BaseHook, Ownable, Pausable, ReentrancyGuard, IUnlockC
         return (BaseHook.afterSwap.selector, int128(0));
     }
 
-    function deposit(PoolKey calldata key, int24 tickLower, int24 tickUpper, uint128 liquidity)
-        external
-        whenNotPaused
-        nonReentrant
-        returns (bytes32 positionId)
-    {
+    function deposit(
+        PoolKey calldata key,
+        int24 tickLower,
+        int24 tickUpper,
+        uint128 liquidity,
+        int24 minBound,
+        int24 maxBound
+    ) external whenNotPaused nonReentrant returns (bytes32 positionId) {
         if (liquidity == 0) revert ZeroLiquidity();
+        if (address(key.hooks) != address(this)) revert HookMismatch();
+        if (Currency.unwrap(key.currency0) == address(0)) revert NativeNotSupported();
         _validateTicks(key, tickLower, tickUpper);
+        _validateTicks(key, minBound, maxBound);
+        if (tickLower < minBound || tickUpper > maxBound) revert OutOfBounds();
 
         PoolId id = key.toId();
         positionId = keccak256(abi.encode(msg.sender, id, depositNonce++));
+        boundLower[positionId] = minBound;
+        boundUpper[positionId] = maxBound;
 
         poolManager.unlock(
             abi.encode(
@@ -145,6 +166,7 @@ contract AutopilotHook is BaseHook, Ownable, Pausable, ReentrancyGuard, IUnlockC
                     newTickLower: int24(0),
                     newTickUpper: int24(0),
                     liquidity: liquidity,
+                    minLiquidity: 0,
                     owner: msg.sender
                 })
             )
@@ -189,6 +211,7 @@ contract AutopilotHook is BaseHook, Ownable, Pausable, ReentrancyGuard, IUnlockC
                     newTickLower: int24(0),
                     newTickUpper: int24(0),
                     liquidity: liquidity,
+                    minLiquidity: 0,
                     owner: msg.sender
                 })
             )
@@ -196,10 +219,11 @@ contract AutopilotHook is BaseHook, Ownable, Pausable, ReentrancyGuard, IUnlockC
         emit PositionClosed(positionId, msg.sender, liquidity);
     }
 
-    function rebalance(bytes32 positionId, int24 newTickLower, int24 newTickUpper)
+    function rebalance(bytes32 positionId, int24 newTickLower, int24 newTickUpper, uint128 minLiquidity)
         external
         whenNotPaused
         nonReentrant
+        returns (uint128 newLiquidity)
     {
         if (!isRebalancer[msg.sender]) revert NotRebalancer();
         Position storage pos = positions[positionId];
@@ -210,6 +234,7 @@ contract AutopilotHook is BaseHook, Ownable, Pausable, ReentrancyGuard, IUnlockC
 
         PoolKey memory key = pos.key;
         _validateTicks(key, newTickLower, newTickUpper);
+        if (newTickLower < boundLower[positionId] || newTickUpper > boundUpper[positionId]) revert OutOfBounds();
 
         int24 oldLower = pos.tickLower;
         int24 oldUpper = pos.tickUpper;
@@ -226,11 +251,12 @@ contract AutopilotHook is BaseHook, Ownable, Pausable, ReentrancyGuard, IUnlockC
                     newTickLower: newTickLower,
                     newTickUpper: newTickUpper,
                     liquidity: oldLiquidity,
+                    minLiquidity: minLiquidity,
                     owner: pos.owner
                 })
             )
         );
-        uint128 newLiquidity = abi.decode(ret, (uint128));
+        newLiquidity = abi.decode(ret, (uint128));
 
         pos.tickLower = newTickLower;
         pos.tickUpper = newTickUpper;
@@ -315,6 +341,7 @@ contract AutopilotHook is BaseHook, Ownable, Pausable, ReentrancyGuard, IUnlockC
             freed1
         );
         if (newLiquidity == 0) revert ZeroLiquidity();
+        if (newLiquidity < cb.minLiquidity) revert SlippageExceeded(newLiquidity, cb.minLiquidity);
 
         (BalanceDelta added,) = poolManager.modifyLiquidity(
             cb.key,
@@ -337,8 +364,9 @@ contract AutopilotHook is BaseHook, Ownable, Pausable, ReentrancyGuard, IUnlockC
     }
 
     function _validateTicks(PoolKey memory key, int24 tickLower, int24 tickUpper) internal pure {
-        if (tickLower >= tickUpper) revert InvalidTickRange();
         int24 spacing = key.tickSpacing;
+        if (spacing <= 0) revert InvalidTickRange();
+        if (tickLower >= tickUpper) revert InvalidTickRange();
         if (tickLower % spacing != 0 || tickUpper % spacing != 0) revert TicksNotAligned();
         if (tickLower < TickMath.minUsableTick(spacing) || tickUpper > TickMath.maxUsableTick(spacing)) {
             revert InvalidTickRange();
@@ -351,8 +379,13 @@ contract AutopilotHook is BaseHook, Ownable, Pausable, ReentrancyGuard, IUnlockC
     }
 
     function setMinRebalanceInterval(uint64 interval) external onlyOwner {
+        if (interval > MAX_REBALANCE_INTERVAL) revert IntervalTooLong();
         minRebalanceInterval = interval;
         emit MinRebalanceIntervalSet(interval);
+    }
+
+    function renounceOwnership() public view override onlyOwner {
+        revert RenounceDisabled();
     }
 
     function pause() external onlyOwner {

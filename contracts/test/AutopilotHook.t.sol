@@ -47,7 +47,7 @@ contract AutopilotHookTest is Test, Deployers {
     }
 
     function _deposit(int24 lo, int24 hi, uint128 liq) internal returns (bytes32) {
-        return hook.deposit(key, lo, hi, liq);
+        return hook.deposit(key, lo, hi, liq, TickMath.minUsableTick(60), TickMath.maxUsableTick(60));
     }
 
     function _swap() internal {
@@ -107,7 +107,7 @@ contract AutopilotHookTest is Test, Deployers {
         vm.warp(block.timestamp + COOLDOWN);
 
         vm.prank(rebalancer);
-        hook.rebalance(pid, -1200, 1200);
+        hook.rebalance(pid, -1200, 1200, 0);
 
         (, , int24 lo, int24 hi, uint128 liq,, uint64 last) = hook.positions(pid);
         assertEq(lo, -1200);
@@ -121,18 +121,18 @@ contract AutopilotHookTest is Test, Deployers {
         vm.warp(block.timestamp + COOLDOWN);
         vm.prank(attacker);
         vm.expectRevert(AutopilotHook.NotRebalancer.selector);
-        hook.rebalance(pid, -1200, 1200);
+        hook.rebalance(pid, -1200, 1200, 0);
     }
 
     function test_rebalance_cooldown_enforced() public {
         bytes32 pid = _deposit(-600, 600, 1e18);
         vm.prank(rebalancer);
         vm.expectRevert(abi.encodeWithSelector(AutopilotHook.RebalanceTooSoon.selector, COOLDOWN));
-        hook.rebalance(pid, -1200, 1200);
+        hook.rebalance(pid, -1200, 1200, 0);
 
         vm.warp(block.timestamp + COOLDOWN);
         vm.prank(rebalancer);
-        hook.rebalance(pid, -1200, 1200);
+        hook.rebalance(pid, -1200, 1200, 0);
     }
 
     function test_rebalance_rejects_unaligned_ticks() public {
@@ -140,7 +140,7 @@ contract AutopilotHookTest is Test, Deployers {
         vm.warp(block.timestamp + COOLDOWN);
         vm.prank(rebalancer);
         vm.expectRevert(AutopilotHook.TicksNotAligned.selector);
-        hook.rebalance(pid, -601, 1200);
+        hook.rebalance(pid, -601, 1200, 0);
     }
 
     function test_rebalance_rejects_inverted_range() public {
@@ -148,7 +148,7 @@ contract AutopilotHookTest is Test, Deployers {
         vm.warp(block.timestamp + COOLDOWN);
         vm.prank(rebalancer);
         vm.expectRevert(AutopilotHook.InvalidTickRange.selector);
-        hook.rebalance(pid, 1200, -1200);
+        hook.rebalance(pid, 1200, -1200, 0);
     }
 
     function test_withdraw_only_owner() public {
@@ -163,7 +163,7 @@ contract AutopilotHookTest is Test, Deployers {
         hook.pause();
 
         vm.expectRevert(Pausable.EnforcedPause.selector);
-        hook.deposit(key, -600, 600, 1e18);
+        hook.deposit(key, -600, 600, 1e18, -600, 600);
 
         hook.withdraw(pid);
         (,,,,, bool active,) = hook.positions(pid);
@@ -176,7 +176,7 @@ contract AutopilotHookTest is Test, Deployers {
         hook.pause();
         vm.prank(rebalancer);
         vm.expectRevert(Pausable.EnforcedPause.selector);
-        hook.rebalance(pid, -1200, 1200);
+        hook.rebalance(pid, -1200, 1200, 0);
     }
 
     function test_unlockCallback_only_pool_manager() public {
@@ -204,12 +204,12 @@ contract AutopilotHookTest is Test, Deployers {
 
     function test_deposit_zero_liquidity_reverts() public {
         vm.expectRevert(AutopilotHook.ZeroLiquidity.selector);
-        hook.deposit(key, -600, 600, 0);
+        hook.deposit(key, -600, 600, 0, -600, 600);
     }
 
     function test_deposit_unaligned_ticks_reverts() public {
         vm.expectRevert(AutopilotHook.TicksNotAligned.selector);
-        hook.deposit(key, -601, 600, 1e18);
+        hook.deposit(key, -601, 600, 1e18, -660, 660);
     }
 
     function test_double_withdraw_reverts() public {
@@ -225,7 +225,7 @@ contract AutopilotHookTest is Test, Deployers {
         vm.warp(block.timestamp + COOLDOWN);
         vm.prank(rebalancer);
         vm.expectRevert(AutopilotHook.PositionNotActive.selector);
-        hook.rebalance(pid, -1200, 1200);
+        hook.rebalance(pid, -1200, 1200, 0);
     }
 
     function test_two_positions_independent() public {
@@ -244,10 +244,98 @@ contract AutopilotHookTest is Test, Deployers {
         bytes32 pid = _deposit(-600, 600, 1e18);
         vm.warp(block.timestamp + COOLDOWN);
         vm.prank(rebalancer);
-        hook.rebalance(pid, 600, 1200);
+        hook.rebalance(pid, 600, 1200, 0);
         (,, int24 lo, int24 hi, uint128 liq,,) = hook.positions(pid);
         assertEq(lo, 600);
         assertEq(hi, 1200);
         assertGt(liq, 0);
+    }
+
+    function test_deposit_rejects_foreign_hook() public {
+        PoolKey memory foreign = PoolKey(currency0, currency1, 3000, 60, IHooks(address(0xDEAD)));
+        vm.expectRevert(AutopilotHook.HookMismatch.selector);
+        hook.deposit(foreign, -600, 600, 1e18, -600, 600);
+    }
+
+    function test_rebalance_slippage_floor_reverts() public {
+        bytes32 pid = _deposit(-600, 600, 1e18);
+        vm.warp(block.timestamp + COOLDOWN);
+        vm.prank(rebalancer);
+        vm.expectPartialRevert(AutopilotHook.SlippageExceeded.selector);
+        hook.rebalance(pid, -1200, 1200, type(uint128).max);
+    }
+
+    function test_rebalance_returns_liquidity() public {
+        bytes32 pid = _deposit(-600, 600, 1e18);
+        vm.warp(block.timestamp + COOLDOWN);
+        vm.prank(rebalancer);
+        uint128 newLiq = hook.rebalance(pid, -1200, 1200, 1);
+        assertGt(newLiq, 0);
+    }
+
+    function test_set_interval_too_long_reverts() public {
+        vm.expectRevert(AutopilotHook.IntervalTooLong.selector);
+        hook.setMinRebalanceInterval(366 days);
+    }
+
+    function test_deposit_zero_spacing_reverts() public {
+        PoolKey memory bad = PoolKey(currency0, currency1, 3000, 0, IHooks(hook));
+        vm.expectRevert(AutopilotHook.InvalidTickRange.selector);
+        hook.deposit(bad, 0, 60, 1e18, -600, 600);
+    }
+
+    function testFuzz_deposit_withdraw_conserves(uint128 liq) public {
+        liq = uint128(bound(liq, 1e6, 1e23));
+        MockERC20 t0 = MockERC20(Currency.unwrap(currency0));
+        MockERC20 t1 = MockERC20(Currency.unwrap(currency1));
+        uint256 b0 = t0.balanceOf(address(this));
+        uint256 b1 = t1.balanceOf(address(this));
+
+        bytes32 pid = _deposit(-600, 600, liq);
+        hook.withdraw(pid);
+
+        assertApproxEqAbs(t0.balanceOf(address(this)), b0, 10);
+        assertApproxEqAbs(t1.balanceOf(address(this)), b1, 10);
+        (,,,,, bool active,) = hook.positions(pid);
+        assertFalse(active);
+    }
+
+    function test_deposit_native_currency_reverts() public {
+        PoolKey memory nativeKey = PoolKey(Currency.wrap(address(0)), currency1, 3000, 60, IHooks(hook));
+        vm.expectRevert(AutopilotHook.NativeNotSupported.selector);
+        hook.deposit(nativeKey, -600, 600, 1e18, -600, 600);
+    }
+
+    function test_deposit_range_outside_bounds_reverts() public {
+        vm.expectRevert(AutopilotHook.OutOfBounds.selector);
+        hook.deposit(key, -600, 600, 1e18, -300, 300);
+    }
+
+    function test_rebalance_respects_owner_bounds() public {
+        bytes32 pid = hook.deposit(key, -600, 600, 1e18, -600, 600);
+        vm.warp(block.timestamp + COOLDOWN);
+
+        vm.prank(rebalancer);
+        vm.expectRevert(AutopilotHook.OutOfBounds.selector);
+        hook.rebalance(pid, -1200, 1200, 0);
+
+        vm.prank(rebalancer);
+        hook.rebalance(pid, -540, 540, 0);
+        (,, int24 lo, int24 hi,,,) = hook.positions(pid);
+        assertEq(lo, -540);
+        assertEq(hi, 540);
+    }
+
+    function test_renounce_ownership_disabled() public {
+        vm.expectRevert(AutopilotHook.RenounceDisabled.selector);
+        hook.renounceOwnership();
+    }
+
+    function test_two_step_ownership_transfer() public {
+        hook.transferOwnership(attacker);
+        assertEq(hook.owner(), address(this));
+        vm.prank(attacker);
+        hook.acceptOwnership();
+        assertEq(hook.owner(), attacker);
     }
 }

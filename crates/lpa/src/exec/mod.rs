@@ -11,7 +11,7 @@ use anyhow::{bail, Context, Result};
 sol! {
     #[sol(rpc)]
     interface IAutopilotHook {
-        function rebalance(bytes32 positionId, int24 newTickLower, int24 newTickUpper) external;
+        function rebalance(bytes32 positionId, int24 newTickLower, int24 newTickUpper, uint128 minLiquidity) external returns (uint128);
         function isRebalancer(address who) external view returns (bool);
     }
 }
@@ -20,6 +20,7 @@ pub struct SimOutcome {
     pub ok: bool,
     pub revert: Option<String>,
     pub gas_estimate: u64,
+    pub quoted_liquidity: u128,
 }
 
 pub struct ExecReport {
@@ -64,17 +65,22 @@ impl Executor {
     pub async fn simulate(&self, position_id: B256, lower: i32, upper: i32) -> Result<SimOutcome> {
         let (l, u) = (to_i24(lower)?, to_i24(upper)?);
         let hook = IAutopilotHook::new(self.hook, &self.provider);
-        match hook.rebalance(position_id, l, u).from(self.signer).call().await {
-            Ok(_) => {
+        match hook.rebalance(position_id, l, u, 0).from(self.signer).call().await {
+            Ok(quoted) => {
                 let gas = hook
-                    .rebalance(position_id, l, u)
+                    .rebalance(position_id, l, u, 0)
                     .from(self.signer)
                     .estimate_gas()
                     .await
                     .unwrap_or(0);
-                Ok(SimOutcome { ok: true, revert: None, gas_estimate: gas })
+                Ok(SimOutcome { ok: true, revert: None, gas_estimate: gas, quoted_liquidity: quoted })
             }
-            Err(e) => Ok(SimOutcome { ok: false, revert: Some(e.to_string()), gas_estimate: 0 }),
+            Err(e) => Ok(SimOutcome {
+                ok: false,
+                revert: Some(e.to_string()),
+                gas_estimate: 0,
+                quoted_liquidity: 0,
+            }),
         }
     }
 
@@ -83,6 +89,7 @@ impl Executor {
         position_id: B256,
         lower: i32,
         upper: i32,
+        slippage_bps: u32,
         max_gas_usd: f64,
         eth_price_usd: f64,
     ) -> Result<ExecReport> {
@@ -90,11 +97,13 @@ impl Executor {
         if !sim.ok {
             bail!("preflight simulation reverted: {}", sim.revert.unwrap_or_default());
         }
+        let bps = slippage_bps.min(10_000) as u128;
+        let floor = sim.quoted_liquidity.saturating_mul(10_000 - bps) / 10_000;
 
         let (l, u) = (to_i24(lower)?, to_i24(upper)?);
         let read = IAutopilotHook::new(self.hook, &self.provider);
         let gas = read
-            .rebalance(position_id, l, u)
+            .rebalance(position_id, l, u, floor)
             .from(self.signer)
             .estimate_gas()
             .await
@@ -106,7 +115,7 @@ impl Executor {
         }
 
         let hook = IAutopilotHook::new(self.hook, &self.submit);
-        let pending = hook.rebalance(position_id, l, u).send().await?;
+        let pending = hook.rebalance(position_id, l, u, floor).send().await?;
         let receipt = pending.get_receipt().await?;
         Ok(ExecReport {
             tx_hash: format!("{:#x}", receipt.transaction_hash),
