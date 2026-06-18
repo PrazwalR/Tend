@@ -9,23 +9,41 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./react": {
+      "types": "./dist/react.d.ts",
+      "import": "./dist/react.js"
     }
   },
-  "files": ["dist", "src/generated"],
+  "files": [
+    "dist",
+    "src/generated"
+  ],
   "scripts": {
     "generate": "buf generate ../../proto",
     "build": "tsc",
     "typecheck": "tsc --noEmit",
-    "ping": "tsx src/ping-check.ts"
+    "ping": "tsx src/ping-check.ts",
+    "stream-check": "tsx src/stream-check.ts"
   },
   "dependencies": {
-    "@bufbuild/protobuf": "^2",
+    "@bufbuild/protobuf": "^2.12.0",
     "@connectrpc/connect": "^2",
     "@connectrpc/connect-web": "^2"
   },
+  "peerDependencies": {
+    "react": ">=18"
+  },
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": true
+    }
+  },
   "devDependencies": {
     "@bufbuild/buf": "^1",
-    "@bufbuild/protoc-gen-es": "^2",
+    "@bufbuild/protoc-gen-es": "^2.12.0",
+    "@types/react": "^18",
+    "react": "^18",
     "tsx": "^4",
     "typescript": "^5"
   }

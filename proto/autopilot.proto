@@ -72,6 +72,7 @@ service AutopilotStrategy {
   rpc DeregisterPosition(DeregisterPositionRequest) returns (DeregisterPositionResponse);
   rpc GetPositionConfig(GetPositionConfigRequest) returns (PositionConfig);
   rpc UpdateConfig(UpdateConfigRequest) returns (UpdateConfigResponse);
+  rpc StreamPositions(StreamPositionsRequest) returns (stream PositionState);
 }
 
 message StreamPositionsRequest {

@@ -40,6 +40,8 @@ enum Command {
         port: u16,
         #[arg(long, env = "LPA_GRPC_HOST", default_value = "127.0.0.1")]
         host: String,
+        #[arg(long, env = "LPA_DB")]
+        db: Option<String>,
     },
     Watch {
         #[arg(long)]
@@ -118,7 +120,11 @@ async fn main() -> anyhow::Result<()> {
     init_logging(cli.log_format);
 
     match cli.command {
-        Command::Serve { port, host } => serve::run(&host, port).await?,
+        Command::Serve { port, host, db } => {
+            let file = cfg::load(cli.config.as_deref())?;
+            let db = db.or(file.db).unwrap_or_else(|| "lpa.sqlite".into());
+            serve::run(&host, port, &db).await?;
+        }
         Command::Watch { chain, db } => {
             let file = cfg::load(cli.config.as_deref())?;
             let chain = chain.or(file.chain).unwrap_or_else(|| "base".into());

@@ -26,6 +26,17 @@ CREATE TABLE IF NOT EXISTS tick_history (
     observed_at  INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_tick_pool ON tick_history(pool_id, block_number);
+CREATE TABLE IF NOT EXISTS configs (
+    position_id       TEXT PRIMARY KEY,
+    strategy          INTEGER NOT NULL,
+    il_threshold_pct  REAL NOT NULL,
+    fee_capture_ratio REAL NOT NULL,
+    bollinger_period  INTEGER NOT NULL,
+    bollinger_stddev  REAL NOT NULL,
+    max_gas_usd       REAL NOT NULL,
+    auto_compound_fees INTEGER NOT NULL,
+    use_flashbots     INTEGER NOT NULL
+);
 ";
 
 #[derive(Debug, Clone, PartialEq)]
@@ -46,6 +57,18 @@ pub struct TickCross {
     pub position_id: String,
     pub was_in_range: bool,
     pub now_in_range: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConfigRow {
+    pub strategy: i32,
+    pub il_threshold_pct: f64,
+    pub fee_capture_ratio: f64,
+    pub bollinger_period: u32,
+    pub bollinger_stddev: f64,
+    pub max_gas_usd: f64,
+    pub auto_compound_fees: bool,
+    pub use_flashbots: bool,
 }
 
 pub struct Tracker {
@@ -153,6 +176,65 @@ impl Tracker {
         Ok(out)
     }
 
+    pub fn set_config(&self, position_id: &str, c: &ConfigRow) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO configs
+             (position_id, strategy, il_threshold_pct, fee_capture_ratio, bollinger_period,
+              bollinger_stddev, max_gas_usd, auto_compound_fees, use_flashbots)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                position_id, c.strategy, c.il_threshold_pct, c.fee_capture_ratio,
+                c.bollinger_period, c.bollinger_stddev, c.max_gas_usd,
+                c.auto_compound_fees as i64, c.use_flashbots as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_config(&self, position_id: &str) -> Result<Option<ConfigRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT strategy, il_threshold_pct, fee_capture_ratio, bollinger_period,
+                    bollinger_stddev, max_gas_usd, auto_compound_fees, use_flashbots
+             FROM configs WHERE position_id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![position_id], |row| {
+            Ok(ConfigRow {
+                strategy: row.get(0)?,
+                il_threshold_pct: row.get(1)?,
+                fee_capture_ratio: row.get(2)?,
+                bollinger_period: row.get::<_, i64>(3)? as u32,
+                bollinger_stddev: row.get(4)?,
+                max_gas_usd: row.get(5)?,
+                auto_compound_fees: row.get::<_, i64>(6)? != 0,
+                use_flashbots: row.get::<_, i64>(7)? != 0,
+            })
+        })?;
+        match rows.next() {
+            Some(r) => Ok(Some(r?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn delete_position(&self, position_id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM configs WHERE position_id = ?1", params![position_id])?;
+        let n = conn.execute("DELETE FROM positions WHERE position_id = ?1", params![position_id])?;
+        Ok(n > 0)
+    }
+
+    pub fn all_position_ids(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT position_id FROM positions")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     pub fn count_positions(&self) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM positions", [], |r| r.get(0))?;
@@ -257,6 +339,29 @@ mod tests {
         let got = t.get_position("0xabc").unwrap().unwrap();
         assert_eq!(got.current_tick, Some(150));
         assert!(got.in_range);
+    }
+
+    #[test]
+    fn config_roundtrip_and_delete() {
+        let t = Tracker::open_in_memory().unwrap();
+        t.register(&sample("0xabc", "0xpool", 100, 200)).unwrap();
+        let c = ConfigRow {
+            strategy: 1,
+            il_threshold_pct: 5.0,
+            fee_capture_ratio: 0.5,
+            bollinger_period: 200,
+            bollinger_stddev: 2.0,
+            max_gas_usd: 50.0,
+            auto_compound_fees: true,
+            use_flashbots: false,
+        };
+        t.set_config("0xabc", &c).unwrap();
+        assert_eq!(t.get_config("0xabc").unwrap().unwrap(), c);
+
+        assert!(t.delete_position("0xabc").unwrap());
+        assert!(t.get_position("0xabc").unwrap().is_none());
+        assert!(t.get_config("0xabc").unwrap().is_none());
+        assert!(!t.delete_position("0xabc").unwrap());
     }
 
     #[test]
