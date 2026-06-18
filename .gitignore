@@ -29,6 +29,7 @@ packages/sdk/src/generated/
 *.sqlite
 *.sqlite-*
 *.db
+lpa.toml
 
 # OS / editor
 .DS_Store

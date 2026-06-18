@@ -52,6 +52,24 @@ impl CostModel for StubCostModel {
     }
 }
 
+pub fn config_from(
+    il_threshold_pct: Option<f64>,
+    bollinger_period: Option<u32>,
+    bollinger_stddev: Option<f64>,
+) -> PositionConfig {
+    let mut c = default_config();
+    if let Some(v) = il_threshold_pct {
+        c.il_threshold_pct = v;
+    }
+    if let Some(v) = bollinger_period {
+        c.bollinger_period = v;
+    }
+    if let Some(v) = bollinger_stddev {
+        c.bollinger_stddev = v;
+    }
+    c
+}
+
 pub fn default_config() -> PositionConfig {
     PositionConfig {
         position_id: String::new(),
