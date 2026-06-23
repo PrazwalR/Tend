@@ -217,6 +217,17 @@ impl Tracker {
         }
     }
 
+    pub fn update_range(&self, position_id: &str, tick_lower: i32, tick_upper: i32) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE positions SET tick_lower = ?1, tick_upper = ?2,
+             in_range = (current_tick IS NOT NULL AND current_tick >= ?1 AND current_tick <= ?2)
+             WHERE position_id = ?3",
+            params![tick_lower, tick_upper, position_id],
+        )?;
+        Ok(n > 0)
+    }
+
     pub fn delete_position(&self, position_id: &str) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM configs WHERE position_id = ?1", params![position_id])?;
@@ -233,6 +244,21 @@ impl Tracker {
             out.push(r?);
         }
         Ok(out)
+    }
+
+    pub fn prune_all_ticks(&self, keep_per_pool: usize) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "DELETE FROM tick_history WHERE id IN (
+                 SELECT id FROM (
+                     SELECT id, ROW_NUMBER() OVER (
+                         PARTITION BY pool_id ORDER BY block_number DESC, id DESC
+                     ) AS rn FROM tick_history
+                 ) WHERE rn > ?1
+             )",
+            params![keep_per_pool as i64],
+        )?;
+        Ok(n)
     }
 
     pub fn count_positions(&self) -> Result<i64> {
@@ -339,6 +365,50 @@ mod tests {
         let got = t.get_position("0xabc").unwrap().unwrap();
         assert_eq!(got.current_tick, Some(150));
         assert!(got.in_range);
+    }
+
+    #[test]
+    fn prune_keeps_newest_per_pool() {
+        let t = Tracker::open_in_memory().unwrap();
+        for b in 1000u64..1010 {
+            t.record_tick("0xpool", b as i32, b).unwrap();
+        }
+        t.record_tick("0xother", 5, 1).unwrap();
+        let removed = t.prune_all_ticks(4).unwrap();
+        assert_eq!(removed, 6);
+        let kept = t.recent_ticks("0xpool", 100).unwrap();
+        assert_eq!(kept, vec![1006, 1007, 1008, 1009]);
+        assert_eq!(t.recent_ticks("0xother", 100).unwrap(), vec![5]);
+    }
+
+    #[test]
+    fn update_range_changes_ticks_and_in_range() {
+        let t = Tracker::open_in_memory().unwrap();
+        t.register(&sample("0xabc", "0xpool", 100, 200)).unwrap();
+        t.update_pool_tick("0xpool", 150).unwrap();
+        assert!(t.get_position("0xabc").unwrap().unwrap().in_range);
+
+        assert!(t.update_range("0xabc", 300, 400).unwrap());
+        let p = t.get_position("0xabc").unwrap().unwrap();
+        assert_eq!((p.tick_lower, p.tick_upper), (300, 400));
+        assert!(!p.in_range, "tick 150 now outside [300,400]");
+
+        assert!(!t.update_range("0xmissing", 0, 1).unwrap());
+    }
+
+    #[test]
+    fn prune_edge_cases() {
+        let t = Tracker::open_in_memory().unwrap();
+        for b in 1u64..=5 {
+            t.record_tick("p", b as i32, b).unwrap();
+        }
+        assert_eq!(t.prune_all_ticks(100).unwrap(), 0);
+        assert_eq!(t.recent_ticks("p", 100).unwrap().len(), 5);
+        assert_eq!(t.prune_all_ticks(2).unwrap(), 3);
+        assert_eq!(t.recent_ticks("p", 100).unwrap(), vec![4, 5]);
+        assert_eq!(t.prune_all_ticks(0).unwrap(), 2);
+        assert!(t.recent_ticks("p", 100).unwrap().is_empty());
+        assert_eq!(t.prune_all_ticks(5).unwrap(), 0);
     }
 
     #[test]

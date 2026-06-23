@@ -48,6 +48,8 @@ enum Command {
         chain: Option<String>,
         #[arg(long, env = "LPA_DB")]
         db: Option<String>,
+        #[arg(long, env = "AUTOPILOT_HOOK_ADDRESS")]
+        hook: Option<String>,
     },
     #[command(allow_negative_numbers = true)]
     Register {
@@ -125,14 +127,25 @@ async fn main() -> anyhow::Result<()> {
             let db = db.or(file.db).unwrap_or_else(|| "lpa.sqlite".into());
             serve::run(&host, port, &db).await?;
         }
-        Command::Watch { chain, db } => {
+        Command::Watch { chain, db, hook } => {
             let file = cfg::load(cli.config.as_deref())?;
             let chain = chain.or(file.chain).unwrap_or_else(|| "base".into());
             let db = db.or(file.db).unwrap_or_else(|| "lpa.sqlite".into());
+            let hook_addr = hook
+                .or(file.hook)
+                .filter(|h| !h.trim().is_empty())
+                .map(|h| h.parse::<alloy::primitives::Address>())
+                .transpose()
+                .map_err(|_| anyhow::anyhow!("invalid hook address"))?;
             let cfg = ChainConfig::from_name(&chain)?;
             let tracker = Arc::new(Tracker::open(&db)?);
-            tracing::info!(chain = cfg.name, positions = tracker.count_positions()?, "starting watch");
-            chain::subscriber::run_watch(cfg, tracker).await?;
+            tracing::info!(
+                chain = cfg.name,
+                positions = tracker.count_positions()?,
+                indexing_hook = hook_addr.is_some(),
+                "starting watch"
+            );
+            chain::subscriber::run_watch(cfg, tracker, hook_addr).await?;
         }
         Command::Register {
             chain,

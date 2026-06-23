@@ -6,7 +6,8 @@ use alloy::primitives::{Address, B256};
 use alloy::providers::{DynProvider, Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
+use std::time::Duration;
 
 sol! {
     #[sol(rpc)]
@@ -34,6 +35,7 @@ pub struct Executor {
     submit: DynProvider,
     signer: Address,
     hook: Address,
+    tx_timeout: Duration,
 }
 
 impl Executor {
@@ -55,7 +57,11 @@ impl Executor {
             None => provider.clone(),
         };
 
-        Ok(Self { provider, submit, signer: addr, hook })
+        let tx_timeout = Duration::from_secs(
+            std::env::var("LPA_TX_TIMEOUT_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(120),
+        );
+
+        Ok(Self { provider, submit, signer: addr, hook, tx_timeout })
     }
 
     pub fn signer(&self) -> Address {
@@ -116,7 +122,12 @@ impl Executor {
 
         let hook = IAutopilotHook::new(self.hook, &self.submit);
         let pending = hook.rebalance(position_id, l, u, floor).send().await?;
-        let receipt = pending.get_receipt().await?;
+        let tx_hash = *pending.tx_hash();
+        let receipt = pending
+            .with_timeout(Some(self.tx_timeout))
+            .get_receipt()
+            .await
+            .map_err(|e| anyhow!("tx {tx_hash:#x} unconfirmed after {}s ({e})", self.tx_timeout.as_secs()))?;
         Ok(ExecReport {
             tx_hash: format!("{:#x}", receipt.transaction_hash),
             gas_used: receipt.gas_used,
