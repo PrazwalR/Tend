@@ -22,6 +22,8 @@ fn position(pool: &str, lower: i32, upper: i32, entry: i32) -> PositionRow {
         current_tick: None,
         in_range: false,
         entry_tick: Some(entry),
+        fee: Some(3000),
+        tick_spacing: Some(60),
     }
 }
 

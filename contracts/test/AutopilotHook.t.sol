@@ -300,6 +300,25 @@ contract AutopilotHookTest is Test, Deployers {
         assertFalse(active);
     }
 
+    function test_position_opened_emits_fee_and_spacing() public {
+        vm.recordLogs();
+        _deposit(-600, 600, 1e18);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bytes32 sig = keccak256("PositionOpened(bytes32,address,bytes32,int24,int24,uint128,uint24,int24)");
+        bool found;
+        for (uint256 i = 0; i < logs.length; i++) {
+            if (logs[i].emitter == address(hook) && logs[i].topics[0] == sig) {
+                (,, uint128 liq, uint24 fee, int24 spacing) =
+                    abi.decode(logs[i].data, (int24, int24, uint128, uint24, int24));
+                assertEq(fee, 3000);
+                assertEq(spacing, 60);
+                assertEq(liq, 1e18);
+                found = true;
+            }
+        }
+        assertTrue(found, "PositionOpened with fee+spacing emitted");
+    }
+
     function test_deposit_native_currency_reverts() public {
         PoolKey memory nativeKey = PoolKey(Currency.wrap(address(0)), currency1, 3000, 60, IHooks(hook));
         vm.expectRevert(AutopilotHook.NativeNotSupported.selector);

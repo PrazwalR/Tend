@@ -73,7 +73,9 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
         PoolId indexed poolId,
         int24 tickLower,
         int24 tickUpper,
-        uint128 liquidity
+        uint128 liquidity,
+        uint24 fee,
+        int24 tickSpacing
     );
     event PositionClosed(bytes32 indexed positionId, address indexed owner, uint128 liquidity);
     event Rebalanced(
@@ -182,7 +184,7 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
             lastRebalanceAt: 0
         });
         poolPositionCount[id] += 1;
-        emit PositionOpened(positionId, msg.sender, id, tickLower, tickUpper, liquidity);
+        emit PositionOpened(positionId, msg.sender, id, tickLower, tickUpper, liquidity, key.fee, key.tickSpacing);
     }
 
     function withdraw(bytes32 positionId) external nonReentrant {

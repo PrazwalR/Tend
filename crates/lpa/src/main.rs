@@ -63,6 +63,10 @@ enum Command {
         tick_lower: i32,
         #[arg(long)]
         tick_upper: i32,
+        #[arg(long)]
+        fee: Option<u32>,
+        #[arg(long)]
+        tick_spacing: Option<i32>,
         #[arg(long, env = "LPA_DB")]
         db: Option<String>,
     },
@@ -90,10 +94,10 @@ enum Command {
     Simulate {
         #[arg(long)]
         position_id: String,
-        #[arg(long, default_value_t = 60)]
-        tick_spacing: i32,
-        #[arg(long, default_value_t = 3000)]
-        fee: u32,
+        #[arg(long)]
+        tick_spacing: Option<i32>,
+        #[arg(long)]
+        fee: Option<u32>,
         #[arg(long, default_value_t = 200)]
         window: usize,
         #[arg(long, env = "LPA_DB")]
@@ -153,6 +157,8 @@ async fn main() -> anyhow::Result<()> {
             owner,
             tick_lower,
             tick_upper,
+            fee,
+            tick_spacing,
             db,
         } => {
             if tick_lower >= tick_upper {
@@ -174,6 +180,8 @@ async fn main() -> anyhow::Result<()> {
                 current_tick: None,
                 in_range: false,
                 entry_tick: None,
+                fee,
+                tick_spacing,
             })?;
             println!("registered position {position_id} on {}", cfg.name);
         }
@@ -252,6 +260,8 @@ async fn main() -> anyhow::Result<()> {
                 .or_else(|| ticks.last().copied())
                 .ok_or_else(|| anyhow::anyhow!("no tick data for pool {}", pos.pool_id))?;
             let entry_tick = pos.entry_tick.unwrap_or((pos.tick_lower + pos.tick_upper) / 2);
+            let tick_spacing = tick_spacing.or(pos.tick_spacing).unwrap_or(60);
+            let fee_pips = fee.or(pos.fee).unwrap_or(3000);
             let config = strategy::config_from(
                 file.il_threshold_pct,
                 file.bollinger_period,
@@ -265,7 +275,7 @@ async fn main() -> anyhow::Result<()> {
                 cur_lower: pos.tick_lower,
                 cur_upper: pos.tick_upper,
                 tick_spacing,
-                fee_pips: fee,
+                fee_pips,
                 ticks: &ticks,
                 config: &config,
             };

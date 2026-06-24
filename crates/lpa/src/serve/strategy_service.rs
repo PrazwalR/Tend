@@ -72,6 +72,8 @@ impl AutopilotStrategy for StrategyService {
                 current_tick: None,
                 in_range: false,
                 entry_tick: Some((range.tick_lower + range.tick_upper) / 2),
+                fee: Some(pool_key.fee),
+                tick_spacing: Some(pool_key.tick_spacing),
             })
             .map_err(|e| Status::internal(e.to_string()))?;
 

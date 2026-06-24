@@ -32,23 +32,46 @@ pub trait CostModel {
     fn volume_usd_per_block(&self, pool_id: &str) -> f64;
 }
 
-pub struct StubCostModel;
-
-impl StubCostModel {
-    fn env_f64(key: &str, default: f64) -> f64 {
-        std::env::var(key)
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(default)
-    }
+fn env_f64(key: &str, default: f64) -> f64 {
+    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
+
+const REBALANCE_GAS_UNITS: u64 = 270_000;
+
+pub struct StubCostModel;
 
 impl CostModel for StubCostModel {
     fn rebalance_cost_usd(&self, _chain_id: &str) -> f64 {
-        Self::env_f64("LPA_DEMO_GAS_USD", 5.0)
+        env_f64("LPA_DEMO_GAS_USD", 5.0)
     }
     fn volume_usd_per_block(&self, _pool_id: &str) -> f64 {
-        Self::env_f64("LPA_DEMO_VOLUME_USD_PER_BLOCK", 50_000.0)
+        env_f64("LPA_VOLUME_USD_PER_BLOCK", 50_000.0)
+    }
+}
+
+pub struct LiveCostModel {
+    gas_price_wei: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    eth_price_usd: f64,
+    volume_usd_per_block: f64,
+}
+
+impl LiveCostModel {
+    pub fn new(gas_price_wei: std::sync::Arc<std::sync::atomic::AtomicU64>) -> Self {
+        Self {
+            gas_price_wei,
+            eth_price_usd: env_f64("ETH_PRICE_USD", 3000.0),
+            volume_usd_per_block: env_f64("LPA_VOLUME_USD_PER_BLOCK", 50_000.0),
+        }
+    }
+}
+
+impl CostModel for LiveCostModel {
+    fn rebalance_cost_usd(&self, _chain_id: &str) -> f64 {
+        let gp = self.gas_price_wei.load(std::sync::atomic::Ordering::Relaxed) as f64;
+        (REBALANCE_GAS_UNITS as f64 * gp / 1e18) * self.eth_price_usd
+    }
+    fn volume_usd_per_block(&self, _pool_id: &str) -> f64 {
+        self.volume_usd_per_block
     }
 }
 
@@ -277,6 +300,18 @@ mod tests {
         let ticks = noisy_ticks(0, 200);
         let d = StrategyEngine::default().decide(&input(&ticks, 0, 5000, 6000, &cfg), &FixedCost);
         assert!(d.is_none());
+    }
+
+    #[test]
+    fn constant_ticks_zero_sigma_no_panic() {
+        let cfg = default_config();
+        let ticks = vec![100i32; 200];
+        let d = StrategyEngine::default().decide(&input(&ticks, 100, 5000, 6000, &cfg), &FixedCost);
+        let d = d.expect("OOR position should still decide with zero volatility");
+        assert_eq!(d.new_lower % 60, 0);
+        assert_eq!(d.new_upper % 60, 0);
+        assert!(d.new_lower < d.new_upper);
+        assert!(d.est_cost_usd.is_finite());
     }
 
     #[test]

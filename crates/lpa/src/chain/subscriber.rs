@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -15,7 +16,7 @@ use tracing::{debug, error, info, warn};
 use crate::chain::config::ChainConfig;
 use crate::position::tracker::{PositionRow, Tracker};
 use crate::proto::PositionConfig;
-use crate::strategy::{default_config, CostModel, DecideInput, StrategyEngine, StubCostModel};
+use crate::strategy::{default_config, CostModel, DecideInput, LiveCostModel, StrategyEngine};
 
 sol! {
     event Swap(
@@ -35,7 +36,9 @@ sol! {
         bytes32 indexed poolId,
         int24 tickLower,
         int24 tickUpper,
-        uint128 liquidity
+        uint128 liquidity,
+        uint24 fee,
+        int24 tickSpacing
     );
 
     event PositionClosed(bytes32 indexed positionId, address indexed owner, uint128 liquidity);
@@ -61,13 +64,14 @@ enum WatchEnd {
 
 pub async fn run_watch(cfg: ChainConfig, tracker: Arc<Tracker>, hook: Option<Address>) -> Result<()> {
     let engine = StrategyEngine::default();
-    let cost = StubCostModel;
+    let gas_price = Arc::new(AtomicU64::new(5_000_000_000));
+    let cost = LiveCostModel::new(gas_price.clone());
     let config = default_config();
     let mut attempt = 0u32;
 
     loop {
         let started = Instant::now();
-        match watch_once(&cfg, &tracker, &engine, &cost, &config, hook).await {
+        match watch_once(&cfg, &tracker, &engine, &cost, &config, hook, &gas_price).await {
             Ok(WatchEnd::Shutdown) => {
                 info!("shutdown signal received");
                 return Ok(());
@@ -99,10 +103,14 @@ async fn watch_once(
     cost: &dyn CostModel,
     config: &PositionConfig,
     hook: Option<Address>,
+    gas_price: &AtomicU64,
 ) -> Result<WatchEnd> {
     let ws_url = cfg.ws_url()?;
     let provider = ProviderBuilder::new().connect_ws(WsConnect::new(ws_url)).await?;
     info!(chain = cfg.name, chain_id = cfg.chain_id, "connected to WS RPC");
+    if let Ok(gp) = provider.get_gas_price().await {
+        gas_price.store(gp as u64, Ordering::Relaxed);
+    }
 
     let swap_filter = Filter::new()
         .address(cfg.addrs.pool_manager)
@@ -148,7 +156,11 @@ async fn watch_once(
             },
             _ = sleep(heartbeat) => {
                 match timeout(Duration::from_secs(5), provider.get_block_number()).await {
-                    Ok(Ok(_)) => {}
+                    Ok(Ok(_)) => {
+                        if let Ok(gp) = provider.get_gas_price().await {
+                            gas_price.store(gp as u64, Ordering::Relaxed);
+                        }
+                    }
                     _ => {
                         warn!("WS heartbeat health-check failed; forcing reconnect");
                         return Ok(WatchEnd::StreamEnded);
@@ -244,6 +256,8 @@ fn handle_opened(tracker: &Arc<Tracker>, chain_id: u64, log: Log) -> Result<()> 
         current_tick: None,
         in_range: false,
         entry_tick: Some((tick_lower + tick_upper) / 2),
+        fee: Some(ev.fee.to::<u32>()),
+        tick_spacing: Some(ev.tickSpacing.as_i32()),
     })?;
     info!(position_id = %position_id, tick_lower, tick_upper, "indexed PositionOpened");
     Ok(())
@@ -292,8 +306,8 @@ fn propose_rebalance(
         entry_tick,
         cur_lower: pos.tick_lower,
         cur_upper: pos.tick_upper,
-        tick_spacing: 60,
-        fee_pips: 3000,
+        tick_spacing: pos.tick_spacing.unwrap_or(60),
+        fee_pips: pos.fee.unwrap_or(3000),
         ticks: &ticks,
         config,
     };
@@ -329,7 +343,7 @@ mod tests {
         );
         assert_eq!(
             PositionOpened::SIGNATURE_HASH,
-            b256!("0x4b1141c4873ddadcb77b54d629ba596ebd2e41d649b97e3e5a66e87d6e6b8469")
+            b256!("0x01752da74706270d395215d4fcfe2c2b8d96be1d03425d74c6a3344378b06f19")
         );
         assert_eq!(
             PositionClosed::SIGNATURE_HASH,
@@ -388,6 +402,8 @@ mod tests {
                 current_tick: None,
                 in_range: false,
                 entry_tick: Some(150),
+                fee: None,
+                tick_spacing: None,
             })
             .unwrap();
         let (engine, cost, config) = engine_set();
@@ -416,6 +432,8 @@ mod tests {
             tickLower: I24::try_from(-600).unwrap(),
             tickUpper: I24::try_from(600).unwrap(),
             liquidity: 1_000_000u128,
+            fee: U24::from(3000u32),
+            tickSpacing: I24::try_from(60).unwrap(),
         };
         let log = RpcLog {
             inner: PrimLog { address: hook, data: opened.encode_log_data() },
@@ -428,6 +446,8 @@ mod tests {
         let p = tracker.get_position(&id_hex).unwrap().expect("indexed");
         assert_eq!((p.tick_lower, p.tick_upper), (-600, 600));
         assert_eq!(p.pool_id, format!("{:#x}", pool));
+        assert_eq!(p.fee, Some(3000), "fee indexed from event");
+        assert_eq!(p.tick_spacing, Some(60), "tick_spacing indexed from event");
 
         let closed = PositionClosed {
             positionId: pos_id,

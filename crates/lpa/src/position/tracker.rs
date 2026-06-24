@@ -15,6 +15,8 @@ CREATE TABLE IF NOT EXISTS positions (
     current_tick    INTEGER,
     in_range        INTEGER NOT NULL DEFAULT 0,
     entry_tick      INTEGER,
+    fee             INTEGER,
+    tick_spacing    INTEGER,
     last_updated_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_positions_pool ON positions(pool_id);
@@ -50,6 +52,8 @@ pub struct PositionRow {
     pub current_tick: Option<i32>,
     pub in_range: bool,
     pub entry_tick: Option<i32>,
+    pub fee: Option<u32>,
+    pub tick_spacing: Option<i32>,
 }
 
 #[derive(Debug, Clone)]
@@ -79,6 +83,7 @@ impl Tracker {
     pub fn open(path: &str) -> Result<Self> {
         let conn = Connection::open(path)?;
         conn.execute_batch(SCHEMA)?;
+        migrate(&conn);
         Ok(Self { conn: Mutex::new(conn) })
     }
 
@@ -86,6 +91,7 @@ impl Tracker {
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
+        migrate(&conn);
         Ok(Self { conn: Mutex::new(conn) })
     }
 
@@ -94,11 +100,12 @@ impl Tracker {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT OR REPLACE INTO positions
-             (position_id, owner, pool_id, chain_id, tick_lower, tick_upper, current_tick, in_range, entry_tick, last_updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, strftime('%s','now'))",
+             (position_id, owner, pool_id, chain_id, tick_lower, tick_upper, current_tick, in_range, entry_tick, fee, tick_spacing, last_updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, strftime('%s','now'))",
             params![
                 p.position_id, p.owner, p.pool_id, p.chain_id,
-                p.tick_lower, p.tick_upper, p.current_tick, p.in_range as i64, entry
+                p.tick_lower, p.tick_upper, p.current_tick, p.in_range as i64, entry,
+                p.fee.map(|f| f as i64), p.tick_spacing
             ],
         )?;
         Ok(())
@@ -108,7 +115,7 @@ impl Tracker {
     pub fn get_position(&self, position_id: &str) -> Result<Option<PositionRow>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT position_id, owner, pool_id, chain_id, tick_lower, tick_upper, current_tick, in_range, entry_tick
+            "SELECT position_id, owner, pool_id, chain_id, tick_lower, tick_upper, current_tick, in_range, entry_tick, fee, tick_spacing
              FROM positions WHERE position_id = ?1",
         )?;
         let mut rows = stmt.query_map(params![position_id], row_to_position)?;
@@ -121,7 +128,7 @@ impl Tracker {
     pub fn positions_for_pool(&self, pool_id: &str) -> Result<Vec<PositionRow>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT position_id, owner, pool_id, chain_id, tick_lower, tick_upper, current_tick, in_range, entry_tick
+            "SELECT position_id, owner, pool_id, chain_id, tick_lower, tick_upper, current_tick, in_range, entry_tick, fee, tick_spacing
              FROM positions WHERE pool_id = ?1",
         )?;
         let rows = stmt.query_map(params![pool_id], row_to_position)?;
@@ -268,6 +275,16 @@ impl Tracker {
     }
 }
 
+fn migrate(conn: &Connection) {
+    for stmt in [
+        "ALTER TABLE positions ADD COLUMN entry_tick INTEGER",
+        "ALTER TABLE positions ADD COLUMN fee INTEGER",
+        "ALTER TABLE positions ADD COLUMN tick_spacing INTEGER",
+    ] {
+        let _ = conn.execute(stmt, []);
+    }
+}
+
 fn row_to_position(row: &Row) -> rusqlite::Result<PositionRow> {
     Ok(PositionRow {
         position_id: row.get(0)?,
@@ -279,6 +296,8 @@ fn row_to_position(row: &Row) -> rusqlite::Result<PositionRow> {
         current_tick: row.get(6)?,
         in_range: row.get::<_, i64>(7)? != 0,
         entry_tick: row.get(8)?,
+        fee: row.get::<_, Option<i64>>(9)?.map(|v| v as u32),
+        tick_spacing: row.get(10)?,
     })
 }
 
@@ -313,6 +332,8 @@ mod tests {
             current_tick: None,
             in_range: false,
             entry_tick: None,
+            fee: None,
+            tick_spacing: None,
         }
     }
 
@@ -379,6 +400,35 @@ mod tests {
         let kept = t.recent_ticks("0xpool", 100).unwrap();
         assert_eq!(kept, vec![1006, 1007, 1008, 1009]);
         assert_eq!(t.recent_ticks("0xother", 100).unwrap(), vec![5]);
+    }
+
+    #[test]
+    fn migrates_old_schema_db() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        let path = f.path().to_str().unwrap().to_string();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE positions (
+                    position_id TEXT PRIMARY KEY, owner TEXT NOT NULL, pool_id TEXT NOT NULL,
+                    chain_id TEXT NOT NULL, tick_lower INTEGER NOT NULL, tick_upper INTEGER NOT NULL,
+                    current_tick INTEGER, in_range INTEGER NOT NULL DEFAULT 0, last_updated_at INTEGER);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO positions (position_id, owner, pool_id, chain_id, tick_lower, tick_upper, in_range)
+                 VALUES ('0xold', '0xowner', '0xpool', '1', 10, 20, 0)",
+                [],
+            )
+            .unwrap();
+        }
+        let t = Tracker::open(&path).unwrap();
+        let p = t.get_position("0xold").unwrap().expect("old row readable after migration");
+        assert_eq!((p.tick_lower, p.tick_upper), (10, 20));
+        assert_eq!(p.fee, None);
+        assert_eq!(p.tick_spacing, None);
+        t.register(&sample("0xnew", "0xpool", 1, 2)).unwrap();
+        assert_eq!(t.count_positions().unwrap(), 2);
     }
 
     #[test]
