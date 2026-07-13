@@ -24,7 +24,13 @@ pub fn in_range_prob(center: i32, lower: i32, upper: i32, step_sigma: f64, horiz
 
 fn fee_value(inp: &EvInputs, lower: i32, upper: i32) -> f64 {
     let width = (upper - lower).max(1) as f64;
-    let p_in = in_range_prob(inp.current_tick, lower, upper, inp.step_sigma, inp.horizon_blocks);
+    let p_in = in_range_prob(
+        inp.current_tick,
+        lower,
+        upper,
+        inp.step_sigma,
+        inp.horizon_blocks,
+    );
     let fee_frac = inp.fee_tier_pips / 1_000_000.0;
     inp.volume_usd_per_block * inp.horizon_blocks * fee_frac * p_in / width
 }

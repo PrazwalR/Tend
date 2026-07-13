@@ -13,10 +13,16 @@ use futures_util::StreamExt;
 use tokio::time::{sleep, timeout};
 use tracing::{debug, error, info, warn};
 
+use tokio::sync::mpsc;
+
 use crate::chain::config::ChainConfig;
+use crate::exec::RebalanceIntent;
 use crate::position::tracker::{PositionRow, Tracker};
 use crate::proto::PositionConfig;
-use crate::strategy::{default_config, CostModel, DecideInput, LiveCostModel, StrategyEngine};
+use crate::strategy::{
+    default_config, CostModel, DecideInput, LiveCostModel, StrategyEngine, DEFAULT_FEE_PIPS,
+    DEFAULT_TICK_SPACING,
+};
 
 sol! {
     event Swap(
@@ -54,24 +60,56 @@ sol! {
     );
 }
 
+/// Ticks kept per pool in `tick_history` (older rows pruned).
 const TICK_RETENTION: usize = 2000;
+/// Prune `tick_history` every N processed logs.
 const PRUNE_EVERY: u32 = 500;
+/// Gas price assumed until the first live fetch lands (5 gwei).
+const INITIAL_GAS_PRICE_WEI: u64 = 5_000_000_000;
+/// Default seconds of silence before the WS heartbeat health-check runs.
+const DEFAULT_HEARTBEAT_SECS: u64 = 30;
+/// Timeout for the heartbeat block-number probe.
+const HEALTH_PROBE_TIMEOUT_SECS: u64 = 5;
+/// A connection alive this long resets the reconnect backoff.
+const CONNECTION_STABLE_SECS: u64 = 60;
+/// Tick-history lookback fed to the strategy on an OOR event.
+const STRATEGY_TICK_WINDOW: usize = 200;
 
 enum WatchEnd {
     Shutdown,
     StreamEnded,
 }
 
-pub async fn run_watch(cfg: ChainConfig, tracker: Arc<Tracker>, hook: Option<Address>) -> Result<()> {
+fn store_gas_price(slot: &AtomicU64, wei: u128) {
+    slot.store(wei.min(u128::from(u64::MAX)) as u64, Ordering::Relaxed);
+}
+
+pub async fn run_watch(
+    cfg: ChainConfig,
+    tracker: Arc<Tracker>,
+    hook: Option<Address>,
+    intent_tx: Option<mpsc::Sender<RebalanceIntent>>,
+) -> Result<()> {
     let engine = StrategyEngine::default();
-    let gas_price = Arc::new(AtomicU64::new(5_000_000_000));
+    let gas_price = Arc::new(AtomicU64::new(INITIAL_GAS_PRICE_WEI));
     let cost = LiveCostModel::new(gas_price.clone());
     let config = default_config();
     let mut attempt = 0u32;
 
     loop {
         let started = Instant::now();
-        match watch_once(&cfg, &tracker, &engine, &cost, &config, hook, &gas_price).await {
+        match watch_once(
+            &cfg,
+            &tracker,
+            &engine,
+            &cost,
+            &config,
+            hook,
+            &gas_price,
+            intent_tx.as_ref(),
+        )
+        .await
+        {
             Ok(WatchEnd::Shutdown) => {
                 info!("shutdown signal received");
                 return Ok(());
@@ -80,7 +118,7 @@ pub async fn run_watch(cfg: ChainConfig, tracker: Arc<Tracker>, hook: Option<Add
             Err(e) => error!(error = %e, "WS watch connection error"),
         }
 
-        if started.elapsed() >= Duration::from_secs(60) {
+        if started.elapsed() >= Duration::from_secs(CONNECTION_STABLE_SECS) {
             attempt = 0;
         }
         let backoff = next_backoff(attempt);
@@ -96,6 +134,7 @@ pub async fn run_watch(cfg: ChainConfig, tracker: Arc<Tracker>, hook: Option<Add
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn watch_once(
     cfg: &ChainConfig,
     tracker: &Arc<Tracker>,
@@ -104,12 +143,19 @@ async fn watch_once(
     config: &PositionConfig,
     hook: Option<Address>,
     gas_price: &AtomicU64,
+    intent_tx: Option<&mpsc::Sender<RebalanceIntent>>,
 ) -> Result<WatchEnd> {
     let ws_url = cfg.ws_url()?;
-    let provider = ProviderBuilder::new().connect_ws(WsConnect::new(ws_url)).await?;
-    info!(chain = cfg.name, chain_id = cfg.chain_id, "connected to WS RPC");
+    let provider = ProviderBuilder::new()
+        .connect_ws(WsConnect::new(ws_url))
+        .await?;
+    info!(
+        chain = cfg.name,
+        chain_id = cfg.chain_id,
+        "connected to WS RPC"
+    );
     if let Ok(gp) = provider.get_gas_price().await {
-        gas_price.store(gp as u64, Ordering::Relaxed);
+        store_gas_price(gas_price, gp);
     }
 
     let swap_filter = Filter::new()
@@ -133,7 +179,10 @@ async fn watch_once(
     };
 
     let heartbeat = Duration::from_secs(
-        std::env::var("LPA_WS_HEARTBEAT_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(30),
+        std::env::var("LPA_WS_HEARTBEAT_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_HEARTBEAT_SECS),
     );
     let last_block: DashMap<B256, u64> = DashMap::new();
     let mut since_prune = 0u32;
@@ -141,7 +190,7 @@ async fn watch_once(
         tokio::select! {
             maybe_log = stream.next() => match maybe_log {
                 Some(log) => {
-                    if let Err(e) = handle(tracker, engine, cost, config, cfg.chain_id, &last_block, log) {
+                    if let Err(e) = handle(tracker, engine, cost, config, cfg.chain_id, &last_block, intent_tx, log) {
                         error!(error = %e, "log handling error");
                     }
                     since_prune += 1;
@@ -155,10 +204,10 @@ async fn watch_once(
                 None => return Ok(WatchEnd::StreamEnded),
             },
             _ = sleep(heartbeat) => {
-                match timeout(Duration::from_secs(5), provider.get_block_number()).await {
+                match timeout(Duration::from_secs(HEALTH_PROBE_TIMEOUT_SECS), provider.get_block_number()).await {
                     Ok(Ok(_)) => {
                         if let Ok(gp) = provider.get_gas_price().await {
-                            gas_price.store(gp as u64, Ordering::Relaxed);
+                            store_gas_price(gas_price, gp);
                         }
                     }
                     _ => {
@@ -177,6 +226,7 @@ fn next_backoff(attempt: u32) -> Duration {
     Duration::from_secs(secs)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle(
     tracker: &Arc<Tracker>,
     engine: &StrategyEngine,
@@ -184,6 +234,7 @@ fn handle(
     config: &PositionConfig,
     chain_id: u64,
     last_block: &DashMap<B256, u64>,
+    intent_tx: Option<&mpsc::Sender<RebalanceIntent>>,
     log: Log,
 ) -> Result<()> {
     if log.removed {
@@ -191,7 +242,9 @@ fn handle(
         return Ok(());
     }
     match log.topic0().copied() {
-        Some(t) if t == Swap::SIGNATURE_HASH => handle_swap(tracker, engine, cost, config, last_block, log),
+        Some(t) if t == Swap::SIGNATURE_HASH => {
+            handle_swap(tracker, engine, cost, config, last_block, intent_tx, log)
+        }
         Some(t) if t == PositionOpened::SIGNATURE_HASH => handle_opened(tracker, chain_id, log),
         Some(t) if t == PositionClosed::SIGNATURE_HASH => handle_closed(tracker, log),
         Some(t) if t == Rebalanced::SIGNATURE_HASH => handle_rebalanced(tracker, log),
@@ -199,17 +252,22 @@ fn handle(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_swap(
     tracker: &Arc<Tracker>,
     engine: &StrategyEngine,
     cost: &dyn CostModel,
     config: &PositionConfig,
     last_block: &DashMap<B256, u64>,
+    intent_tx: Option<&mpsc::Sender<RebalanceIntent>>,
     log: Log,
 ) -> Result<()> {
     let ev = match Swap::decode_log(&log.inner) {
         Ok(e) => e,
-        Err(_) => return Ok(()),
+        Err(e) => {
+            debug!(error = %e, "event decode failed; skipping log");
+            return Ok(());
+        }
     };
     let pool_id = ev.id;
     let pool_hex = format!("{:#x}", pool_id);
@@ -220,14 +278,26 @@ fn handle_swap(
     for cx in &crosses {
         if cx.was_in_range && !cx.now_in_range {
             warn!(position_id = %cx.position_id, tick, "position EXITED range");
-            propose_rebalance(tracker, engine, cost, config, &pool_hex, tick, &cx.position_id);
+            propose_rebalance(
+                tracker,
+                engine,
+                cost,
+                config,
+                intent_tx,
+                &pool_hex,
+                tick,
+                &cx.position_id,
+            );
         } else if !cx.was_in_range && cx.now_in_range {
             info!(position_id = %cx.position_id, tick, "position re-entered range");
         }
     }
 
     if !crosses.is_empty() {
-        let new_block = last_block.get(&pool_id).map(|v| *v != block).unwrap_or(true);
+        let new_block = last_block
+            .get(&pool_id)
+            .map(|v| *v != block)
+            .unwrap_or(true);
         if new_block {
             last_block.insert(pool_id, block);
             tracker.record_tick(&pool_hex, tick, block)?;
@@ -241,7 +311,10 @@ fn handle_swap(
 fn handle_opened(tracker: &Arc<Tracker>, chain_id: u64, log: Log) -> Result<()> {
     let ev = match PositionOpened::decode_log(&log.inner) {
         Ok(e) => e,
-        Err(_) => return Ok(()),
+        Err(e) => {
+            debug!(error = %e, "event decode failed; skipping log");
+            return Ok(());
+        }
     };
     let position_id = format!("{:#x}", ev.positionId);
     let tick_lower = ev.tickLower.as_i32();
@@ -266,7 +339,10 @@ fn handle_opened(tracker: &Arc<Tracker>, chain_id: u64, log: Log) -> Result<()> 
 fn handle_closed(tracker: &Arc<Tracker>, log: Log) -> Result<()> {
     let ev = match PositionClosed::decode_log(&log.inner) {
         Ok(e) => e,
-        Err(_) => return Ok(()),
+        Err(e) => {
+            debug!(error = %e, "event decode failed; skipping log");
+            return Ok(());
+        }
     };
     let position_id = format!("{:#x}", ev.positionId);
     tracker.delete_position(&position_id)?;
@@ -277,7 +353,10 @@ fn handle_closed(tracker: &Arc<Tracker>, log: Log) -> Result<()> {
 fn handle_rebalanced(tracker: &Arc<Tracker>, log: Log) -> Result<()> {
     let ev = match Rebalanced::decode_log(&log.inner) {
         Ok(e) => e,
-        Err(_) => return Ok(()),
+        Err(e) => {
+            debug!(error = %e, "event decode failed; skipping log");
+            return Ok(());
+        }
     };
     let position_id = format!("{:#x}", ev.positionId);
     let lower = ev.newTickLower.as_i32();
@@ -287,18 +366,26 @@ fn handle_rebalanced(tracker: &Arc<Tracker>, log: Log) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn propose_rebalance(
     tracker: &Arc<Tracker>,
     engine: &StrategyEngine,
     cost: &dyn CostModel,
     config: &PositionConfig,
+    intent_tx: Option<&mpsc::Sender<RebalanceIntent>>,
     pool_hex: &str,
     tick: i32,
     position_id: &str,
 ) {
-    let Ok(Some(pos)) = tracker.get_position(position_id) else { return };
-    let ticks = tracker.recent_ticks(pool_hex, 200).unwrap_or_default();
-    let entry_tick = pos.entry_tick.unwrap_or((pos.tick_lower + pos.tick_upper) / 2);
+    let Ok(Some(pos)) = tracker.get_position(position_id) else {
+        return;
+    };
+    let ticks = tracker
+        .recent_ticks(pool_hex, STRATEGY_TICK_WINDOW)
+        .unwrap_or_default();
+    let entry_tick = pos
+        .entry_tick
+        .unwrap_or((pos.tick_lower + pos.tick_upper) / 2);
     let input = DecideInput {
         pool_id: pool_hex,
         chain_id: &pos.chain_id,
@@ -306,20 +393,38 @@ fn propose_rebalance(
         entry_tick,
         cur_lower: pos.tick_lower,
         cur_upper: pos.tick_upper,
-        tick_spacing: pos.tick_spacing.unwrap_or(60),
-        fee_pips: pos.fee.unwrap_or(3000),
+        tick_spacing: pos.tick_spacing.unwrap_or(DEFAULT_TICK_SPACING),
+        fee_pips: pos.fee.unwrap_or(DEFAULT_FEE_PIPS),
         ticks: &ticks,
         config,
     };
-    if let Some(d) = engine.decide(&input, cost) {
-        warn!(
+    let Some(d) = engine.decide(&input, cost) else {
+        return;
+    };
+    match intent_tx {
+        Some(tx) => {
+            let intent = RebalanceIntent {
+                position_id: pos.position_id.clone(),
+                new_lower: d.new_lower,
+                new_upper: d.new_upper,
+            };
+            match tx.try_send(intent) {
+                Ok(()) => {
+                    info!(position_id = %pos.position_id, new_lower = d.new_lower, new_upper = d.new_upper, "auto-execute intent queued")
+                }
+                Err(_) => {
+                    warn!(position_id = %pos.position_id, "auto-execute queue full; dropped intent")
+                }
+            }
+        }
+        None => warn!(
             position_id = %pos.position_id,
             new_lower = d.new_lower,
             new_upper = d.new_upper,
             est_cost_usd = d.est_cost_usd,
             reason = %d.reason,
             "rebalance proposed (run `lpa rebalance` with this position id)"
-        );
+        ),
     }
 }
 
@@ -327,7 +432,7 @@ fn propose_rebalance(
 mod tests {
     use super::{handle, next_backoff, PositionClosed, PositionOpened, Rebalanced, Swap};
     use crate::position::tracker::{PositionRow, Tracker};
-    use crate::strategy::{default_config, StrategyEngine, StubCostModel};
+    use crate::strategy::{default_config, EstimateCostModel, StrategyEngine};
     use alloy::primitives::aliases::{I24, U160, U24};
     use alloy::primitives::{address, b256, Log as PrimLog, B256};
     use alloy::rpc::types::Log as RpcLog;
@@ -364,8 +469,16 @@ mod tests {
         assert_eq!(next_backoff(100).as_secs(), 30);
     }
 
-    fn engine_set() -> (StrategyEngine, StubCostModel, crate::proto::PositionConfig) {
-        (StrategyEngine::default(), StubCostModel, default_config())
+    fn engine_set() -> (
+        StrategyEngine,
+        EstimateCostModel,
+        crate::proto::PositionConfig,
+    ) {
+        (
+            StrategyEngine::default(),
+            EstimateCostModel,
+            default_config(),
+        )
     }
 
     fn swap_log(pool: B256, tick: i32, removed: bool) -> RpcLog {
@@ -383,7 +496,12 @@ mod tests {
             address: address!("0x498581ff718922c3f8e6a244956af099b2652b2b"),
             data: ev.encode_log_data(),
         };
-        RpcLog { inner, block_number: Some(1), removed, ..Default::default() }
+        RpcLog {
+            inner,
+            block_number: Some(1),
+            removed,
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -409,11 +527,35 @@ mod tests {
         let (engine, cost, config) = engine_set();
         let last_block: DashMap<B256, u64> = DashMap::new();
 
-        handle(&tracker, &engine, &cost, &config, 8453, &last_block, swap_log(pool, 150, false)).unwrap();
+        handle(
+            &tracker,
+            &engine,
+            &cost,
+            &config,
+            8453,
+            &last_block,
+            None,
+            swap_log(pool, 150, false),
+        )
+        .unwrap();
         assert_eq!(tracker.recent_ticks(&pool_hex, 10).unwrap(), vec![150]);
 
-        handle(&tracker, &engine, &cost, &config, 8453, &last_block, swap_log(pool, 160, true)).unwrap();
-        assert_eq!(tracker.recent_ticks(&pool_hex, 10).unwrap(), vec![150], "removed log must not record");
+        handle(
+            &tracker,
+            &engine,
+            &cost,
+            &config,
+            8453,
+            &last_block,
+            None,
+            swap_log(pool, 160, true),
+        )
+        .unwrap();
+        assert_eq!(
+            tracker.recent_ticks(&pool_hex, 10).unwrap(),
+            vec![150],
+            "removed log must not record"
+        );
     }
 
     #[test]
@@ -436,12 +578,25 @@ mod tests {
             tickSpacing: I24::try_from(60).unwrap(),
         };
         let log = RpcLog {
-            inner: PrimLog { address: hook, data: opened.encode_log_data() },
+            inner: PrimLog {
+                address: hook,
+                data: opened.encode_log_data(),
+            },
             block_number: Some(2),
             removed: false,
             ..Default::default()
         };
-        handle(&tracker, &engine, &cost, &config, 8453, &last_block, log).unwrap();
+        handle(
+            &tracker,
+            &engine,
+            &cost,
+            &config,
+            8453,
+            &last_block,
+            None,
+            log,
+        )
+        .unwrap();
         let id_hex = format!("{:#x}", pos_id);
         let p = tracker.get_position(&id_hex).unwrap().expect("indexed");
         assert_eq!((p.tick_lower, p.tick_upper), (-600, 600));
@@ -455,12 +610,28 @@ mod tests {
             liquidity: 1_000_000u128,
         };
         let clog = RpcLog {
-            inner: PrimLog { address: hook, data: closed.encode_log_data() },
+            inner: PrimLog {
+                address: hook,
+                data: closed.encode_log_data(),
+            },
             block_number: Some(3),
             removed: false,
             ..Default::default()
         };
-        handle(&tracker, &engine, &cost, &config, 8453, &last_block, clog).unwrap();
-        assert!(tracker.get_position(&id_hex).unwrap().is_none(), "closed position removed");
+        handle(
+            &tracker,
+            &engine,
+            &cost,
+            &config,
+            8453,
+            &last_block,
+            None,
+            clog,
+        )
+        .unwrap();
+        assert!(
+            tracker.get_position(&id_hex).unwrap().is_none(),
+            "closed position removed"
+        );
     }
 }

@@ -2,7 +2,11 @@
   "name": "@lp-autopilot/sdk",
   "version": "0.1.0",
   "description": "TypeScript Connect-ES client for the LP Autopilot strategy engine",
+  "license": "MIT",
   "type": "module",
+  "publishConfig": {
+    "access": "public"
+  },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {

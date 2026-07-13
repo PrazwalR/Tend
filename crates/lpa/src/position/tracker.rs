@@ -84,15 +84,19 @@ impl Tracker {
         let conn = Connection::open(path)?;
         conn.execute_batch(SCHEMA)?;
         migrate(&conn);
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
         migrate(&conn);
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
     pub fn register(&self, p: &PositionRow) -> Result<()> {
@@ -111,7 +115,6 @@ impl Tracker {
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub fn get_position(&self, position_id: &str) -> Result<Option<PositionRow>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -191,9 +194,15 @@ impl Tracker {
               bollinger_stddev, max_gas_usd, auto_compound_fees, use_flashbots)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
-                position_id, c.strategy, c.il_threshold_pct, c.fee_capture_ratio,
-                c.bollinger_period, c.bollinger_stddev, c.max_gas_usd,
-                c.auto_compound_fees as i64, c.use_flashbots as i64
+                position_id,
+                c.strategy,
+                c.il_threshold_pct,
+                c.fee_capture_ratio,
+                c.bollinger_period,
+                c.bollinger_stddev,
+                c.max_gas_usd,
+                c.auto_compound_fees as i64,
+                c.use_flashbots as i64
             ],
         )?;
         Ok(())
@@ -224,7 +233,12 @@ impl Tracker {
         }
     }
 
-    pub fn update_range(&self, position_id: &str, tick_lower: i32, tick_upper: i32) -> Result<bool> {
+    pub fn update_range(
+        &self,
+        position_id: &str,
+        tick_lower: i32,
+        tick_upper: i32,
+    ) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         let n = conn.execute(
             "UPDATE positions SET tick_lower = ?1, tick_upper = ?2,
@@ -237,8 +251,14 @@ impl Tracker {
 
     pub fn delete_position(&self, position_id: &str) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM configs WHERE position_id = ?1", params![position_id])?;
-        let n = conn.execute("DELETE FROM positions WHERE position_id = ?1", params![position_id])?;
+        conn.execute(
+            "DELETE FROM configs WHERE position_id = ?1",
+            params![position_id],
+        )?;
+        let n = conn.execute(
+            "DELETE FROM positions WHERE position_id = ?1",
+            params![position_id],
+        )?;
         Ok(n > 0)
     }
 
@@ -306,9 +326,18 @@ fn int24_be3(v: i32) -> [u8; 3] {
     [b[1], b[2], b[3]]
 }
 
-pub fn compute_position_id(owner: &str, pool_id: &str, tick_lower: i32, tick_upper: i32) -> Result<String> {
-    let owner: Address = owner.parse().map_err(|_| anyhow!("invalid owner address: {owner}"))?;
-    let pid: B256 = pool_id.parse().map_err(|_| anyhow!("invalid pool id: {pool_id}"))?;
+pub fn compute_position_id(
+    owner: &str,
+    pool_id: &str,
+    tick_lower: i32,
+    tick_upper: i32,
+) -> Result<String> {
+    let owner: Address = owner
+        .parse()
+        .map_err(|_| anyhow!("invalid owner address: {owner}"))?;
+    let pid: B256 = pool_id
+        .parse()
+        .map_err(|_| anyhow!("invalid pool id: {pool_id}"))?;
     let mut buf = Vec::with_capacity(20 + 32 + 3 + 3);
     buf.extend_from_slice(owner.as_slice());
     buf.extend_from_slice(pid.as_slice());
@@ -423,7 +452,10 @@ mod tests {
             .unwrap();
         }
         let t = Tracker::open(&path).unwrap();
-        let p = t.get_position("0xold").unwrap().expect("old row readable after migration");
+        let p = t
+            .get_position("0xold")
+            .unwrap()
+            .expect("old row readable after migration");
         assert_eq!((p.tick_lower, p.tick_upper), (10, 20));
         assert_eq!(p.fee, None);
         assert_eq!(p.tick_spacing, None);

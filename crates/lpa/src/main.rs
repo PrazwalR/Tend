@@ -50,6 +50,11 @@ enum Command {
         db: Option<String>,
         #[arg(long, env = "AUTOPILOT_HOOK_ADDRESS")]
         hook: Option<String>,
+        #[arg(
+            long,
+            help = "send real rebalance txs for indexed positions (requires --hook + REBALANCER_PRIVATE_KEY)"
+        )]
+        execute: bool,
     },
     #[command(allow_negative_numbers = true)]
     Register {
@@ -131,25 +136,78 @@ async fn main() -> anyhow::Result<()> {
             let db = db.or(file.db).unwrap_or_else(|| "lpa.sqlite".into());
             serve::run(&host, port, &db).await?;
         }
-        Command::Watch { chain, db, hook } => {
+        Command::Watch {
+            chain,
+            db,
+            hook,
+            execute,
+        } => {
             let file = cfg::load(cli.config.as_deref())?;
-            let chain = chain.or(file.chain).unwrap_or_else(|| "base".into());
-            let db = db.or(file.db).unwrap_or_else(|| "lpa.sqlite".into());
+            let chain = chain
+                .or(file.chain.clone())
+                .unwrap_or_else(|| "base".into());
+            let db = db
+                .or(file.db.clone())
+                .unwrap_or_else(|| "lpa.sqlite".into());
             let hook_addr = hook
-                .or(file.hook)
+                .or(file.hook.clone())
                 .filter(|h| !h.trim().is_empty())
                 .map(|h| h.parse::<alloy::primitives::Address>())
                 .transpose()
                 .map_err(|_| anyhow::anyhow!("invalid hook address"))?;
             let cfg = ChainConfig::from_name(&chain)?;
             let tracker = Arc::new(Tracker::open(&db)?);
+
+            let intent_tx = if execute {
+                let hook_addr =
+                    hook_addr.ok_or_else(|| anyhow::anyhow!("--execute requires --hook"))?;
+                let pk = std::env::var("REBALANCER_PRIVATE_KEY")
+                    .map_err(|_| anyhow::anyhow!("--execute requires REBALANCER_PRIVATE_KEY"))?;
+                let rpc = cfg.http_url()?;
+                let private = std::env::var("FLASHBOTS_RPC")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty());
+                let executor = exec::Executor::connect(&rpc, &pk, hook_addr, private).await?;
+                let auto = exec::AutoExec {
+                    slippage_bps: file.slippage_bps.unwrap_or(exec::DEFAULT_SLIPPAGE_BPS),
+                    max_gas_usd: file
+                        .max_gas_usd
+                        .or_else(|| {
+                            std::env::var("DEFAULT_MAX_GAS_USD")
+                                .ok()
+                                .and_then(|v| v.parse().ok())
+                        })
+                        .unwrap_or(exec::DEFAULT_MAX_GAS_USD),
+                    eth_price_usd: file
+                        .eth_price_usd
+                        .or_else(|| {
+                            std::env::var("ETH_PRICE_USD")
+                                .ok()
+                                .and_then(|v| v.parse().ok())
+                        })
+                        .unwrap_or(exec::DEFAULT_ETH_PRICE_USD),
+                    min_interval: std::time::Duration::from_secs(
+                        std::env::var("LPA_AUTO_INTERVAL_SECS")
+                            .ok()
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(exec::DEFAULT_AUTO_INTERVAL_SECS),
+                    ),
+                };
+                let (tx, rx) = tokio::sync::mpsc::channel(exec::AUTO_INTENT_CHANNEL_CAP);
+                tokio::spawn(exec::run_executor_loop(rx, executor, auto));
+                Some(tx)
+            } else {
+                None
+            };
+
             tracing::info!(
                 chain = cfg.name,
                 positions = tracker.count_positions()?,
                 indexing_hook = hook_addr.is_some(),
+                auto_execute = execute,
                 "starting watch"
             );
-            chain::subscriber::run_watch(cfg, tracker, hook_addr).await?;
+            chain::subscriber::run_watch(cfg, tracker, hook_addr, intent_tx).await?;
         }
         Command::Register {
             chain,
@@ -201,37 +259,56 @@ async fn main() -> anyhow::Result<()> {
             }
             let file = cfg::load(cli.config.as_deref())?;
             let chain = chain.or(file.chain).unwrap_or_else(|| "base".into());
-            let slippage_bps = slippage_bps.or(file.slippage_bps).unwrap_or(100);
-            let max_gas_usd = max_gas_usd.or(file.max_gas_usd).unwrap_or(50.0);
-            let eth_price_usd = eth_price_usd.or(file.eth_price_usd).unwrap_or(3000.0);
-            let hook = hook
-                .or(file.hook)
-                .ok_or_else(|| anyhow::anyhow!("hook address required (--hook, AUTOPILOT_HOOK_ADDRESS, or config)"))?;
+            let slippage_bps = slippage_bps
+                .or(file.slippage_bps)
+                .unwrap_or(exec::DEFAULT_SLIPPAGE_BPS);
+            let max_gas_usd = max_gas_usd
+                .or(file.max_gas_usd)
+                .unwrap_or(exec::DEFAULT_MAX_GAS_USD);
+            let eth_price_usd = eth_price_usd
+                .or(file.eth_price_usd)
+                .unwrap_or(exec::DEFAULT_ETH_PRICE_USD);
+            let hook = hook.or(file.hook).ok_or_else(|| {
+                anyhow::anyhow!("hook address required (--hook, AUTOPILOT_HOOK_ADDRESS, or config)")
+            })?;
 
             let cfg = ChainConfig::from_name(&chain)?;
             let rpc = cfg.http_url()?;
             let pk = std::env::var("REBALANCER_PRIVATE_KEY")
                 .map_err(|_| anyhow::anyhow!("REBALANCER_PRIVATE_KEY not set"))?;
             tracing::warn!("rebalancer key loaded from env (plaintext) — testnet only; use a keystore or external signer in production");
-            let hook_addr: alloy::primitives::Address =
-                hook.parse().map_err(|_| anyhow::anyhow!("invalid hook address: {hook}"))?;
+            let hook_addr: alloy::primitives::Address = hook
+                .parse()
+                .map_err(|_| anyhow::anyhow!("invalid hook address: {hook}"))?;
             let pid: alloy::primitives::B256 = position_id
                 .parse()
                 .map_err(|_| anyhow::anyhow!("invalid --position-id (expect 0x + 64 hex)"))?;
-            let private = std::env::var("FLASHBOTS_RPC").ok().filter(|s| !s.trim().is_empty());
+            let private = std::env::var("FLASHBOTS_RPC")
+                .ok()
+                .filter(|s| !s.trim().is_empty());
             let executor = exec::Executor::connect(&rpc, &pk, hook_addr, private).await?;
             tracing::info!(signer = %executor.signer(), hook = %hook_addr, chain = cfg.name, "executor ready");
 
             if dry_run {
                 let s = executor.simulate(pid, new_lower, new_upper).await?;
                 if s.ok {
-                    println!("DRY-RUN OK | est_gas={} | quoted_liquidity={}", s.gas_estimate, s.quoted_liquidity);
+                    println!(
+                        "DRY-RUN OK | est_gas={} | quoted_liquidity={}",
+                        s.gas_estimate, s.quoted_liquidity
+                    );
                 } else {
                     println!("DRY-RUN REVERT | {}", s.revert.unwrap_or_default());
                 }
             } else {
                 let r = executor
-                    .execute(pid, new_lower, new_upper, slippage_bps, max_gas_usd, eth_price_usd)
+                    .execute(
+                        pid,
+                        new_lower,
+                        new_upper,
+                        slippage_bps,
+                        max_gas_usd,
+                        eth_price_usd,
+                    )
                     .await?;
                 println!(
                     "{} | tx={} | gas_used={}",
@@ -259,9 +336,13 @@ async fn main() -> anyhow::Result<()> {
                 .current_tick
                 .or_else(|| ticks.last().copied())
                 .ok_or_else(|| anyhow::anyhow!("no tick data for pool {}", pos.pool_id))?;
-            let entry_tick = pos.entry_tick.unwrap_or((pos.tick_lower + pos.tick_upper) / 2);
-            let tick_spacing = tick_spacing.or(pos.tick_spacing).unwrap_or(60);
-            let fee_pips = fee.or(pos.fee).unwrap_or(3000);
+            let entry_tick = pos
+                .entry_tick
+                .unwrap_or((pos.tick_lower + pos.tick_upper) / 2);
+            let tick_spacing = tick_spacing
+                .or(pos.tick_spacing)
+                .unwrap_or(strategy::DEFAULT_TICK_SPACING);
+            let fee_pips = fee.or(pos.fee).unwrap_or(strategy::DEFAULT_FEE_PIPS);
             let config = strategy::config_from(
                 file.il_threshold_pct,
                 file.bollinger_period,
@@ -279,10 +360,16 @@ async fn main() -> anyhow::Result<()> {
                 ticks: &ticks,
                 config: &config,
             };
-            match strategy::StrategyEngine::default().decide(&input, &strategy::StubCostModel) {
+            match strategy::StrategyEngine::default().decide(&input, &strategy::EstimateCostModel) {
                 Some(d) => println!(
                     "REBALANCE [{}, {}] -> [{}, {}] | {} | ~${:.2} | {:?}",
-                    pos.tick_lower, pos.tick_upper, d.new_lower, d.new_upper, d.reason, d.est_cost_usd, d.strategy
+                    pos.tick_lower,
+                    pos.tick_upper,
+                    d.new_lower,
+                    d.new_upper,
+                    d.reason,
+                    d.est_cost_usd,
+                    d.strategy
                 ),
                 None => println!("HOLD: no EV-positive rebalance for {position_id}"),
             }

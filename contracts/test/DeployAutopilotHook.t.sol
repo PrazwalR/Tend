@@ -13,8 +13,7 @@ contract DeployAutopilotHookTest is Test, Deployers {
 
         uint160 flags = uint160(Hooks.AFTER_SWAP_FLAG);
         bytes memory args = abi.encode(manager, address(0xBEEF), uint64(3600));
-        (address predicted, bytes32 salt) =
-            HookMiner.find(address(this), flags, type(AutopilotHook).creationCode, args);
+        (address predicted, bytes32 salt) = HookMiner.find(address(this), flags, type(AutopilotHook).creationCode, args);
 
         AutopilotHook hook = new AutopilotHook{salt: salt}(manager, address(0xBEEF), uint64(3600));
 

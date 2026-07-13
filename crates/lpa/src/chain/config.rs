@@ -2,11 +2,8 @@ use alloy::primitives::{address, Address};
 use anyhow::{anyhow, bail, Result};
 
 #[derive(Clone, Copy)]
-#[allow(dead_code)]
 pub struct ChainAddrs {
     pub pool_manager: Address,
-    pub state_view: Address,
-    pub position_manager: Address,
 }
 
 #[derive(Clone)]
@@ -24,8 +21,6 @@ impl ChainConfig {
                 name: "base",
                 addrs: ChainAddrs {
                     pool_manager: address!("0x498581ff718922c3f8e6a244956af099b2652b2b"),
-                    state_view: address!("0xa3c0c9b65bad0b08107aa264b0f3db444b867a71"),
-                    position_manager: address!("0x7c5f5a4bbd8fd63184577525326123b519429bdc"),
                 },
             }),
             "ethereum" | "eth" | "mainnet" => Ok(Self {
@@ -33,8 +28,6 @@ impl ChainConfig {
                 name: "ethereum",
                 addrs: ChainAddrs {
                     pool_manager: address!("0x000000000004444c5dc75cb358380d2e3de08a90"),
-                    state_view: address!("0x7ffe42c4a5deea5b0fec41c94c136cf115597227"),
-                    position_manager: address!("0xbd216513d74c8cf14cf4747e6aaa6420ff64ee9e"),
                 },
             }),
             other => bail!("unknown chain: {other}"),
@@ -42,13 +35,20 @@ impl ChainConfig {
     }
 
     pub fn ws_url(&self) -> Result<String> {
-        let key = if self.name == "base" { "RPC_WS_BASE" } else { "RPC_WS_ETHEREUM" };
+        let key = if self.name == "base" {
+            "RPC_WS_BASE"
+        } else {
+            "RPC_WS_ETHEREUM"
+        };
         std::env::var(key).map_err(|_| anyhow!("{key} not set in env"))
     }
 
-    #[allow(dead_code)]
     pub fn http_url(&self) -> Result<String> {
-        let key = if self.name == "base" { "RPC_BASE" } else { "RPC_ETHEREUM" };
+        let key = if self.name == "base" {
+            "RPC_BASE"
+        } else {
+            "RPC_ETHEREUM"
+        };
         std::env::var(key).map_err(|_| anyhow!("{key} not set in env"))
     }
 }
@@ -66,11 +66,12 @@ mod tests {
     }
 
     #[test]
-    fn addresses_distinct_per_chain() {
-        let b = ChainConfig::from_name("base").unwrap().addrs;
-        assert_ne!(b.pool_manager, b.state_view);
-        assert_ne!(b.pool_manager, b.position_manager);
-        let e = ChainConfig::from_name("ethereum").unwrap().addrs;
-        assert_ne!(e.state_view, b.state_view);
+    fn pool_manager_differs_per_chain() {
+        let base = ChainConfig::from_name("base").unwrap().addrs.pool_manager;
+        let eth = ChainConfig::from_name("ethereum")
+            .unwrap()
+            .addrs
+            .pool_manager;
+        assert_ne!(base, eth);
     }
 }

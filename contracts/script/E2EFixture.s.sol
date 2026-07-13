@@ -36,8 +36,7 @@ contract E2EFixture is Script {
         t0.approve(address(hook), type(uint256).max);
         t1.approve(address(hook), type(uint256).max);
 
-        PoolKey memory key =
-            PoolKey(Currency.wrap(address(t0)), Currency.wrap(address(t1)), 3000, 60, IHooks(hook));
+        PoolKey memory key = PoolKey(Currency.wrap(address(t0)), Currency.wrap(address(t1)), 3000, 60, IHooks(hook));
         IPoolManager(manager).initialize(key, SQRT_PRICE_1_1);
         bytes32 positionId = hook.deposit(key, -600, 600, 1e18, -1200, 1200);
         vm.stopBroadcast();

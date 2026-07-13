@@ -106,10 +106,7 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
     error RenounceDisabled();
     error NativeNotSupported();
 
-    constructor(IPoolManager pm, address initialRebalancer, uint64 cooldown)
-        BaseHook(pm)
-        Ownable(msg.sender)
-    {
+    constructor(IPoolManager pm, address initialRebalancer, uint64 cooldown) BaseHook(pm) Ownable(msg.sender) {
         if (initialRebalancer != address(0)) {
             isRebalancer[initialRebalancer] = true;
             emit RebalancerSet(initialRebalancer, true);

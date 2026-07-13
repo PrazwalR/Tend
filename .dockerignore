@@ -1,0 +1,15 @@
+target/
+**/target/
+contracts/
+packages/
+node_modules/
+.git/
+.github/
+.env
+.env.*
+!.env.example
+*.sqlite
+*.sqlite-*
+lpa.toml
+README.md
+ROADMAP.md

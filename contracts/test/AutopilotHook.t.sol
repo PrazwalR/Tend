@@ -109,7 +109,7 @@ contract AutopilotHookTest is Test, Deployers {
         vm.prank(rebalancer);
         hook.rebalance(pid, -1200, 1200, 0);
 
-        (, , int24 lo, int24 hi, uint128 liq,, uint64 last) = hook.positions(pid);
+        (,, int24 lo, int24 hi, uint128 liq,, uint64 last) = hook.positions(pid);
         assertEq(lo, -1200);
         assertEq(hi, 1200);
         assertGt(liq, 0);

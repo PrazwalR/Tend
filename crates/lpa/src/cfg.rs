@@ -31,7 +31,9 @@ pub fn default_path() -> Option<String> {
     if std::path::Path::new("lpa.toml").exists() {
         return Some("lpa.toml".to_string());
     }
-    std::env::var("HOME").ok().map(|h| format!("{h}/.config/lpa/lpa.toml"))
+    std::env::var("HOME")
+        .ok()
+        .map(|h| format!("{h}/.config/lpa/lpa.toml"))
 }
 
 pub fn resolved_path(explicit: Option<&str>) -> String {
@@ -57,13 +59,16 @@ pub fn load(explicit: Option<&str>) -> Result<Config> {
 }
 
 pub fn init(explicit: Option<&str>, force: bool) -> Result<String> {
-    let path = explicit.map(str::to_string).unwrap_or_else(|| "lpa.toml".to_string());
+    let path = explicit
+        .map(str::to_string)
+        .unwrap_or_else(|| "lpa.toml".to_string());
     if std::path::Path::new(&path).exists() && !force {
         anyhow::bail!("{path} already exists (use --force to overwrite)");
     }
     if let Some(parent) = std::path::Path::new(&path).parent() {
         if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
         }
     }
     std::fs::write(&path, TEMPLATE).with_context(|| format!("writing {path}"))?;

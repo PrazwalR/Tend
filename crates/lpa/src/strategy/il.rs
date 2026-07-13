@@ -10,7 +10,12 @@ fn amounts(sp: f64, spa: f64, spb: f64) -> (f64, f64) {
     }
 }
 
-pub fn concentrated_il(entry_tick: i32, current_tick: i32, tick_lower: i32, tick_upper: i32) -> f64 {
+pub fn concentrated_il(
+    entry_tick: i32,
+    current_tick: i32,
+    tick_lower: i32,
+    tick_upper: i32,
+) -> f64 {
     if tick_lower >= tick_upper {
         return 0.0;
     }

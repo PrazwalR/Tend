@@ -9,8 +9,8 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
-use crate::position::tracker::{ConfigRow, PositionRow, Tracker};
 use crate::position::tracker::compute_position_id;
+use crate::position::tracker::{ConfigRow, PositionRow, Tracker};
 use crate::proto::autopilot_strategy_server::AutopilotStrategy;
 use crate::proto::{
     DeregisterPositionRequest, DeregisterPositionResponse, GetPositionConfigRequest, PingRequest,
@@ -30,6 +30,11 @@ sol! {
     }
 }
 
+/// Buffered position-state updates per streaming client.
+const STREAM_CHANNEL_CAP: usize = 16;
+/// How often the position stream re-reads the tracker and pushes an update.
+const STREAM_POLL_SECS: u64 = 2;
+
 pub struct StrategyService {
     tracker: Arc<Tracker>,
 }
@@ -43,7 +48,9 @@ impl StrategyService {
 #[tonic::async_trait]
 impl AutopilotStrategy for StrategyService {
     async fn ping(&self, _req: Request<PingRequest>) -> Result<Response<PingResponse>, Status> {
-        Ok(Response::new(PingResponse { timestamp: now_secs() }))
+        Ok(Response::new(PingResponse {
+            timestamp: now_secs(),
+        }))
     }
 
     async fn register_position(
@@ -51,15 +58,24 @@ impl AutopilotStrategy for StrategyService {
         req: Request<RegisterPositionRequest>,
     ) -> Result<Response<RegisterPositionResponse>, Status> {
         let req = req.into_inner();
-        let pool_key = req.pool_key.ok_or_else(|| Status::invalid_argument("pool_key required"))?;
-        let range = req.tick_range.ok_or_else(|| Status::invalid_argument("tick_range required"))?;
+        let pool_key = req
+            .pool_key
+            .ok_or_else(|| Status::invalid_argument("pool_key required"))?;
+        let range = req
+            .tick_range
+            .ok_or_else(|| Status::invalid_argument("tick_range required"))?;
         if range.tick_lower >= range.tick_upper {
             return Err(Status::invalid_argument("tick_lower must be < tick_upper"));
         }
         let pool_id = pool_id_from_key(&pool_key)?;
-        let position_id = compute_position_id(&req.owner, &pool_id, range.tick_lower, range.tick_upper)
-            .map_err(|e| Status::invalid_argument(e.to_string()))?;
-        let chain_id = if req.chain_id.is_empty() { "8453".to_string() } else { req.chain_id };
+        let position_id =
+            compute_position_id(&req.owner, &pool_id, range.tick_lower, range.tick_upper)
+                .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let chain_id = if req.chain_id.is_empty() {
+            "8453".to_string()
+        } else {
+            req.chain_id
+        };
 
         self.tracker
             .register(&PositionRow {
@@ -83,7 +99,10 @@ impl AutopilotStrategy for StrategyService {
                 .map_err(|e| Status::internal(e.to_string()))?;
         }
 
-        Ok(Response::new(RegisterPositionResponse { position_id, success: true }))
+        Ok(Response::new(RegisterPositionResponse {
+            position_id,
+            success: true,
+        }))
     }
 
     async fn deregister_position(
@@ -103,7 +122,11 @@ impl AutopilotStrategy for StrategyService {
         req: Request<GetPositionConfigRequest>,
     ) -> Result<Response<PositionConfig>, Status> {
         let id = req.into_inner().position_id;
-        match self.tracker.get_config(&id).map_err(|e| Status::internal(e.to_string()))? {
+        match self
+            .tracker
+            .get_config(&id)
+            .map_err(|e| Status::internal(e.to_string()))?
+        {
             Some(row) => Ok(Response::new(row_to_config(&id, &row))),
             None => Err(Status::not_found("config not found")),
         }
@@ -114,7 +137,9 @@ impl AutopilotStrategy for StrategyService {
         req: Request<UpdateConfigRequest>,
     ) -> Result<Response<UpdateConfigResponse>, Status> {
         let req = req.into_inner();
-        let cfg = req.config.ok_or_else(|| Status::invalid_argument("config required"))?;
+        let cfg = req
+            .config
+            .ok_or_else(|| Status::invalid_argument("config required"))?;
         if self
             .tracker
             .get_position(&req.position_id)
@@ -137,9 +162,9 @@ impl AutopilotStrategy for StrategyService {
     ) -> Result<Response<Self::StreamPositionsStream>, Status> {
         let ids = req.into_inner().position_ids;
         let tracker = Arc::clone(&self.tracker);
-        let (tx, rx) = mpsc::channel(16);
+        let (tx, rx) = mpsc::channel(STREAM_CHANNEL_CAP);
         tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_secs(2));
+            let mut ticker = tokio::time::interval(Duration::from_secs(STREAM_POLL_SECS));
             loop {
                 ticker.tick().await;
                 let targets = if ids.is_empty() {
@@ -161,10 +186,20 @@ impl AutopilotStrategy for StrategyService {
 }
 
 fn pool_id_from_key(k: &PoolKey) -> Result<String, Status> {
-    let currency0: Address = k.currency0.parse().map_err(|_| Status::invalid_argument("bad currency0"))?;
-    let currency1: Address = k.currency1.parse().map_err(|_| Status::invalid_argument("bad currency1"))?;
-    let hooks: Address = k.hooks.parse().map_err(|_| Status::invalid_argument("bad hooks"))?;
-    let tick_spacing = I24::try_from(k.tick_spacing).map_err(|_| Status::invalid_argument("bad tick_spacing"))?;
+    let currency0: Address = k
+        .currency0
+        .parse()
+        .map_err(|_| Status::invalid_argument("bad currency0"))?;
+    let currency1: Address = k
+        .currency1
+        .parse()
+        .map_err(|_| Status::invalid_argument("bad currency1"))?;
+    let hooks: Address = k
+        .hooks
+        .parse()
+        .map_err(|_| Status::invalid_argument("bad hooks"))?;
+    let tick_spacing =
+        I24::try_from(k.tick_spacing).map_err(|_| Status::invalid_argument("bad tick_spacing"))?;
     let abi = PoolKeyAbi {
         currency0,
         currency1,
@@ -175,6 +210,11 @@ fn pool_id_from_key(k: &PoolKey) -> Result<String, Status> {
     Ok(format!("{:#x}", keccak256(abi.abi_encode())))
 }
 
+/// Builds the health view the stream serves. Populated from indexed state:
+/// range, current tick, in-range flag, and concentrated-LP IL. Token balances,
+/// uncollected fees, and fee APR are left empty/zero because they require
+/// per-position on-chain (StateView) reads the daemon does not yet perform;
+/// they are `unknown`, not fabricated. See README.
 fn position_state(p: &PositionRow) -> PositionState {
     let il_percent = match p.current_tick {
         Some(t) => concentrated_il(
@@ -189,7 +229,10 @@ fn position_state(p: &PositionRow) -> PositionState {
         position_id: p.position_id.clone(),
         owner: p.owner.clone(),
         pool_key: None,
-        current_range: Some(TickRange { tick_lower: p.tick_lower, tick_upper: p.tick_upper }),
+        current_range: Some(TickRange {
+            tick_lower: p.tick_lower,
+            tick_upper: p.tick_upper,
+        }),
         current_tick: p.current_tick.unwrap_or(0),
         liquidity: String::new(),
         token0_amount: String::new(),
@@ -232,7 +275,10 @@ fn row_to_config(position_id: &str, c: &ConfigRow) -> PositionConfig {
 }
 
 fn now_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

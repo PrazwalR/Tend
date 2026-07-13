@@ -33,16 +33,28 @@ pub trait CostModel {
 }
 
 fn env_f64(key: &str, default: f64) -> f64 {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
+/// Gas a rebalance (remove + add liquidity) costs, used to price the EV gate.
 const REBALANCE_GAS_UNITS: u64 = 270_000;
 
-pub struct StubCostModel;
+/// Fallback pool parameters when a tracked position has no stored fee/tick
+/// spacing (e.g. an off-chain `lpa register` without `--fee`/`--tick-spacing`).
+pub const DEFAULT_TICK_SPACING: i32 = 60;
+pub const DEFAULT_FEE_PIPS: u32 = 3000;
 
-impl CostModel for StubCostModel {
+/// Cost model for the offline `lpa simulate` command: gas/volume come from
+/// env vars (operator estimates), not the chain. The live `watch` path uses
+/// [`LiveCostModel`], which reads a real refreshed gas price.
+pub struct EstimateCostModel;
+
+impl CostModel for EstimateCostModel {
     fn rebalance_cost_usd(&self, _chain_id: &str) -> f64 {
-        env_f64("LPA_DEMO_GAS_USD", 5.0)
+        env_f64("LPA_SIMULATE_GAS_USD", 5.0)
     }
     fn volume_usd_per_block(&self, _pool_id: &str) -> f64 {
         env_f64("LPA_VOLUME_USD_PER_BLOCK", 50_000.0)
@@ -67,7 +79,9 @@ impl LiveCostModel {
 
 impl CostModel for LiveCostModel {
     fn rebalance_cost_usd(&self, _chain_id: &str) -> f64 {
-        let gp = self.gas_price_wei.load(std::sync::atomic::Ordering::Relaxed) as f64;
+        let gp = self
+            .gas_price_wei
+            .load(std::sync::atomic::Ordering::Relaxed) as f64;
         (REBALANCE_GAS_UNITS as f64 * gp / 1e18) * self.eth_price_usd
     }
     fn volume_usd_per_block(&self, _pool_id: &str) -> f64 {
@@ -114,9 +128,13 @@ pub struct StrategyEngine {
 
 impl Default for StrategyEngine {
     fn default() -> Self {
+        let min_ticks = std::env::var("LPA_MIN_TICKS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8);
         Self {
             horizon_blocks: 300.0,
-            min_ticks: 8,
+            min_ticks,
         }
     }
 }
@@ -139,10 +157,14 @@ impl StrategyEngine {
         let bands = math::bollinger(input.ticks, k);
         let spacing = input.tick_spacing.max(1);
         let half = self.half_width(strategy, &bands, input);
-        let new_lower =
-            math::clamp_tick(math::round_down_to_spacing(input.current_tick - half, spacing), spacing);
-        let new_upper =
-            math::clamp_tick(math::round_up_to_spacing(input.current_tick + half, spacing), spacing);
+        let new_lower = math::clamp_tick(
+            math::round_down_to_spacing(input.current_tick - half, spacing),
+            spacing,
+        );
+        let new_upper = math::clamp_tick(
+            math::round_up_to_spacing(input.current_tick + half, spacing),
+            spacing,
+        );
         if new_upper <= new_lower {
             return None;
         }
@@ -184,13 +206,22 @@ impl StrategyEngine {
         }
 
         let reason = if !in_range {
-            format!("out of range: tick {tick} not in [{},{}]", input.cur_lower, input.cur_upper)
+            format!(
+                "out of range: tick {tick} not in [{},{}]",
+                input.cur_lower, input.cur_upper
+            )
         } else if il_breach {
-            format!("IL {il:.2}% exceeds {:.2}% limit", input.config.il_threshold_pct)
+            format!(
+                "IL {il:.2}% exceeds {:.2}% limit",
+                input.config.il_threshold_pct
+            )
         } else if over_ranged {
             format!("over-ranged: width {range_width} vs target {target_width}")
         } else if out_of_bb {
-            format!("tick {tick} outside Bollinger [{:.0},{:.0}]", bands.lower, bands.upper)
+            format!(
+                "tick {tick} outside Bollinger [{:.0},{:.0}]",
+                bands.lower, bands.upper
+            )
         } else {
             format!("near boundary of [{},{}]", input.cur_lower, input.cur_upper)
         };
@@ -244,12 +275,16 @@ mod tests {
     }
 
     fn noisy_ticks(center: i32, n: usize) -> Vec<i32> {
-        (0..n)
-            .map(|i| center + ((i as i32 * 7) % 11) - 5)
-            .collect()
+        (0..n).map(|i| center + ((i as i32 * 7) % 11) - 5).collect()
     }
 
-    fn input<'a>(ticks: &'a [i32], cur: i32, lo: i32, hi: i32, cfg: &'a PositionConfig) -> DecideInput<'a> {
+    fn input<'a>(
+        ticks: &'a [i32],
+        cur: i32,
+        lo: i32,
+        hi: i32,
+        cfg: &'a PositionConfig,
+    ) -> DecideInput<'a> {
         DecideInput {
             pool_id: "0xpool",
             chain_id: "8453",

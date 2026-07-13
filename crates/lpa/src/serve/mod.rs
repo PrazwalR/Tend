@@ -10,6 +10,19 @@ use crate::position::tracker::Tracker;
 use crate::proto::autopilot_strategy_server::AutopilotStrategyServer;
 use strategy_service::StrategyService;
 
+/// Constant-time byte comparison, so the auth check does not leak the token
+/// via response timing. Length is not secret (bearer tokens are fixed-length).
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 pub async fn run(host: &str, port: u16, db: &str) -> anyhow::Result<()> {
     let addr = format!("{host}:{port}").parse()?;
     if host == "0.0.0.0" {
@@ -29,11 +42,13 @@ pub async fn run(host: &str, port: u16, db: &str) -> anyhow::Result<()> {
     let auth = move |req: Request<()>| -> Result<Request<()>, Status> {
         match &expected {
             Some(header) => {
-                let got = req.metadata().get("authorization").and_then(|v| v.to_str().ok());
-                if got == Some(header.as_str()) {
-                    Ok(req)
-                } else {
-                    Err(Status::unauthenticated("missing or invalid bearer token"))
+                let got = req
+                    .metadata()
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok());
+                match got {
+                    Some(g) if ct_eq(g.as_bytes(), header.as_bytes()) => Ok(req),
+                    _ => Err(Status::unauthenticated("missing or invalid bearer token")),
                 }
             }
             None => Ok(req),
@@ -45,7 +60,10 @@ pub async fn run(host: &str, port: u16, db: &str) -> anyhow::Result<()> {
         .accept_http1(true)
         .layer(GrpcWebLayer::new())
         .add_service(AutopilotStrategyServer::with_interceptor(service, auth))
-        .serve(addr)
+        .serve_with_shutdown(addr, async {
+            let _ = tokio::signal::ctrl_c().await;
+            tracing::info!("shutdown signal received; draining serve");
+        })
         .await?;
     Ok(())
 }
