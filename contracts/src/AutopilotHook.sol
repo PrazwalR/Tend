@@ -15,6 +15,10 @@ import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {SwapParams, ModifyLiquidityParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 
+import {SqrtPriceMath} from "@uniswap/v4-core/src/libraries/SqrtPriceMath.sol";
+import {FullMath} from "@uniswap/v4-core/src/libraries/FullMath.sol";
+import {FixedPoint96} from "@uniswap/v4-core/src/libraries/FixedPoint96.sol";
+
 import {LiquidityAmounts} from "@uniswap/v4-periphery/src/libraries/LiquidityAmounts.sol";
 
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
@@ -331,6 +335,14 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
         uint256 freed1 = removed.amount1() > 0 ? uint256(uint128(removed.amount1())) : 0;
         if (freed0 == 0 && freed1 == 0) revert NothingFreed();
 
+        // A position that has drifted out of range is entirely one token, but
+        // a range straddling the current price needs both. Without this swap
+        // the redeposit below would compute zero liquidity and revert — which
+        // is precisely the case a rebalance exists to handle.
+        BalanceDelta swapped = _swapToRatio(cb, freed0, freed1);
+        freed0 = _add(freed0, swapped.amount0());
+        freed1 = _add(freed1, swapped.amount1());
+
         (uint160 sqrtPriceX96,,,) = poolManager.getSlot0(cb.key.toId());
         newLiquidity = LiquidityAmounts.getLiquidityForAmounts(
             sqrtPriceX96,
@@ -353,13 +365,88 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
             ""
         );
 
-        BalanceDelta net = removed + added;
+        // Whatever the ratio maths left over is dust; it goes back to the owner
+        // rather than accumulating in the hook.
+        BalanceDelta net = removed + swapped + added;
         if (net.amount0() > 0) {
             cb.key.currency0.take(poolManager, cb.owner, uint256(uint128(net.amount0())), false);
         }
         if (net.amount1() > 0) {
             cb.key.currency1.take(poolManager, cb.owner, uint256(uint128(net.amount1())), false);
         }
+    }
+
+    /// @dev Swaps the surplus side so the freed tokens roughly match the ratio
+    ///      the new range wants. Sizing is a first-order estimate at the
+    ///      current price: exactness is not required because any residual is
+    ///      returned to the owner, and the caller's `minLiquidity` floor is
+    ///      what actually bounds an adverse fill.
+    function _swapToRatio(Callback memory cb, uint256 have0, uint256 have1) internal returns (BalanceDelta) {
+        (uint160 sqrtPriceX96,,,) = poolManager.getSlot0(cb.key.toId());
+        uint160 sqrtA = TickMath.getSqrtPriceAtTick(cb.newTickLower);
+        uint160 sqrtB = TickMath.getSqrtPriceAtTick(cb.newTickUpper);
+
+        bool zeroForOne;
+        uint256 amountIn;
+
+        if (sqrtPriceX96 <= sqrtA) {
+            // Range sits entirely above spot: it is funded with token0 only.
+            if (have1 == 0) return BalanceDeltaLibrary.ZERO_DELTA;
+            (zeroForOne, amountIn) = (false, have1);
+        } else if (sqrtPriceX96 >= sqrtB) {
+            // Range sits entirely below spot: token1 only.
+            if (have0 == 0) return BalanceDeltaLibrary.ZERO_DELTA;
+            (zeroForOne, amountIn) = (true, have0);
+        } else {
+            // Straddles spot: value both holdings and the target split in
+            // token1 terms, then trade the difference.
+            uint256 want0 = SqrtPriceMath.getAmount0Delta(sqrtPriceX96, sqrtB, cb.liquidity, false);
+            uint256 want1 = SqrtPriceMath.getAmount1Delta(sqrtA, sqrtPriceX96, cb.liquidity, false);
+
+            uint256 haveValue = _inToken1(have0, sqrtPriceX96) + have1;
+            uint256 wantValue = _inToken1(want0, sqrtPriceX96) + want1;
+            if (haveValue == 0 || wantValue == 0) return BalanceDeltaLibrary.ZERO_DELTA;
+
+            uint256 target1 = FullMath.mulDiv(haveValue, want1, wantValue);
+            if (target1 > have1) {
+                uint256 deficit1 = target1 - have1;
+                uint256 sell0 = _inToken0(deficit1, sqrtPriceX96);
+                if (sell0 == 0 || sell0 > have0) sell0 = sell0 > have0 ? have0 : sell0;
+                if (sell0 == 0) return BalanceDeltaLibrary.ZERO_DELTA;
+                (zeroForOne, amountIn) = (true, sell0);
+            } else {
+                uint256 surplus1 = have1 - target1;
+                if (surplus1 == 0) return BalanceDeltaLibrary.ZERO_DELTA;
+                (zeroForOne, amountIn) = (false, surplus1);
+            }
+        }
+
+        if (amountIn == 0) return BalanceDeltaLibrary.ZERO_DELTA;
+        return poolManager.swap(
+            cb.key,
+            SwapParams({
+                zeroForOne: zeroForOne,
+                amountSpecified: -int256(amountIn),
+                sqrtPriceLimitX96: zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
+            }),
+            ""
+        );
+    }
+
+    function _inToken1(uint256 amount0, uint160 sqrtPriceX96) private pure returns (uint256) {
+        uint256 half = FullMath.mulDiv(amount0, sqrtPriceX96, FixedPoint96.Q96);
+        return FullMath.mulDiv(half, sqrtPriceX96, FixedPoint96.Q96);
+    }
+
+    function _inToken0(uint256 amount1, uint160 sqrtPriceX96) private pure returns (uint256) {
+        uint256 half = FullMath.mulDiv(amount1, FixedPoint96.Q96, sqrtPriceX96);
+        return FullMath.mulDiv(half, FixedPoint96.Q96, sqrtPriceX96);
+    }
+
+    function _add(uint256 base, int128 delta) private pure returns (uint256) {
+        if (delta >= 0) return base + uint256(uint128(delta));
+        uint256 sub = uint256(uint128(-delta));
+        return base > sub ? base - sub : 0;
     }
 
     function _validateTicks(PoolKey memory key, int24 tickLower, int24 tickUpper) internal pure {

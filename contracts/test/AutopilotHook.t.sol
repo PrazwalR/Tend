@@ -345,6 +345,82 @@ contract AutopilotHookTest is Test, Deployers {
         assertEq(hi, 540);
     }
 
+    /// Regression: before the re-ratio swap, a position that had genuinely
+    /// drifted out of range held one token only, so recentring computed zero
+    /// liquidity and reverted — the exact case the product exists to handle.
+    function test_rebalance_after_price_exits_range() public {
+        modifyLiquidityRouter.modifyLiquidity(
+            key, ModifyLiquidityParams({tickLower: -60000, tickUpper: 60000, liquidityDelta: 1e21, salt: 0}), ""
+        );
+        bytes32 pid = _deposit(-600, 600, 1e18);
+
+        PoolSwapTest.TestSettings memory ts = PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false});
+        swapRouter.swap(
+            key,
+            SwapParams({zeroForOne: true, amountSpecified: -4e19, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1}),
+            ts,
+            ""
+        );
+
+        (, int24 tick,,) = manager.getSlot0(id);
+        assertLt(tick, int24(-600), "price should have exited the range below");
+
+        vm.warp(block.timestamp + COOLDOWN);
+        vm.prank(rebalancer);
+        uint128 newLiq = hook.rebalance(pid, -1800, -600, 0);
+
+        assertGt(newLiq, 0, "rebalance must fund the new range");
+        (,, int24 lo, int24 hi, uint128 stored,,) = hook.positions(pid);
+        assertEq(lo, -1800);
+        assertEq(hi, -600);
+        assertEq(stored, newLiq);
+    }
+
+    /// The same drift, but recentring onto a range that straddles spot — this
+    /// needs both tokens while the position holds only one.
+    function test_rebalance_out_of_range_onto_straddling_range() public {
+        modifyLiquidityRouter.modifyLiquidity(
+            key, ModifyLiquidityParams({tickLower: -60000, tickUpper: 60000, liquidityDelta: 1e21, salt: 0}), ""
+        );
+        bytes32 pid = _deposit(-600, 600, 1e18);
+
+        PoolSwapTest.TestSettings memory ts = PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false});
+        swapRouter.swap(
+            key,
+            SwapParams({zeroForOne: true, amountSpecified: -4e19, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1}),
+            ts,
+            ""
+        );
+        (, int24 tick,,) = manager.getSlot0(id);
+        int24 lower = ((tick - 600) / 60) * 60;
+        int24 upper = ((tick + 600) / 60) * 60;
+
+        vm.warp(block.timestamp + COOLDOWN);
+        vm.prank(rebalancer);
+        uint128 newLiq = hook.rebalance(pid, lower, upper, 0);
+        assertGt(newLiq, 0, "straddling range must be funded from one-sided holdings");
+    }
+
+    /// The re-ratio swap must not become a way to drain a position: the
+    /// caller-supplied floor still has to bind.
+    function test_rebalance_out_of_range_respects_slippage_floor() public {
+        modifyLiquidityRouter.modifyLiquidity(
+            key, ModifyLiquidityParams({tickLower: -60000, tickUpper: 60000, liquidityDelta: 1e21, salt: 0}), ""
+        );
+        bytes32 pid = _deposit(-600, 600, 1e18);
+        PoolSwapTest.TestSettings memory ts = PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false});
+        swapRouter.swap(
+            key,
+            SwapParams({zeroForOne: true, amountSpecified: -4e19, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1}),
+            ts,
+            ""
+        );
+        vm.warp(block.timestamp + COOLDOWN);
+        vm.prank(rebalancer);
+        vm.expectPartialRevert(AutopilotHook.SlippageExceeded.selector);
+        hook.rebalance(pid, -1800, -600, type(uint128).max);
+    }
+
     function test_renounce_ownership_disabled() public {
         vm.expectRevert(AutopilotHook.RenounceDisabled.selector);
         hook.renounceOwnership();

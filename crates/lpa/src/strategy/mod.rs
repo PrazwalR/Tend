@@ -42,8 +42,10 @@ fn env_f64(key: &str, default: f64) -> f64 {
         .unwrap_or(default)
 }
 
-/// Gas a rebalance (remove + add liquidity) costs, used to price the EV gate.
-const REBALANCE_GAS_UNITS: u64 = 270_000;
+/// Gas a rebalance costs, used to price the EV gate. Covers remove + re-ratio
+/// swap + add; measured at ~290k against a forked Base PoolManager, rounded up
+/// so the gate errs toward not trading.
+const REBALANCE_GAS_UNITS: u64 = 320_000;
 
 /// Fallback pool parameters when a tracked position has no stored fee/tick
 /// spacing (e.g. an off-chain `lpa register` without `--fee`/`--tick-spacing`).
