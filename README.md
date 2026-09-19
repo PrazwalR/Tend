@@ -34,6 +34,8 @@ process, wired by in-process channels. The only network surface is `lpa serve`
 
 - **Monitor** — alloy WS subscription to the v4 `PoolManager` `Swap` event and
   the hook's position events; SQLite tracks positions and per-block tick history.
+  A per-chain watermark plus an `eth_getLogs` backfill closes the gap after a
+  restart; reorged position events resync from the hook's own storage.
 - **Strategy** — concentrated-LP impermanent-loss, block-sampled Bollinger
   bands, and an expected-value gate (`E[fee gain] − E[IL] − cost > 0`).
 - **Executor** — alloy signer; preflight `eth_call`, hard gas estimate, USD
@@ -78,7 +80,7 @@ Global flags: `--config <path>` (TOML), `--log-format json|pretty`.
 
 | Command | Purpose |
 |---|---|
-| `lpa serve [--host --port --db]` | gRPC(-web) API for the SDK (bearer auth via `LPA_API_TOKEN`) |
+| `lpa serve [--host --port --db --chain --hook]` | gRPC(-web) API for the SDK (bearer auth via `LPA_API_TOKEN`); `--hook` enables on-chain position enrichment |
 | `lpa watch [--chain --hook --db --execute]` | monitor a chain; `--execute` sends real rebalance txs for indexed positions |
 | `lpa register --pool-id --owner --tick-lower --tick-upper [--fee --tick-spacing]` | track a position off-chain |
 | `lpa simulate --position-id` | dry-run the strategy on a stored position |
@@ -113,6 +115,9 @@ Put the deployed address in `AUTOPILOT_HOOK_ADDRESS`.
   (`LPA_API_TOKEN`) on every RPC when set.
 - The strategy's USD volume input is an operator assumption pending a price
   oracle; the executor's spend cap uses a live gas price.
+- Position liquidity, token amounts and uncollected fees are read from the v4
+  `StateView` lens. Without `--hook` (or an HTTP RPC) those fields stream empty
+  rather than guessed.
 
 ## Development
 

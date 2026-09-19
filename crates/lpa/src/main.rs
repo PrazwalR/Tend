@@ -42,6 +42,10 @@ enum Command {
         host: String,
         #[arg(long, env = "LPA_DB")]
         db: Option<String>,
+        #[arg(long)]
+        chain: Option<String>,
+        #[arg(long, env = "AUTOPILOT_HOOK_ADDRESS")]
+        hook: Option<String>,
     },
     Watch {
         #[arg(long)]
@@ -131,10 +135,23 @@ async fn main() -> anyhow::Result<()> {
     init_logging(cli.log_format);
 
     match cli.command {
-        Command::Serve { port, host, db } => {
+        Command::Serve {
+            port,
+            host,
+            db,
+            chain,
+            hook,
+        } => {
             let file = cfg::load(cli.config.as_deref())?;
             let db = db.or(file.db).unwrap_or_else(|| "lpa.sqlite".into());
-            serve::run(&host, port, &db).await?;
+            let chain = chain.or(file.chain).unwrap_or_else(|| "base".into());
+            let hook_addr = hook
+                .or(file.hook)
+                .filter(|h| !h.trim().is_empty())
+                .map(|h| h.parse::<alloy::primitives::Address>())
+                .transpose()
+                .map_err(|_| anyhow::anyhow!("invalid hook address"))?;
+            serve::run(&host, port, &db, &chain, hook_addr).await?;
         }
         Command::Watch {
             chain,

@@ -122,7 +122,7 @@ pub async fn run_watch(
 
     let reader = match hook {
         Some(h) => match cfg.http_url() {
-            Ok(url) => match ChainReader::connect(&url, h).await {
+            Ok(url) => match ChainReader::connect(&url, h, cfg.addrs.state_view).await {
                 Ok(r) => Some(r),
                 Err(e) => {
                     warn!(error = %e, "HTTP reader unavailable; reorg resync disabled");

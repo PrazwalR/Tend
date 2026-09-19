@@ -1,5 +1,4 @@
-pub const MIN_TICK: i32 = -887272;
-pub const MAX_TICK: i32 = 887272;
+pub use crate::chain::tickmath::{MAX_TICK, MIN_TICK};
 
 pub fn tick_to_price(tick: i32) -> f64 {
     1.0001f64.powi(tick)

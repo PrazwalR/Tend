@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS positions (
     entry_tick      INTEGER,
     fee             INTEGER,
     tick_spacing    INTEGER,
+    opened_at       INTEGER,
     last_updated_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_positions_pool ON positions(pool_id);
@@ -108,8 +109,10 @@ impl Tracker {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT OR REPLACE INTO positions
-             (position_id, owner, pool_id, chain_id, tick_lower, tick_upper, current_tick, in_range, entry_tick, fee, tick_spacing, last_updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, strftime('%s','now'))",
+             (position_id, owner, pool_id, chain_id, tick_lower, tick_upper, current_tick, in_range, entry_tick, fee, tick_spacing, opened_at, last_updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                     COALESCE((SELECT opened_at FROM positions WHERE position_id = ?1), strftime('%s','now')),
+                     strftime('%s','now'))",
             params![
                 p.position_id, p.owner, p.pool_id, p.chain_id,
                 p.tick_lower, p.tick_upper, p.current_tick, p.in_range as i64, entry,
@@ -292,6 +295,19 @@ impl Tracker {
         Ok(n)
     }
 
+    /// Unix seconds when the position was first seen. Survives re-registration
+    /// (a reorg resync or a repeat `PositionOpened`) so fee APR keeps a stable
+    /// denominator instead of resetting the position's age to zero.
+    pub fn opened_at(&self, position_id: &str) -> Result<Option<i64>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT opened_at FROM positions WHERE position_id = ?1")?;
+        let mut rows = stmt.query_map(params![position_id], |r| r.get::<_, Option<i64>>(0))?;
+        match rows.next() {
+            Some(r) => Ok(r?),
+            None => Ok(None),
+        }
+    }
+
     pub fn last_indexed_block(&self, chain_id: &str) -> Result<Option<u64>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT last_block FROM index_state WHERE chain_id = ?1")?;
@@ -337,6 +353,7 @@ fn migrate(conn: &Connection) {
         "ALTER TABLE positions ADD COLUMN entry_tick INTEGER",
         "ALTER TABLE positions ADD COLUMN fee INTEGER",
         "ALTER TABLE positions ADD COLUMN tick_spacing INTEGER",
+        "ALTER TABLE positions ADD COLUMN opened_at INTEGER",
     ] {
         let _ = conn.execute(stmt, []);
     }

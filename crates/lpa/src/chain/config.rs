@@ -4,6 +4,7 @@ use anyhow::{anyhow, bail, Result};
 #[derive(Clone, Copy)]
 pub struct ChainAddrs {
     pub pool_manager: Address,
+    pub state_view: Address,
 }
 
 #[derive(Clone)]
@@ -21,6 +22,7 @@ impl ChainConfig {
                 name: "base",
                 addrs: ChainAddrs {
                     pool_manager: address!("0x498581ff718922c3f8e6a244956af099b2652b2b"),
+                    state_view: address!("0xa3c0c9b65bad0b08107aa264b0f3db444b867a71"),
                 },
             }),
             "ethereum" | "eth" | "mainnet" => Ok(Self {
@@ -28,6 +30,7 @@ impl ChainConfig {
                 name: "ethereum",
                 addrs: ChainAddrs {
                     pool_manager: address!("0x000000000004444c5dc75cb358380d2e3de08a90"),
+                    state_view: address!("0x7ffe42c4a5deea5b0fec41c94c136cf115597227"),
                 },
             }),
             other => bail!("unknown chain: {other}"),
@@ -63,6 +66,13 @@ mod tests {
         assert_eq!(ChainConfig::from_name("eth").unwrap().chain_id, 1);
         assert_eq!(ChainConfig::from_name("MAINNET").unwrap().chain_id, 1);
         assert!(ChainConfig::from_name("solana").is_err());
+    }
+
+    #[test]
+    fn state_view_differs_per_chain() {
+        let base = ChainConfig::from_name("base").unwrap().addrs.state_view;
+        let eth = ChainConfig::from_name("ethereum").unwrap().addrs.state_view;
+        assert_ne!(base, eth);
     }
 
     #[test]
