@@ -127,6 +127,18 @@ Put the deployed address in `AUTOPILOT_HOOK_ADDRESS`.
   `StateView` lens. Without `--hook` (or an HTTP RPC) those fields stream empty
   rather than guessed.
 
+## End-to-end
+
+`scripts/e2e.sh` runs the whole loop against an anvil fork of Base: deploy the
+hook, start the daemon, open a position, swap the price out of range, and
+assert the daemon sends a real rebalance tx that moves the range on-chain. It
+also restarts the daemon across a deposit to prove the watermark and backfill
+recover it. Needs `RPC_BASE`; skips cleanly without one.
+
+```bash
+RPC_BASE=https://... ./scripts/e2e.sh
+```
+
 ## Development
 
 `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, `cargo test`,

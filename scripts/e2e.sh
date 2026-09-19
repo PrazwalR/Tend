@@ -63,7 +63,7 @@ start_daemon() {
   LPA_WS_HEARTBEAT_SECS=5 \
   LPA_VOLUME_USD_PER_BLOCK=5000000 \
   DEFAULT_MAX_GAS_USD=500 \
-    ./target/debug/lpa --log-format pretty watch --chain base --execute >>"$DAEMON_LOG" 2>&1 &
+    ./target/debug/lpa --log-format json watch --chain base --execute >>"$DAEMON_LOG" 2>&1 &
   DAEMON_PID=$!
   sleep 3
   kill -0 "$DAEMON_PID" 2>/dev/null || fail "daemon exited on startup"
@@ -180,7 +180,9 @@ if (( REBALANCED == 0 )); then
   fail "position exited range but no rebalance tx landed"
 fi
 
-TXH=$(grep -oE 'tx[=:] *"?0x[0-9a-fA-F]{64}' "$DAEMON_LOG" | tail -1 | grep -oE '0x[0-9a-fA-F]{64}')
+# Pull the first 32-byte word off the success line: the tx hash precedes the
+# position id. Tolerates any log format, and must not trip `set -e` on no match.
+TXH=$(grep "auto-rebalanced on-chain" "$DAEMON_LOG" | tail -1 | grep -oE '0x[0-9a-fA-F]{64}' | head -1 || true)
 echo "rebalance tx: $TXH"
 [[ -n "$TXH" ]] || fail "could not parse rebalance tx hash"
 STATUS=$(cast receipt "$TXH" --rpc-url "$RPC" --json | jq -r '.status')
