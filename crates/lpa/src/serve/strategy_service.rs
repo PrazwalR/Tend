@@ -2,13 +2,12 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::aliases::{I24, U24};
-use alloy::primitives::{keccak256, Address};
-use alloy::sol;
-use alloy::sol_types::SolValue;
+use alloy::primitives::Address;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
+use crate::chain::reader::{pool_id_of, PoolKeyAbi};
 use crate::position::tracker::compute_position_id;
 use crate::position::tracker::{ConfigRow, PositionRow, Tracker};
 use crate::proto::autopilot_strategy_server::AutopilotStrategy;
@@ -19,16 +18,6 @@ use crate::proto::{
     UpdateConfigResponse,
 };
 use crate::strategy::concentrated_il;
-
-sol! {
-    struct PoolKeyAbi {
-        address currency0;
-        address currency1;
-        uint24 fee;
-        int24 tickSpacing;
-        address hooks;
-    }
-}
 
 /// Buffered position-state updates per streaming client.
 const STREAM_CHANNEL_CAP: usize = 16;
@@ -207,7 +196,7 @@ fn pool_id_from_key(k: &PoolKey) -> Result<String, Status> {
         tickSpacing: tick_spacing,
         hooks,
     };
-    Ok(format!("{:#x}", keccak256(abi.abi_encode())))
+    Ok(format!("{:#x}", pool_id_of(&abi)))
 }
 
 /// Builds the health view the stream serves. Populated from indexed state:

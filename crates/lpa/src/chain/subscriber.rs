@@ -16,6 +16,7 @@ use tracing::{debug, error, info, warn};
 use tokio::sync::mpsc;
 
 use crate::chain::config::ChainConfig;
+use crate::chain::reader::ChainReader;
 use crate::exec::RebalanceIntent;
 use crate::position::tracker::{PositionRow, Tracker};
 use crate::proto::PositionConfig;
@@ -74,10 +75,34 @@ const HEALTH_PROBE_TIMEOUT_SECS: u64 = 5;
 const CONNECTION_STABLE_SECS: u64 = 60;
 /// Tick-history lookback fed to the strategy on an OOR event.
 const STRATEGY_TICK_WINDOW: usize = 200;
+/// Blocks per `eth_getLogs` request while catching up; providers cap the span.
+const BACKFILL_CHUNK_BLOCKS: u64 = 500;
+/// Refuse to backfill further than this behind head — beyond it the tick
+/// history is stale anyway and a full scan would hammer the RPC.
+const BACKFILL_MAX_BLOCKS: u64 = 100_000;
 
 enum WatchEnd {
     Shutdown,
     StreamEnded,
+}
+
+/// Everything the log handlers need, so the hot path passes one reference
+/// instead of eight positional arguments.
+struct Ctx<'a> {
+    tracker: &'a Arc<Tracker>,
+    engine: &'a StrategyEngine,
+    cost: &'a dyn CostModel,
+    config: &'a PositionConfig,
+    chain_id: u64,
+    reader: Option<&'a ChainReader>,
+    intent_tx: Option<&'a mpsc::Sender<RebalanceIntent>>,
+    last_block: DashMap<B256, u64>,
+}
+
+impl<'a> Ctx<'a> {
+    fn chain_key(&self) -> String {
+        self.chain_id.to_string()
+    }
 }
 
 fn store_gas_price(slot: &AtomicU64, wei: u128) {
@@ -94,22 +119,38 @@ pub async fn run_watch(
     let gas_price = Arc::new(AtomicU64::new(INITIAL_GAS_PRICE_WEI));
     let cost = LiveCostModel::new(gas_price.clone());
     let config = default_config();
-    let mut attempt = 0u32;
 
+    let reader = match hook {
+        Some(h) => match cfg.http_url() {
+            Ok(url) => match ChainReader::connect(&url, h).await {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    warn!(error = %e, "HTTP reader unavailable; reorg resync disabled");
+                    None
+                }
+            },
+            Err(e) => {
+                warn!(error = %e, "no HTTP RPC configured; reorg resync disabled");
+                None
+            }
+        },
+        None => None,
+    };
+
+    let mut attempt = 0u32;
     loop {
         let started = Instant::now();
-        match watch_once(
-            &cfg,
-            &tracker,
-            &engine,
-            &cost,
-            &config,
-            hook,
-            &gas_price,
-            intent_tx.as_ref(),
-        )
-        .await
-        {
+        let ctx = Ctx {
+            tracker: &tracker,
+            engine: &engine,
+            cost: &cost,
+            config: &config,
+            chain_id: cfg.chain_id,
+            reader: reader.as_ref(),
+            intent_tx: intent_tx.as_ref(),
+            last_block: DashMap::new(),
+        };
+        match watch_once(&cfg, &ctx, hook, &gas_price).await {
             Ok(WatchEnd::Shutdown) => {
                 info!("shutdown signal received");
                 return Ok(());
@@ -134,16 +175,11 @@ pub async fn run_watch(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn watch_once(
     cfg: &ChainConfig,
-    tracker: &Arc<Tracker>,
-    engine: &StrategyEngine,
-    cost: &dyn CostModel,
-    config: &PositionConfig,
+    ctx: &Ctx<'_>,
     hook: Option<Address>,
     gas_price: &AtomicU64,
-    intent_tx: Option<&mpsc::Sender<RebalanceIntent>>,
 ) -> Result<WatchEnd> {
     let ws_url = cfg.ws_url()?;
     let provider = ProviderBuilder::new()
@@ -178,25 +214,36 @@ async fn watch_once(
         None => swap_stream.boxed(),
     };
 
+    // Subscriptions only deliver logs from now on. Anything that happened while
+    // the daemon was down is replayed here before the live stream is served.
+    if let Err(e) = backfill(&provider, cfg, ctx, hook).await {
+        warn!(error = %e, "backfill failed; continuing on live stream only");
+    }
+
     let heartbeat = Duration::from_secs(
         std::env::var("LPA_WS_HEARTBEAT_SECS")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(DEFAULT_HEARTBEAT_SECS),
     );
-    let last_block: DashMap<B256, u64> = DashMap::new();
     let mut since_prune = 0u32;
     loop {
         tokio::select! {
             maybe_log = stream.next() => match maybe_log {
                 Some(log) => {
-                    if let Err(e) = handle(tracker, engine, cost, config, cfg.chain_id, &last_block, intent_tx, log) {
+                    let block = log.block_number;
+                    if let Err(e) = handle(ctx, log).await {
                         error!(error = %e, "log handling error");
+                    }
+                    if let Some(b) = block {
+                        if let Err(e) = ctx.tracker.set_last_indexed_block(&ctx.chain_key(), b) {
+                            warn!(error = %e, "watermark update failed");
+                        }
                     }
                     since_prune += 1;
                     if since_prune >= PRUNE_EVERY {
                         since_prune = 0;
-                        if let Err(e) = tracker.prune_all_ticks(TICK_RETENTION) {
+                        if let Err(e) = ctx.tracker.prune_all_ticks(TICK_RETENTION) {
                             warn!(error = %e, "tick prune failed");
                         }
                     }
@@ -205,9 +252,14 @@ async fn watch_once(
             },
             _ = sleep(heartbeat) => {
                 match timeout(Duration::from_secs(HEALTH_PROBE_TIMEOUT_SECS), provider.get_block_number()).await {
-                    Ok(Ok(_)) => {
+                    Ok(Ok(head)) => {
                         if let Ok(gp) = provider.get_gas_price().await {
                             store_gas_price(gas_price, gp);
+                        }
+                        // A quiet pool is still indexed ground; record it so a
+                        // restart does not re-scan blocks that held no logs.
+                        if let Err(e) = ctx.tracker.set_last_indexed_block(&ctx.chain_key(), head) {
+                            warn!(error = %e, "watermark update failed");
                         }
                     }
                     _ => {
@@ -221,47 +273,167 @@ async fn watch_once(
     }
 }
 
+/// Replays logs between the stored watermark and current head. Hook events are
+/// fetched across all pools; `Swap` events only for pools we actually track,
+/// because an unfiltered v4 `Swap` scan would return every swap on the chain.
+async fn backfill<P: Provider>(
+    provider: &P,
+    cfg: &ChainConfig,
+    ctx: &Ctx<'_>,
+    hook: Option<Address>,
+) -> Result<()> {
+    let head = provider.get_block_number().await?;
+    let Some(watermark) = ctx.tracker.last_indexed_block(&ctx.chain_key())? else {
+        ctx.tracker.set_last_indexed_block(&ctx.chain_key(), head)?;
+        info!(head, "no watermark stored; indexing from current head");
+        return Ok(());
+    };
+    if watermark >= head {
+        return Ok(());
+    }
+
+    let span = head - watermark;
+    let from = if span > BACKFILL_MAX_BLOCKS {
+        warn!(
+            span,
+            max = BACKFILL_MAX_BLOCKS,
+            "watermark too far behind; truncating backfill"
+        );
+        head - BACKFILL_MAX_BLOCKS
+    } else {
+        watermark + 1
+    };
+
+    let pools = ctx.tracker.distinct_pool_ids()?;
+    let pool_topics: Vec<B256> = pools
+        .iter()
+        .filter_map(|p| p.parse::<B256>().ok())
+        .collect();
+    info!(
+        from,
+        to = head,
+        pools = pool_topics.len(),
+        "backfilling missed logs"
+    );
+
+    let mut start = from;
+    let mut replayed = 0usize;
+    while start <= head {
+        let end = (start + BACKFILL_CHUNK_BLOCKS - 1).min(head);
+
+        if let Some(h) = hook {
+            let f = Filter::new()
+                .address(h)
+                .event_signature(vec![
+                    PositionOpened::SIGNATURE_HASH,
+                    PositionClosed::SIGNATURE_HASH,
+                    Rebalanced::SIGNATURE_HASH,
+                ])
+                .from_block(start)
+                .to_block(end);
+            for log in provider.get_logs(&f).await? {
+                handle(ctx, log).await?;
+                replayed += 1;
+            }
+        }
+
+        if !pool_topics.is_empty() {
+            let f = Filter::new()
+                .address(cfg.addrs.pool_manager)
+                .event_signature(Swap::SIGNATURE_HASH)
+                .topic1(pool_topics.clone())
+                .from_block(start)
+                .to_block(end);
+            for log in provider.get_logs(&f).await? {
+                handle(ctx, log).await?;
+                replayed += 1;
+            }
+        }
+
+        ctx.tracker.set_last_indexed_block(&ctx.chain_key(), end)?;
+        start = end + 1;
+    }
+    info!(replayed, "backfill complete");
+    Ok(())
+}
+
 fn next_backoff(attempt: u32) -> Duration {
     let secs = (1u64 << attempt.min(5)).min(30);
     Duration::from_secs(secs)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn handle(
-    tracker: &Arc<Tracker>,
-    engine: &StrategyEngine,
-    cost: &dyn CostModel,
-    config: &PositionConfig,
-    chain_id: u64,
-    last_block: &DashMap<B256, u64>,
-    intent_tx: Option<&mpsc::Sender<RebalanceIntent>>,
-    log: Log,
-) -> Result<()> {
+async fn handle(ctx: &Ctx<'_>, log: Log) -> Result<()> {
+    let topic = log.topic0().copied();
     if log.removed {
-        warn!(block = ?log.block_number, "reorg: removed log skipped");
-        return Ok(());
+        return handle_removed(ctx, topic, log).await;
     }
-    match log.topic0().copied() {
-        Some(t) if t == Swap::SIGNATURE_HASH => {
-            handle_swap(tracker, engine, cost, config, last_block, intent_tx, log)
-        }
-        Some(t) if t == PositionOpened::SIGNATURE_HASH => handle_opened(tracker, chain_id, log),
-        Some(t) if t == PositionClosed::SIGNATURE_HASH => handle_closed(tracker, log),
-        Some(t) if t == Rebalanced::SIGNATURE_HASH => handle_rebalanced(tracker, log),
+    match topic {
+        Some(t) if t == Swap::SIGNATURE_HASH => handle_swap(ctx, log),
+        Some(t) if t == PositionOpened::SIGNATURE_HASH => handle_opened(ctx, log),
+        Some(t) if t == PositionClosed::SIGNATURE_HASH => handle_closed(ctx, log),
+        Some(t) if t == Rebalanced::SIGNATURE_HASH => handle_rebalanced(ctx, log),
         _ => Ok(()),
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn handle_swap(
-    tracker: &Arc<Tracker>,
-    engine: &StrategyEngine,
-    cost: &dyn CostModel,
-    config: &PositionConfig,
-    last_block: &DashMap<B256, u64>,
-    intent_tx: Option<&mpsc::Sender<RebalanceIntent>>,
-    log: Log,
-) -> Result<()> {
+/// A reorg dropped a log we may already have acted on. Swap logs need no
+/// undo — the next swap overwrites the tick. Position lifecycle logs do, and
+/// rather than invert them (which cannot restore a deleted row) we re-read the
+/// hook's storage, which is authoritative for the canonical chain.
+async fn handle_removed(ctx: &Ctx<'_>, topic: Option<B256>, log: Log) -> Result<()> {
+    let is_position_event = matches!(topic,
+        Some(t) if t == PositionOpened::SIGNATURE_HASH
+            || t == PositionClosed::SIGNATURE_HASH
+            || t == Rebalanced::SIGNATURE_HASH
+    );
+    if !is_position_event {
+        warn!(block = ?log.block_number, "reorg: removed swap log skipped");
+        return Ok(());
+    }
+    let Some(position_id) = log.topics().get(1).copied() else {
+        return Ok(());
+    };
+    warn!(position_id = %format!("{:#x}", position_id), block = ?log.block_number, "reorg: resyncing position from chain");
+    resync_position(ctx, position_id).await
+}
+
+async fn resync_position(ctx: &Ctx<'_>, position_id: B256) -> Result<()> {
+    let id_hex = format!("{:#x}", position_id);
+    let Some(reader) = ctx.reader else {
+        warn!(position_id = %id_hex, "no HTTP reader; cannot resync after reorg");
+        return Ok(());
+    };
+    match reader.hook_position(position_id).await {
+        Ok(Some(p)) if p.active => {
+            let stored = ctx.tracker.get_position(&id_hex)?;
+            ctx.tracker.register(&PositionRow {
+                position_id: id_hex.clone(),
+                owner: format!("{:#x}", p.owner),
+                pool_id: format!("{:#x}", p.pool_id),
+                chain_id: ctx.chain_key(),
+                tick_lower: p.tick_lower,
+                tick_upper: p.tick_upper,
+                current_tick: stored.as_ref().and_then(|s| s.current_tick),
+                in_range: stored.as_ref().is_some_and(|s| s.in_range),
+                entry_tick: stored
+                    .as_ref()
+                    .and_then(|s| s.entry_tick)
+                    .or(Some((p.tick_lower + p.tick_upper) / 2)),
+                fee: Some(p.fee),
+                tick_spacing: Some(p.tick_spacing),
+            })?;
+            info!(position_id = %id_hex, tick_lower = p.tick_lower, tick_upper = p.tick_upper, "resynced position from hook storage");
+        }
+        Ok(_) => {
+            ctx.tracker.delete_position(&id_hex)?;
+            info!(position_id = %id_hex, "position absent on canonical chain; dropped");
+        }
+        Err(e) => warn!(error = %e, position_id = %id_hex, "resync read failed"),
+    }
+    Ok(())
+}
+
+fn handle_swap(ctx: &Ctx<'_>, log: Log) -> Result<()> {
     let ev = match Swap::decode_log(&log.inner) {
         Ok(e) => e,
         Err(e) => {
@@ -274,33 +446,25 @@ fn handle_swap(
     let tick = ev.tick.as_i32();
     let block = log.block_number.unwrap_or(0);
 
-    let crosses = tracker.update_pool_tick(&pool_hex, tick)?;
+    let crosses = ctx.tracker.update_pool_tick(&pool_hex, tick)?;
     for cx in &crosses {
         if cx.was_in_range && !cx.now_in_range {
             warn!(position_id = %cx.position_id, tick, "position EXITED range");
-            propose_rebalance(
-                tracker,
-                engine,
-                cost,
-                config,
-                intent_tx,
-                &pool_hex,
-                tick,
-                &cx.position_id,
-            );
+            propose_rebalance(ctx, &pool_hex, tick, &cx.position_id);
         } else if !cx.was_in_range && cx.now_in_range {
             info!(position_id = %cx.position_id, tick, "position re-entered range");
         }
     }
 
     if !crosses.is_empty() {
-        let new_block = last_block
+        let new_block = ctx
+            .last_block
             .get(&pool_id)
             .map(|v| *v != block)
             .unwrap_or(true);
         if new_block {
-            last_block.insert(pool_id, block);
-            tracker.record_tick(&pool_hex, tick, block)?;
+            ctx.last_block.insert(pool_id, block);
+            ctx.tracker.record_tick(&pool_hex, tick, block)?;
         }
     }
 
@@ -308,7 +472,7 @@ fn handle_swap(
     Ok(())
 }
 
-fn handle_opened(tracker: &Arc<Tracker>, chain_id: u64, log: Log) -> Result<()> {
+fn handle_opened(ctx: &Ctx<'_>, log: Log) -> Result<()> {
     let ev = match PositionOpened::decode_log(&log.inner) {
         Ok(e) => e,
         Err(e) => {
@@ -319,11 +483,11 @@ fn handle_opened(tracker: &Arc<Tracker>, chain_id: u64, log: Log) -> Result<()> 
     let position_id = format!("{:#x}", ev.positionId);
     let tick_lower = ev.tickLower.as_i32();
     let tick_upper = ev.tickUpper.as_i32();
-    tracker.register(&PositionRow {
+    ctx.tracker.register(&PositionRow {
         position_id: position_id.clone(),
         owner: format!("{:#x}", ev.owner),
         pool_id: format!("{:#x}", ev.poolId),
-        chain_id: chain_id.to_string(),
+        chain_id: ctx.chain_key(),
         tick_lower,
         tick_upper,
         current_tick: None,
@@ -336,7 +500,7 @@ fn handle_opened(tracker: &Arc<Tracker>, chain_id: u64, log: Log) -> Result<()> 
     Ok(())
 }
 
-fn handle_closed(tracker: &Arc<Tracker>, log: Log) -> Result<()> {
+fn handle_closed(ctx: &Ctx<'_>, log: Log) -> Result<()> {
     let ev = match PositionClosed::decode_log(&log.inner) {
         Ok(e) => e,
         Err(e) => {
@@ -345,12 +509,12 @@ fn handle_closed(tracker: &Arc<Tracker>, log: Log) -> Result<()> {
         }
     };
     let position_id = format!("{:#x}", ev.positionId);
-    tracker.delete_position(&position_id)?;
+    ctx.tracker.delete_position(&position_id)?;
     info!(position_id = %position_id, "indexed PositionClosed");
     Ok(())
 }
 
-fn handle_rebalanced(tracker: &Arc<Tracker>, log: Log) -> Result<()> {
+fn handle_rebalanced(ctx: &Ctx<'_>, log: Log) -> Result<()> {
     let ev = match Rebalanced::decode_log(&log.inner) {
         Ok(e) => e,
         Err(e) => {
@@ -361,26 +525,17 @@ fn handle_rebalanced(tracker: &Arc<Tracker>, log: Log) -> Result<()> {
     let position_id = format!("{:#x}", ev.positionId);
     let lower = ev.newTickLower.as_i32();
     let upper = ev.newTickUpper.as_i32();
-    tracker.update_range(&position_id, lower, upper)?;
+    ctx.tracker.update_range(&position_id, lower, upper)?;
     info!(position_id = %position_id, new_lower = lower, new_upper = upper, "indexed Rebalanced");
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn propose_rebalance(
-    tracker: &Arc<Tracker>,
-    engine: &StrategyEngine,
-    cost: &dyn CostModel,
-    config: &PositionConfig,
-    intent_tx: Option<&mpsc::Sender<RebalanceIntent>>,
-    pool_hex: &str,
-    tick: i32,
-    position_id: &str,
-) {
-    let Ok(Some(pos)) = tracker.get_position(position_id) else {
+fn propose_rebalance(ctx: &Ctx<'_>, pool_hex: &str, tick: i32, position_id: &str) {
+    let Ok(Some(pos)) = ctx.tracker.get_position(position_id) else {
         return;
     };
-    let ticks = tracker
+    let ticks = ctx
+        .tracker
         .recent_ticks(pool_hex, STRATEGY_TICK_WINDOW)
         .unwrap_or_default();
     let entry_tick = pos
@@ -396,12 +551,12 @@ fn propose_rebalance(
         tick_spacing: pos.tick_spacing.unwrap_or(DEFAULT_TICK_SPACING),
         fee_pips: pos.fee.unwrap_or(DEFAULT_FEE_PIPS),
         ticks: &ticks,
-        config,
+        config: ctx.config,
     };
-    let Some(d) = engine.decide(&input, cost) else {
+    let Some(d) = ctx.engine.decide(&input, ctx.cost) else {
         return;
     };
-    match intent_tx {
+    match ctx.intent_tx {
         Some(tx) => {
             let intent = RebalanceIntent {
                 position_id: pos.position_id.clone(),
@@ -427,10 +582,9 @@ fn propose_rebalance(
         ),
     }
 }
-
 #[cfg(test)]
 mod tests {
-    use super::{handle, next_backoff, PositionClosed, PositionOpened, Rebalanced, Swap};
+    use super::{handle, next_backoff, Ctx, PositionClosed, PositionOpened, Rebalanced, Swap};
     use crate::position::tracker::{PositionRow, Tracker};
     use crate::strategy::{default_config, EstimateCostModel, StrategyEngine};
     use alloy::primitives::aliases::{I24, U160, U24};
@@ -469,16 +623,31 @@ mod tests {
         assert_eq!(next_backoff(100).as_secs(), 30);
     }
 
-    fn engine_set() -> (
-        StrategyEngine,
-        EstimateCostModel,
-        crate::proto::PositionConfig,
-    ) {
-        (
-            StrategyEngine::default(),
-            EstimateCostModel,
-            default_config(),
-        )
+    struct Env {
+        engine: StrategyEngine,
+        cost: EstimateCostModel,
+        config: crate::proto::PositionConfig,
+    }
+
+    fn env() -> Env {
+        Env {
+            engine: StrategyEngine::default(),
+            cost: EstimateCostModel,
+            config: default_config(),
+        }
+    }
+
+    fn ctx<'a>(tracker: &'a Arc<Tracker>, e: &'a Env) -> Ctx<'a> {
+        Ctx {
+            tracker,
+            engine: &e.engine,
+            cost: &e.cost,
+            config: &e.config,
+            chain_id: 8453,
+            reader: None,
+            intent_tx: None,
+            last_block: DashMap::new(),
+        }
     }
 
     fn swap_log(pool: B256, tick: i32, removed: bool) -> RpcLog {
@@ -504,8 +673,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn removed_log_skipped_but_valid_recorded() {
+    #[tokio::test]
+    async fn removed_log_skipped_but_valid_recorded() {
         let tracker = Arc::new(Tracker::open_in_memory().unwrap());
         let pool = b256!("0x2222222222222222222222222222222222222222222222222222222222222222");
         let pool_hex = format!("{:#x}", pool);
@@ -524,33 +693,13 @@ mod tests {
                 tick_spacing: None,
             })
             .unwrap();
-        let (engine, cost, config) = engine_set();
-        let last_block: DashMap<B256, u64> = DashMap::new();
+        let e = env();
+        let c = ctx(&tracker, &e);
 
-        handle(
-            &tracker,
-            &engine,
-            &cost,
-            &config,
-            8453,
-            &last_block,
-            None,
-            swap_log(pool, 150, false),
-        )
-        .unwrap();
+        handle(&c, swap_log(pool, 150, false)).await.unwrap();
         assert_eq!(tracker.recent_ticks(&pool_hex, 10).unwrap(), vec![150]);
 
-        handle(
-            &tracker,
-            &engine,
-            &cost,
-            &config,
-            8453,
-            &last_block,
-            None,
-            swap_log(pool, 160, true),
-        )
-        .unwrap();
+        handle(&c, swap_log(pool, 160, true)).await.unwrap();
         assert_eq!(
             tracker.recent_ticks(&pool_hex, 10).unwrap(),
             vec![150],
@@ -558,11 +707,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn indexes_position_opened_and_closed() {
+    #[tokio::test]
+    async fn indexes_position_opened_and_closed() {
         let tracker = Arc::new(Tracker::open_in_memory().unwrap());
-        let (engine, cost, config) = engine_set();
-        let last_block: DashMap<B256, u64> = DashMap::new();
+        let e = env();
+        let c = ctx(&tracker, &e);
         let pos_id = b256!("0x00000000000000000000000000000000000000000000000000000000000000aa");
         let pool = b256!("0x00000000000000000000000000000000000000000000000000000000000000bb");
         let hook = address!("0x00000000000000000000000000000000000000ff");
@@ -586,17 +735,7 @@ mod tests {
             removed: false,
             ..Default::default()
         };
-        handle(
-            &tracker,
-            &engine,
-            &cost,
-            &config,
-            8453,
-            &last_block,
-            None,
-            log,
-        )
-        .unwrap();
+        handle(&c, log).await.unwrap();
         let id_hex = format!("{:#x}", pos_id);
         let p = tracker.get_position(&id_hex).unwrap().expect("indexed");
         assert_eq!((p.tick_lower, p.tick_upper), (-600, 600));
@@ -618,20 +757,106 @@ mod tests {
             removed: false,
             ..Default::default()
         };
-        handle(
-            &tracker,
-            &engine,
-            &cost,
-            &config,
-            8453,
-            &last_block,
-            None,
-            clog,
-        )
-        .unwrap();
+        handle(&c, clog).await.unwrap();
         assert!(
             tracker.get_position(&id_hex).unwrap().is_none(),
             "closed position removed"
         );
+    }
+
+    fn hook_log(topic0: B256, position_id: B256, removed: bool) -> RpcLog {
+        let inner = PrimLog {
+            address: address!("0x00000000000000000000000000000000000000ff"),
+            data: alloy::primitives::LogData::new_unchecked(
+                vec![topic0, position_id],
+                Default::default(),
+            ),
+        };
+        RpcLog {
+            inner,
+            block_number: Some(9),
+            removed,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn removed_position_log_without_reader_leaves_state_intact() {
+        let tracker = Arc::new(Tracker::open_in_memory().unwrap());
+        tracker
+            .register(&PositionRow {
+                position_id: "0x00000000000000000000000000000000000000000000000000000000000000aa"
+                    .into(),
+                owner: "0x1111111111111111111111111111111111111111".into(),
+                pool_id: "0xpool".into(),
+                chain_id: "8453".into(),
+                tick_lower: -600,
+                tick_upper: 600,
+                current_tick: Some(0),
+                in_range: true,
+                entry_tick: Some(0),
+                fee: Some(3000),
+                tick_spacing: Some(60),
+            })
+            .unwrap();
+        let e = env();
+        let c = ctx(&tracker, &e);
+        let pid = b256!("0x00000000000000000000000000000000000000000000000000000000000000aa");
+
+        handle(&c, hook_log(PositionOpened::SIGNATURE_HASH, pid, true))
+            .await
+            .unwrap();
+
+        let id_hex = format!("{:#x}", pid);
+        assert!(
+            tracker.get_position(&id_hex).unwrap().is_some(),
+            "no reader configured must not silently drop the position"
+        );
+    }
+
+    #[test]
+    fn watermark_advances_and_never_rewinds() {
+        let tracker = Tracker::open_in_memory().unwrap();
+        assert_eq!(tracker.last_indexed_block("8453").unwrap(), None);
+        tracker.set_last_indexed_block("8453", 100).unwrap();
+        assert_eq!(tracker.last_indexed_block("8453").unwrap(), Some(100));
+        tracker.set_last_indexed_block("8453", 50).unwrap();
+        assert_eq!(
+            tracker.last_indexed_block("8453").unwrap(),
+            Some(100),
+            "a late log must not rewind the watermark"
+        );
+        tracker.set_last_indexed_block("8453", 150).unwrap();
+        assert_eq!(tracker.last_indexed_block("8453").unwrap(), Some(150));
+        assert_eq!(
+            tracker.last_indexed_block("1").unwrap(),
+            None,
+            "watermark is per chain"
+        );
+    }
+
+    #[test]
+    fn distinct_pool_ids_dedupes() {
+        let tracker = Tracker::open_in_memory().unwrap();
+        for (i, pool) in ["0xaaa", "0xaaa", "0xbbb"].iter().enumerate() {
+            tracker
+                .register(&PositionRow {
+                    position_id: format!("0xpos{i}"),
+                    owner: "0x1111111111111111111111111111111111111111".into(),
+                    pool_id: (*pool).into(),
+                    chain_id: "8453".into(),
+                    tick_lower: -600,
+                    tick_upper: 600,
+                    current_tick: None,
+                    in_range: false,
+                    entry_tick: None,
+                    fee: None,
+                    tick_spacing: None,
+                })
+                .unwrap();
+        }
+        let mut pools = tracker.distinct_pool_ids().unwrap();
+        pools.sort();
+        assert_eq!(pools, vec!["0xaaa".to_string(), "0xbbb".to_string()]);
     }
 }

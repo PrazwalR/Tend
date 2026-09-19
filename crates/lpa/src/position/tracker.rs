@@ -39,6 +39,10 @@ CREATE TABLE IF NOT EXISTS configs (
     auto_compound_fees INTEGER NOT NULL,
     use_flashbots     INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS index_state (
+    chain_id   TEXT PRIMARY KEY,
+    last_block INTEGER NOT NULL
+);
 ";
 
 #[derive(Debug, Clone, PartialEq)]
@@ -286,6 +290,39 @@ impl Tracker {
             params![keep_per_pool as i64],
         )?;
         Ok(n)
+    }
+
+    pub fn last_indexed_block(&self, chain_id: &str) -> Result<Option<u64>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT last_block FROM index_state WHERE chain_id = ?1")?;
+        let mut rows = stmt.query_map(params![chain_id], |r| r.get::<_, i64>(0))?;
+        match rows.next() {
+            Some(r) => Ok(Some(r? as u64)),
+            None => Ok(None),
+        }
+    }
+
+    /// Advances the indexing watermark, never rewinding it: a late log from an
+    /// earlier block must not make the daemon re-scan ground already covered.
+    pub fn set_last_indexed_block(&self, chain_id: &str, block: u64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO index_state (chain_id, last_block) VALUES (?1, ?2)
+             ON CONFLICT(chain_id) DO UPDATE SET last_block = max(last_block, excluded.last_block)",
+            params![chain_id, block as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn distinct_pool_ids(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT DISTINCT pool_id FROM positions")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
     }
 
     pub fn count_positions(&self) -> Result<i64> {

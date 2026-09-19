@@ -16,6 +16,8 @@ docs-*.md
 
 # Foundry
 /contracts/lib/
+/contracts/foundry.lock
+.gitmodules
 /contracts/out/
 /contracts/cache/
 /contracts/broadcast/
