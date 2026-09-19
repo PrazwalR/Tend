@@ -109,6 +109,12 @@ enum Command {
         fee: Option<u32>,
         #[arg(long, default_value_t = 200)]
         window: usize,
+        #[arg(
+            long,
+            env = "LPA_POSITION_VALUE_USD",
+            help = "USD value backing the position; enables the IL/slippage/MEV terms of the EV gate"
+        )]
+        position_value_usd: Option<f64>,
         #[arg(long, env = "LPA_DB")]
         db: Option<String>,
     },
@@ -340,6 +346,7 @@ async fn main() -> anyhow::Result<()> {
             tick_spacing,
             fee,
             window,
+            position_value_usd,
             db,
         } => {
             let file = cfg::load(cli.config.as_deref())?;
@@ -376,6 +383,7 @@ async fn main() -> anyhow::Result<()> {
                 fee_pips,
                 ticks: &ticks,
                 config: &config,
+                position_value_usd: position_value_usd.unwrap_or(0.0),
             };
             match strategy::StrategyEngine::default().decide(&input, &strategy::EstimateCostModel) {
                 Some(d) => println!(

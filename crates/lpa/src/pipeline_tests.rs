@@ -50,6 +50,7 @@ fn decide(t: &Tracker, pool: &str) -> Option<crate::strategy::Decision> {
         fee_pips: 3000,
         ticks: &ticks,
         config: &cfg,
+        position_value_usd: 0.0,
     };
     StrategyEngine::default().decide(&input, &Cost)
 }

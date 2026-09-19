@@ -17,6 +17,9 @@ pub struct DecideInput<'a> {
     pub fee_pips: u32,
     pub ticks: &'a [i32],
     pub config: &'a PositionConfig,
+    /// USD value backing the position, or 0 when it could not be priced.
+    /// Zero disables the IL, slippage and MEV terms of the EV gate.
+    pub position_value_usd: f64,
 }
 
 pub struct Decision {
@@ -63,15 +66,18 @@ impl CostModel for EstimateCostModel {
 
 pub struct LiveCostModel {
     gas_price_wei: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    eth_price_usd: f64,
+    eth_price: crate::chain::oracle::EthPrice,
     volume_usd_per_block: f64,
 }
 
 impl LiveCostModel {
-    pub fn new(gas_price_wei: std::sync::Arc<std::sync::atomic::AtomicU64>) -> Self {
+    pub fn new(
+        gas_price_wei: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        eth_price: crate::chain::oracle::EthPrice,
+    ) -> Self {
         Self {
             gas_price_wei,
-            eth_price_usd: env_f64("ETH_PRICE_USD", 3000.0),
+            eth_price,
             volume_usd_per_block: env_f64("LPA_VOLUME_USD_PER_BLOCK", 50_000.0),
         }
     }
@@ -82,7 +88,7 @@ impl CostModel for LiveCostModel {
         let gp = self
             .gas_price_wei
             .load(std::sync::atomic::Ordering::Relaxed) as f64;
-        (REBALANCE_GAS_UNITS as f64 * gp / 1e18) * self.eth_price_usd
+        (REBALANCE_GAS_UNITS as f64 * gp / 1e18) * self.eth_price.get()
     }
     fn volume_usd_per_block(&self, _pool_id: &str) -> f64 {
         self.volume_usd_per_block
@@ -124,6 +130,10 @@ pub fn default_config() -> PositionConfig {
 pub struct StrategyEngine {
     pub horizon_blocks: f64,
     pub min_ticks: usize,
+    /// Spread paid to re-ratio the position, in bps of position value.
+    pub slippage_bps: f64,
+    /// Allowance for value lost to searchers on a public rebalance, in bps.
+    pub mev_bps: f64,
 }
 
 impl Default for StrategyEngine {
@@ -135,6 +145,8 @@ impl Default for StrategyEngine {
         Self {
             horizon_blocks: 300.0,
             min_ticks,
+            slippage_bps: env_f64("LPA_SLIPPAGE_BPS", 30.0),
+            mev_bps: env_f64("LPA_MEV_BPS", 10.0),
         }
     }
 }
@@ -191,6 +203,7 @@ impl StrategyEngine {
 
         let ev = ev::EvInputs {
             current_tick: tick,
+            entry_tick: input.entry_tick,
             step_sigma: math::step_sigma(input.ticks),
             horizon_blocks: self.horizon_blocks,
             cur_lower: input.cur_lower,
@@ -200,6 +213,9 @@ impl StrategyEngine {
             volume_usd_per_block: cost.volume_usd_per_block(input.pool_id),
             fee_tier_pips: input.fee_pips as f64,
             cost_usd: est_cost,
+            position_value_usd: input.position_value_usd,
+            slippage_bps: self.slippage_bps,
+            mev_bps: self.mev_bps,
         };
         if !ev::should_rebalance(&ev) {
             return None;
@@ -296,6 +312,7 @@ mod tests {
             fee_pips: 3000,
             ticks,
             config: cfg,
+            position_value_usd: 0.0,
         }
     }
 

@@ -16,6 +16,7 @@ use tracing::{debug, error, info, warn};
 use tokio::sync::mpsc;
 
 use crate::chain::config::ChainConfig;
+use crate::chain::oracle::{EthPrice, EthPriceOracle};
 use crate::chain::reader::ChainReader;
 use crate::exec::RebalanceIntent;
 use crate::position::tracker::{PositionRow, Tracker};
@@ -117,7 +118,26 @@ pub async fn run_watch(
 ) -> Result<()> {
     let engine = StrategyEngine::default();
     let gas_price = Arc::new(AtomicU64::new(INITIAL_GAS_PRICE_WEI));
-    let cost = LiveCostModel::new(gas_price.clone());
+
+    // Gas is priced in ETH, so the spend cap is only as honest as the ETH
+    // price. Seed with the operator's figure, then let the on-chain feed
+    // correct it; a feed that never connects keeps the seed and says so.
+    let eth_price = EthPrice::new(
+        std::env::var("ETH_PRICE_USD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3000.0),
+    );
+    match cfg.http_url() {
+        Ok(url) => match EthPriceOracle::connect(&url, cfg.addrs.eth_usd_feed).await {
+            Ok(o) => eth_price.spawn_refresher(o),
+            Err(e) => {
+                warn!(error = %e, seed = eth_price.get(), "ETH/USD oracle unavailable; using seeded price")
+            }
+        },
+        Err(e) => warn!(error = %e, seed = eth_price.get(), "no HTTP RPC; using seeded ETH price"),
+    }
+    let cost = LiveCostModel::new(gas_price.clone(), eth_price);
     let config = default_config();
 
     let reader = match hook {
@@ -368,7 +388,7 @@ async fn handle(ctx: &Ctx<'_>, log: Log) -> Result<()> {
         return handle_removed(ctx, topic, log).await;
     }
     match topic {
-        Some(t) if t == Swap::SIGNATURE_HASH => handle_swap(ctx, log),
+        Some(t) if t == Swap::SIGNATURE_HASH => handle_swap(ctx, log).await,
         Some(t) if t == PositionOpened::SIGNATURE_HASH => handle_opened(ctx, log),
         Some(t) if t == PositionClosed::SIGNATURE_HASH => handle_closed(ctx, log),
         Some(t) if t == Rebalanced::SIGNATURE_HASH => handle_rebalanced(ctx, log),
@@ -433,7 +453,7 @@ async fn resync_position(ctx: &Ctx<'_>, position_id: B256) -> Result<()> {
     Ok(())
 }
 
-fn handle_swap(ctx: &Ctx<'_>, log: Log) -> Result<()> {
+async fn handle_swap(ctx: &Ctx<'_>, log: Log) -> Result<()> {
     let ev = match Swap::decode_log(&log.inner) {
         Ok(e) => e,
         Err(e) => {
@@ -450,7 +470,7 @@ fn handle_swap(ctx: &Ctx<'_>, log: Log) -> Result<()> {
     for cx in &crosses {
         if cx.was_in_range && !cx.now_in_range {
             warn!(position_id = %cx.position_id, tick, "position EXITED range");
-            propose_rebalance(ctx, &pool_hex, tick, &cx.position_id);
+            propose_rebalance(ctx, &pool_hex, tick, &cx.position_id).await;
         } else if !cx.was_in_range && cx.now_in_range {
             info!(position_id = %cx.position_id, tick, "position re-entered range");
         }
@@ -530,7 +550,39 @@ fn handle_rebalanced(ctx: &Ctx<'_>, log: Log) -> Result<()> {
     Ok(())
 }
 
-fn propose_rebalance(ctx: &Ctx<'_>, pool_hex: &str, tick: i32, position_id: &str) {
+/// Values the position in USD so the EV gate can price IL and friction. Needs
+/// both a chain read and an operator-supplied USD price for token1 (there is no
+/// general way to price an arbitrary pair); returns 0 — meaning unknown — if
+/// either is missing, which leaves the gate fee-and-gas only.
+async fn position_value_usd(ctx: &Ctx<'_>, p: &PositionRow) -> f64 {
+    let Some(reader) = ctx.reader else { return 0.0 };
+    let token1_usd = std::env::var("LPA_TOKEN1_USD")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    if token1_usd <= 0.0 {
+        return 0.0;
+    }
+    let (Ok(pool_id), Ok(position_id)) = (p.pool_id.parse::<B256>(), p.position_id.parse::<B256>())
+    else {
+        return 0.0;
+    };
+    let Ok(snap) = reader
+        .position_snapshot(pool_id, position_id, p.tick_lower, p.tick_upper)
+        .await
+    else {
+        return 0.0;
+    };
+    let price = 1.0001f64.powi(snap.current_tick);
+    let to_f64 = |v: alloy::primitives::U256| -> f64 { format!("{v}").parse().unwrap_or(0.0) };
+    let value_token1 = to_f64(snap.amount0) * price + to_f64(snap.amount1);
+    if !value_token1.is_finite() {
+        return 0.0;
+    }
+    value_token1 * token1_usd
+}
+
+async fn propose_rebalance(ctx: &Ctx<'_>, pool_hex: &str, tick: i32, position_id: &str) {
     let Ok(Some(pos)) = ctx.tracker.get_position(position_id) else {
         return;
     };
@@ -552,6 +604,7 @@ fn propose_rebalance(ctx: &Ctx<'_>, pool_hex: &str, tick: i32, position_id: &str
         fee_pips: pos.fee.unwrap_or(DEFAULT_FEE_PIPS),
         ticks: &ticks,
         config: ctx.config,
+        position_value_usd: position_value_usd(ctx, &pos).await,
     };
     let Some(d) = ctx.engine.decide(&input, ctx.cost) else {
         return;

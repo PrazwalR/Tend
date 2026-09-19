@@ -37,7 +37,10 @@ process, wired by in-process channels. The only network surface is `lpa serve`
   A per-chain watermark plus an `eth_getLogs` backfill closes the gap after a
   restart; reorged position events resync from the hook's own storage.
 - **Strategy** — concentrated-LP impermanent-loss, block-sampled Bollinger
-  bands, and an expected-value gate (`E[fee gain] − E[IL] − cost > 0`).
+  bands, and an expected-value gate
+  (`E[fee gain] + E[IL avoided] − gas − slippage − MEV > 0`). Expected IL is
+  integrated over the horizon's terminal tick distribution, not point-estimated,
+  because IL is convex in price.
 - **Executor** — alloy signer; preflight `eth_call`, hard gas estimate, USD
   spend cap, slippage floor, receipt timeout, optional private RPC.
 - **`AutopilotHook.sol`** — v4 hook that custodies liquidity and moves ranges
@@ -113,8 +116,13 @@ Put the deployed address in `AUTOPILOT_HOOK_ADDRESS`.
   funds. Cooldown, pause, and the slippage floor are the safety valves.
 - **serve** binds `127.0.0.1` by default and requires a bearer token
   (`LPA_API_TOKEN`) on every RPC when set.
-- The strategy's USD volume input is an operator assumption pending a price
-  oracle; the executor's spend cap uses a live gas price.
+- The executor's spend cap uses a live gas price and the chain's Chainlink
+  ETH/USD feed, which is verified by `description()` at connect time and
+  rejected when stale. `ETH_PRICE_USD` is only the pre-connect seed.
+- Pool volume (`LPA_VOLUME_USD_PER_BLOCK`) and token1's USD price
+  (`LPA_TOKEN1_USD`) remain operator assumptions. Without the latter a position
+  cannot be valued, and the EV gate runs fee-and-gas only rather than guessing
+  at IL and friction.
 - Position liquidity, token amounts and uncollected fees are read from the v4
   `StateView` lens. Without `--hook` (or an HTTP RPC) those fields stream empty
   rather than guessed.
