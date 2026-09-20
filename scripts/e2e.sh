@@ -108,7 +108,7 @@ cargo build --bin lpa >/dev/null 2>&1 || fail "cargo build failed"
 
 step "stage 1 — deploy hook, pool, background liquidity"
 SETUP_LOG="$WORK/setup.log"
-POOL_MANAGER="$POOL_MANAGER" REBALANCER_ADDRESS="$REBALANCER_ADDR" REBALANCE_COOLDOWN_SECS=0 \
+POOL_MANAGER="$POOL_MANAGER" REBALANCER_ADDRESS="$REBALANCER_ADDR" REBALANCE_COOLDOWN_SECS=60 \
   fscript script/E2ESetup.s.sol:E2ESetup \
     --rpc-url "$RPC" --private-key "$DEPLOYER_KEY" --broadcast --slow >"$SETUP_LOG" 2>&1 \
   || { tail -30 "$SETUP_LOG"; fail "setup script failed"; }
@@ -164,6 +164,12 @@ for _ in $(seq 1 6); do swap true -4e19; done   # push hard through the lower bo
 TICK=$(cast call "$HOOK" "positions(bytes32)(address,(address,address,uint24,int24,address),int24,int24,uint128,bool,uint64)" \
   "$POSITION" --rpc-url "$RPC" 2>/dev/null | sed -n '3p' || true)
 echo "post-swap stored range lower=$TICK"
+
+# The contract enforces a minimum cooldown, and it is now measured from the
+# deposit rather than from 0. Advance chain time past it so the daemon's next
+# attempt is eligible.
+cast rpc evm_increaseTime 120 --rpc-url "$RPC" >/dev/null 2>&1 || true
+cast rpc evm_mine --rpc-url "$RPC" >/dev/null 2>&1 || true
 
 step "stage 5 — wait for the daemon to rebalance on-chain"
 DEADLINE=$((SECONDS + 90))

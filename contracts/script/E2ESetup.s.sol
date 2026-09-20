@@ -26,7 +26,7 @@ contract E2ESetup is Script {
         address manager = vm.envAddress("POOL_MANAGER");
         address rebalancer = vm.envAddress("REBALANCER_ADDRESS");
         address hookOwner = vm.envOr("HOOK_OWNER", msg.sender);
-        uint64 cooldown = uint64(vm.envOr("REBALANCE_COOLDOWN_SECS", uint256(0)));
+        uint64 cooldown = uint64(vm.envOr("REBALANCE_COOLDOWN_SECS", uint256(60)));
 
         uint160 flags = uint160(Hooks.AFTER_SWAP_FLAG);
         bytes memory args = abi.encode(IPoolManager(manager), hookOwner, rebalancer, cooldown);

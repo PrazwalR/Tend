@@ -490,6 +490,126 @@ contract AutopilotHookTest is Test, Deployers {
         hook.rebalance(pid, -1200, 1200, 0);
     }
 
+    // --- HIGH-1 regression: the value floor is protocol-enforced ---
+
+    /// The rebalancer supplies `minLiquidity`, so it cannot be the real bound.
+    /// A zero owner tolerance must stop a rebalance the rebalancer would allow.
+    function test_value_floor_binds_even_when_rebalancer_waives_slippage() public {
+        modifyLiquidityRouter.modifyLiquidity(
+            key, ModifyLiquidityParams({tickLower: -60000, tickUpper: 60000, liquidityDelta: 1e21, salt: 0}), ""
+        );
+        bytes32 pid = _deposit(-600, 600, 1e18);
+        hook.setMaxRebalanceLossBps(0); // tolerate no value loss at all
+        vm.warp(block.timestamp + COOLDOWN);
+
+        // minLiquidity = 0 waives the rebalancer-side guard entirely.
+        vm.prank(rebalancer);
+        vm.expectPartialRevert(AutopilotHook.ValueLossExceeded.selector);
+        hook.rebalance(pid, 600, 1200, 0);
+    }
+
+    function test_value_floor_allows_a_normal_rebalance() public {
+        modifyLiquidityRouter.modifyLiquidity(
+            key, ModifyLiquidityParams({tickLower: -60000, tickUpper: 60000, liquidityDelta: 1e21, salt: 0}), ""
+        );
+        bytes32 pid = _deposit(-600, 600, 1e18);
+        vm.warp(block.timestamp + COOLDOWN);
+        vm.prank(rebalancer);
+        uint128 newLiq = hook.rebalance(pid, -1200, 1200, 0);
+        assertGt(newLiq, 0);
+    }
+
+    function test_loss_tolerance_is_owner_only_and_capped() public {
+        vm.prank(attacker);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, attacker));
+        hook.setMaxRebalanceLossBps(10);
+
+        // Read first: vm.expectRevert applies to the next call, which would
+        // otherwise be the constant getter rather than the setter.
+        uint16 cap = hook.MAX_LOSS_TOLERANCE_BPS();
+        vm.expectRevert(AutopilotHook.LossToleranceTooHigh.selector);
+        hook.setMaxRebalanceLossBps(cap + 1);
+
+        hook.setMaxRebalanceLossBps(25);
+        assertEq(hook.maxRebalanceLossBps(), 25);
+    }
+
+    // --- HIGH-2 regression: free churn inside the envelope ---
+
+    /// A same-range rebalance moved nothing but still paid the pool fee, so it
+    /// was a pure value leak the tick envelope could not prevent.
+    function test_no_op_rebalance_reverts() public {
+        bytes32 pid = _deposit(-600, 600, 1e18);
+        vm.warp(block.timestamp + COOLDOWN);
+        vm.prank(rebalancer);
+        vm.expectRevert(AutopilotHook.NoOpRebalance.selector);
+        hook.rebalance(pid, -600, 600, 0);
+    }
+
+    /// A zero cooldown let a rebalancer loop rebalance() within one transaction.
+    function test_interval_floor_enforced() public {
+        vm.expectRevert(AutopilotHook.IntervalTooShort.selector);
+        hook.setMinRebalanceInterval(0);
+
+        uint64 floorSecs = hook.MIN_REBALANCE_INTERVAL();
+        vm.expectRevert(AutopilotHook.IntervalTooShort.selector);
+        hook.setMinRebalanceInterval(floorSecs - 1);
+
+        hook.setMinRebalanceInterval(floorSecs);
+        assertEq(hook.minRebalanceInterval(), floorSecs);
+    }
+
+    function test_constructor_rejects_zero_cooldown() public {
+        address flags2 = address(uint160(Hooks.AFTER_SWAP_FLAG) | (uint160(0x7777) << 144));
+        vm.expectRevert(AutopilotHook.IntervalTooShort.selector);
+        deployCodeTo("AutopilotHook.sol:AutopilotHook", abi.encode(manager, address(this), rebalancer, 0), flags2);
+    }
+
+    // --- HIGH-3 regression: a frozen owner must not strand the paired token ---
+
+    /// `withdraw` paid only to `pos.owner` and only in the underlying, so a
+    /// blacklist on one currency reverted the whole unlock and locked the other
+    /// token too. Exiting to a different recipient must work.
+    function test_withdraw_to_alternate_recipient() public {
+        MockERC20 t0 = MockERC20(Currency.unwrap(currency0));
+        address rescue = address(0xBEEF1);
+        bytes32 pid = _deposit(-600, 600, 1e18);
+
+        hook.withdraw(pid, rescue, false);
+
+        assertGt(t0.balanceOf(rescue), 0, "recipient received the freed token0");
+        (,,,,, bool active,) = hook.positions(pid);
+        assertFalse(active);
+    }
+
+    /// Taking ERC-6909 claims never calls the token, so it is the censorship-proof
+    /// exit: the claim is minted inside the PoolManager regardless of transfer
+    /// restrictions on the underlying.
+    function test_withdraw_as_claims_does_not_touch_the_token() public {
+        MockERC20 t0 = MockERC20(Currency.unwrap(currency0));
+        bytes32 pid = _deposit(-600, 600, 1e18);
+        uint256 afterDeposit = t0.balanceOf(address(this));
+
+        hook.withdraw(pid, address(this), true);
+
+        assertEq(t0.balanceOf(address(this)), afterDeposit, "underlying must not move on a claims exit");
+        assertGt(manager.balanceOf(address(this), currency0.toId()), 0, "claim minted for token0");
+        assertGt(manager.balanceOf(address(this), currency1.toId()), 0, "claim minted for token1");
+    }
+
+    function test_withdraw_rejects_zero_recipient() public {
+        bytes32 pid = _deposit(-600, 600, 1e18);
+        vm.expectRevert(AutopilotHook.ZeroRecipient.selector);
+        hook.withdraw(pid, address(0), false);
+    }
+
+    function test_withdraw_alternate_recipient_still_owner_only() public {
+        bytes32 pid = _deposit(-600, 600, 1e18);
+        vm.prank(attacker);
+        vm.expectRevert(AutopilotHook.NotPositionOwner.selector);
+        hook.withdraw(pid, attacker, false);
+    }
+
     function test_renounce_ownership_disabled() public {
         vm.expectRevert(AutopilotHook.RenounceDisabled.selector);
         hook.renounceOwnership();
