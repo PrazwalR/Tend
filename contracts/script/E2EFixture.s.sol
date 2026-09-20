@@ -18,15 +18,16 @@ contract E2EFixture is Script {
     function run() external {
         address manager = vm.envAddress("POOL_MANAGER");
         address rebalancer = vm.envAddress("REBALANCER_ADDRESS");
+        address hookOwner = vm.envOr("HOOK_OWNER", msg.sender);
         uint64 cooldown = 3600;
 
         uint160 flags = uint160(Hooks.AFTER_SWAP_FLAG);
-        bytes memory args = abi.encode(IPoolManager(manager), rebalancer, cooldown);
+        bytes memory args = abi.encode(IPoolManager(manager), hookOwner, rebalancer, cooldown);
         (address predicted, bytes32 salt) =
             HookMiner.find(CREATE2_DEPLOYER, flags, type(AutopilotHook).creationCode, args);
 
         vm.startBroadcast();
-        AutopilotHook hook = new AutopilotHook{salt: salt}(IPoolManager(manager), rebalancer, cooldown);
+        AutopilotHook hook = new AutopilotHook{salt: salt}(IPoolManager(manager), hookOwner, rebalancer, cooldown);
 
         MockERC20 a = new MockERC20("A", "A", 18);
         MockERC20 b = new MockERC20("B", "B", 18);

@@ -33,11 +33,15 @@ contract AutopilotHookTest is Test, Deployers {
     event AutopilotCheck(PoolId indexed poolId, int24 tick, uint256 positionCount);
 
     function setUp() public {
+        // A realistic clock. At Foundry's default block.timestamp of 1 the cooldown
+        // assertions pass for the wrong reason: readyAt is an absolute timestamp of
+        // at most 365 days, which is below any live chain's clock.
+        vm.warp(1_758_300_000);
         deployFreshManagerAndRouters();
         (currency0, currency1) = deployMintAndApprove2Currencies();
 
         address flags = address(uint160(Hooks.AFTER_SWAP_FLAG) | (uint160(0x4444) << 144));
-        deployCodeTo("AutopilotHook.sol:AutopilotHook", abi.encode(manager, rebalancer, COOLDOWN), flags);
+        deployCodeTo("AutopilotHook.sol:AutopilotHook", abi.encode(manager, address(this), rebalancer, COOLDOWN), flags);
         hook = AutopilotHook(flags);
 
         (key, id) = initPool(currency0, currency1, IHooks(hook), 3000, SQRT_PRICE_1_1);
@@ -127,7 +131,10 @@ contract AutopilotHookTest is Test, Deployers {
     function test_rebalance_cooldown_enforced() public {
         bytes32 pid = _deposit(-600, 600, 1e18);
         vm.prank(rebalancer);
-        vm.expectRevert(abi.encodeWithSelector(AutopilotHook.RebalanceTooSoon.selector, COOLDOWN));
+        // readyAt is measured from the deposit, not from 0.
+        vm.expectRevert(
+            abi.encodeWithSelector(AutopilotHook.RebalanceTooSoon.selector, uint64(block.timestamp) + COOLDOWN)
+        );
         hook.rebalance(pid, -1200, 1200, 0);
 
         vm.warp(block.timestamp + COOLDOWN);
@@ -419,6 +426,68 @@ contract AutopilotHookTest is Test, Deployers {
         vm.prank(rebalancer);
         vm.expectPartialRevert(AutopilotHook.SlippageExceeded.selector);
         hook.rebalance(pid, -1800, -600, type(uint128).max);
+    }
+
+    // --- CRIT-1 regression: the re-ratio swap must not destroy the pool price ---
+
+    /// The swap runs after this position's liquidity is burned. Unbounded, it walks
+    /// the price to the tick extreme and the call still succeeds.
+    function test_rebalance_does_not_destroy_pool_price() public {
+        bytes32 pid = _deposit(-600, 600, 1e18);
+        (uint160 beforePrice,,,) = manager.getSlot0(id);
+        vm.warp(block.timestamp + COOLDOWN);
+
+        vm.prank(rebalancer);
+        hook.rebalance(pid, 600, 1200, 0);
+
+        (uint160 afterPrice, int24 tick,,) = manager.getSlot0(id);
+        assertLt(uint256(afterPrice), uint256(TickMath.MAX_SQRT_PRICE - 1), "price walked to the sentinel");
+        assertLt(tick, int24(887000), "price walked to the tick extreme");
+        assertLe(tick, int24(1200), "price pushed beyond the target range");
+        assertGt(uint256(afterPrice), uint256(beforePrice) / 100, "price collapsed");
+    }
+
+    /// Same guarantee on the opposite side.
+    function test_rebalance_below_spot_does_not_destroy_pool_price() public {
+        bytes32 pid = _deposit(-600, 600, 1e18);
+        vm.warp(block.timestamp + COOLDOWN);
+
+        vm.prank(rebalancer);
+        hook.rebalance(pid, -1200, -600, 0);
+
+        (, int24 tick,,) = manager.getSlot0(id);
+        assertGt(tick, int24(-887000), "price walked to the tick extreme");
+        assertGe(tick, int24(-1200), "price pushed beyond the target range");
+    }
+
+    /// The dominant-LP case: with no external liquidity the unbounded swap has
+    /// nothing to trade against and runs to the sentinel.
+    function test_rebalance_with_no_external_liquidity_keeps_price_sane() public {
+        bytes32 pid = _deposit(-600, 600, 1e18);
+        vm.warp(block.timestamp + COOLDOWN);
+
+        vm.prank(rebalancer);
+        hook.rebalance(pid, 600, 1200, 0);
+
+        (, int24 tick,,) = manager.getSlot0(id);
+        assertLt(tick, int24(887000), "dominant-LP rebalance walked the price to the extreme");
+    }
+
+    // --- CRIT-2 regression: ownership must survive the real deploy path ---
+
+    function test_owner_is_explicit_not_msg_sender() public view {
+        assertEq(hook.owner(), address(this), "owner must be the configured address");
+    }
+
+    // --- C-3 regression: the first rebalance is subject to the cooldown ---
+
+    function test_first_rebalance_respects_cooldown() public {
+        bytes32 pid = _deposit(-600, 600, 1e18);
+        vm.prank(rebalancer);
+        vm.expectRevert(
+            abi.encodeWithSelector(AutopilotHook.RebalanceTooSoon.selector, uint64(block.timestamp) + COOLDOWN)
+        );
+        hook.rebalance(pid, -1200, 1200, 0);
     }
 
     function test_renounce_ownership_disabled() public {

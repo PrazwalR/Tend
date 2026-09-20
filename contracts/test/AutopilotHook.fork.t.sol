@@ -36,7 +36,7 @@ contract AutopilotHookForkTest is Test {
         }
 
         address flags = address(uint160(Hooks.AFTER_SWAP_FLAG) | (uint160(0x5555) << 144));
-        deployCodeTo("AutopilotHook.sol:AutopilotHook", abi.encode(MANAGER, rebalancer, COOLDOWN), flags);
+        deployCodeTo("AutopilotHook.sol:AutopilotHook", abi.encode(MANAGER, address(this), rebalancer, COOLDOWN), flags);
         hook = AutopilotHook(flags);
 
         MockERC20 a = new MockERC20("A", "A", 18);

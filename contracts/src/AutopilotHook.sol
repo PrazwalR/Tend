@@ -110,7 +110,14 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
     error RenounceDisabled();
     error NativeNotSupported();
 
-    constructor(IPoolManager pm, address initialRebalancer, uint64 cooldown) BaseHook(pm) Ownable(msg.sender) {
+    /// @dev `initialOwner` is explicit rather than `msg.sender`: the hook must be
+    ///      deployed through the CREATE2 factory for its address to carry the
+    ///      permission bits, which would otherwise make the factory the owner and
+    ///      leave `pause()` and `setRebalancer()` permanently unreachable.
+    constructor(IPoolManager pm, address initialOwner, address initialRebalancer, uint64 cooldown)
+        BaseHook(pm)
+        Ownable(initialOwner)
+    {
         if (initialRebalancer != address(0)) {
             isRebalancer[initialRebalancer] = true;
             emit RebalancerSet(initialRebalancer, true);
@@ -182,7 +189,10 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
             tickUpper: tickUpper,
             liquidity: liquidity,
             active: true,
-            lastRebalanceAt: 0
+            // Not 0: `readyAt` would then be `minRebalanceInterval`, an absolute
+            // timestamp below any live chain's clock, so the first rebalance of
+            // every position would bypass the cooldown entirely.
+            lastRebalanceAt: uint64(block.timestamp)
         });
         poolPositionCount[id] += 1;
         emit PositionOpened(positionId, msg.sender, id, tickLower, tickUpper, liquidity, key.fee, key.tickSpacing);
@@ -422,15 +432,40 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
         }
 
         if (amountIn == 0) return BalanceDeltaLibrary.ZERO_DELTA;
+
+        // Bound the fill at the first boundary of the target range lying in the
+        // direction of travel. Without a limit the swap runs after this position's
+        // own liquidity has already been burned, so in a pool this hook dominates it
+        // walks the price to the tick extreme and hands the position to the first
+        // arbitrageur. Stopping at the boundary caps impact at the range width and
+        // leaves the price inside the range being funded; a partial fill is fine,
+        // because leftover dust is returned to the owner below.
+        uint160 limit = _swapPriceLimit(sqrtPriceX96, sqrtA, sqrtB, zeroForOne);
+        if (limit == 0) return BalanceDeltaLibrary.ZERO_DELTA;
+
         return poolManager.swap(
             cb.key,
-            SwapParams({
-                zeroForOne: zeroForOne,
-                amountSpecified: -int256(amountIn),
-                sqrtPriceLimitX96: zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
-            }),
+            SwapParams({zeroForOne: zeroForOne, amountSpecified: -int256(amountIn), sqrtPriceLimitX96: limit}),
             ""
         );
+    }
+
+    /// @dev First boundary of [sqrtA, sqrtB] strictly beyond `spot` in the swap's
+    ///      direction. Returns 0 when no such boundary exists, meaning the swap
+    ///      would move price away from the target range and must be skipped.
+    ///      v4 reverts `PriceLimitAlreadyExceeded` unless the limit is strictly on
+    ///      the correct side of spot, hence the strict comparisons.
+    function _swapPriceLimit(uint160 spot, uint160 sqrtA, uint160 sqrtB, bool zeroForOne)
+        internal
+        pure
+        returns (uint160)
+    {
+        if (zeroForOne) {
+            uint160 edge = sqrtB < spot ? sqrtB : sqrtA; // highest boundary below spot
+            return edge < spot ? edge : 0;
+        }
+        uint160 edge = sqrtA > spot ? sqrtA : sqrtB; // lowest boundary above spot
+        return edge > spot ? edge : 0;
     }
 
     function _inToken1(uint256 amount0, uint160 sqrtPriceX96) private pure returns (uint256) {

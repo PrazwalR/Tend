@@ -6,8 +6,10 @@ a volatility-aware strategy with an EV gate, and executes the move on-chain
 through a custom v4 hook — with a spend cap, slippage floor, preflight
 simulation, and optional private-orderflow submission.
 
-> Status: research / pre-audit. The hook has not been professionally audited.
-> Do not use with real funds on mainnet. See [Security](#security).
+> Status: research. An internal multi-agent audit is in
+> [`audits/tend-2026-09-20/`](audits/tend-2026-09-20/AUDIT-REPORT.md); its two
+> Critical findings are fixed, the remaining Highs are not. The hook has not been
+> professionally audited. Do not use with real funds. See [Security](#security).
 
 ## Why
 
@@ -111,14 +113,21 @@ Put the deployed address in `AUTOPILOT_HOOK_ADDRESS`.
 - **Never commit secrets.** `.env` is gitignored; use `.env.example` as the
   template. `REBALANCER_PRIVATE_KEY` in `.env` is for testnet only — use a
   keystore or external signer in production.
-- **Trust model.** The rebalancer key is trusted but *bounded*: it can only
-  reposition a position within the owner-set tick envelope and cannot withdraw
-  funds. Cooldown, pause, and the slippage floor are the safety valves.
+- **Trust model.** The rebalancer key is trusted but only *partly* bounded. It
+  cannot withdraw funds and cannot move a position outside the owner-set tick
+  envelope. It can still churn a position inside that envelope, paying the pool
+  fee each cycle — an audit measured ~0.3%/cycle. The envelope bounds where a
+  position sits, not what a rebalance does to it. `minLiquidity` is **not** a
+  safety valve: it is supplied by the rebalancer itself and bounds a liquidity
+  number rather than value. Pause and the cooldown do work as described.
+  See [`audits/`](audits/) for the full picture before trusting a rebalancer key.
 - **serve** binds `127.0.0.1` by default and requires a bearer token
   (`LPA_API_TOKEN`) on every RPC when set.
-- The executor's spend cap uses a live gas price and the chain's Chainlink
-  ETH/USD feed, which is verified by `description()` at connect time and
-  rejected when stale. `ETH_PRICE_USD` is only the pre-connect seed.
+- The executor's spend cap uses a **live gas price** but a **configured ETH
+  price** (`ETH_PRICE_USD`, default 3000). The Chainlink feed — verified by
+  `description()` at connect and rejected when stale — currently reaches only
+  the strategy's EV estimate, not the spend cap. Set `ETH_PRICE_USD` to
+  something realistic until that is wired through (audit O-5).
 - Pool volume (`LPA_VOLUME_USD_PER_BLOCK`) and token1's USD price
   (`LPA_TOKEN1_USD`) remain operator assumptions. Without the latter a position
   cannot be valued, and the EV gate runs fee-and-gas only rather than guessing
