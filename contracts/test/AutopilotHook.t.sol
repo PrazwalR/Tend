@@ -19,6 +19,7 @@ import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {BaseHook} from "uniswap-hooks/src/base/BaseHook.sol";
 import {AutopilotHook} from "../src/AutopilotHook.sol";
+import {MockSequencerFeed} from "./mocks/MockSequencerFeed.sol";
 
 contract AutopilotHookTest is Test, Deployers {
     using StateLibrary for IPoolManager;
@@ -693,6 +694,147 @@ contract AutopilotHookTest is Test, Deployers {
         hook.setPriceGuard(100, 500);
         assertEq(hook.maxTickMovePerBlock(), int24(100));
         assertEq(hook.maxDeviationTicks(), int24(500));
+    }
+
+    // --- O-4 regression: an L2 restart must not execute queued rebalances ---
+
+    function test_rebalance_blocked_while_sequencer_down() public {
+        bytes32 pid = _deposit(-600, 600, 1e18);
+        MockSequencerFeed feed = new MockSequencerFeed(1, block.timestamp - 10_000); // 1 == down
+        hook.setSequencerUptimeFeed(address(feed));
+        vm.warp(block.timestamp + COOLDOWN);
+
+        vm.prank(rebalancer);
+        vm.expectRevert(AutopilotHook.SequencerDown.selector);
+        hook.rebalance(pid, -1200, 1200, 0);
+    }
+
+    function test_rebalance_blocked_during_grace_period_after_restart() public {
+        bytes32 pid = _deposit(-600, 600, 1e18);
+        vm.warp(block.timestamp + COOLDOWN);
+        // Up, but only just: the backlog is still draining and spot is gapping.
+        MockSequencerFeed feed = new MockSequencerFeed(0, block.timestamp);
+        hook.setSequencerUptimeFeed(address(feed));
+
+        vm.prank(rebalancer);
+        vm.expectPartialRevert(AutopilotHook.SequencerGracePeriod.selector);
+        hook.rebalance(pid, -1200, 1200, 0);
+    }
+
+    function test_rebalance_allowed_once_grace_period_elapsed() public {
+        bytes32 pid = _deposit(-600, 600, 1e18);
+        MockSequencerFeed feed = new MockSequencerFeed(0, block.timestamp);
+        hook.setSequencerUptimeFeed(address(feed));
+        vm.warp(block.timestamp + hook.SEQUENCER_GRACE_PERIOD() + 1);
+
+        vm.prank(rebalancer);
+        hook.rebalance(pid, -1200, 1200, 0);
+        (,, int24 lo,,,,) = hook.positions(pid);
+        assertEq(lo, -1200);
+    }
+
+    /// A zero feed is the L1 configuration and must not gate anything.
+    function test_zero_sequencer_feed_disables_the_check() public {
+        bytes32 pid = _deposit(-600, 600, 1e18);
+        assertEq(hook.sequencerUptimeFeed(), address(0));
+        vm.warp(block.timestamp + COOLDOWN);
+        vm.prank(rebalancer);
+        hook.rebalance(pid, -1200, 1200, 0);
+    }
+
+    function test_sequencer_feed_is_owner_only() public {
+        vm.prank(attacker);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, attacker));
+        hook.setSequencerUptimeFeed(address(0xFEED));
+    }
+
+    // --- T-4 regression: token restrictions must be enforced, not assumed ---
+
+    function test_allowlist_off_by_default() public {
+        assertFalse(hook.allowlistEnforced());
+        _deposit(-600, 600, 1e18); // unaffected
+    }
+
+    function test_allowlist_blocks_unlisted_pair_when_enforced() public {
+        hook.setAllowlistEnforced(true);
+        vm.expectRevert(AutopilotHook.PairNotAllowed.selector);
+        hook.deposit(key, -600, 600, 1e18, -1200, 1200);
+
+        hook.setAllowedPair(currency0, currency1, true);
+        bytes32 pid = hook.deposit(key, -600, 600, 1e18, -1200, 1200);
+        (,,,,, bool active,) = hook.positions(pid);
+        assertTrue(active);
+    }
+
+    /// De-listing must never strand an open position, so the check is on the way
+    /// in only.
+    function test_delisting_a_pair_still_allows_exit_and_rebalance() public {
+        hook.setAllowlistEnforced(true);
+        hook.setAllowedPair(currency0, currency1, true);
+        bytes32 pid = hook.deposit(key, -600, 600, 1e18, -1800, 1800);
+
+        hook.setAllowedPair(currency0, currency1, false); // de-list
+
+        vm.warp(block.timestamp + COOLDOWN);
+        vm.prank(rebalancer);
+        hook.rebalance(pid, -1200, 1200, 0); // still rebalanceable
+
+        hook.withdraw(pid); // still exitable
+        (,,,,, bool active,) = hook.positions(pid);
+        assertFalse(active);
+    }
+
+    function test_allowlist_admin_is_owner_only() public {
+        vm.prank(attacker);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, attacker));
+        hook.setAllowlistEnforced(true);
+
+        vm.prank(attacker);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, attacker));
+        hook.setAllowedPair(currency0, currency1, true);
+    }
+
+    // --- C-5 regression: owners can scope or revoke their rebalancer ---
+
+    function test_owner_can_scope_rebalancer_to_one_address() public {
+        bytes32 pid = _deposit(-600, 600, 1e18);
+        hook.setRebalancer(attacker, true);
+        hook.setPositionRebalancer(pid, rebalancer);
+        vm.warp(block.timestamp + COOLDOWN);
+
+        vm.prank(attacker);
+        vm.expectRevert(AutopilotHook.NotRebalancer.selector);
+        hook.rebalance(pid, -1200, 1200, 0);
+
+        vm.prank(rebalancer);
+        hook.rebalance(pid, -1200, 1200, 0);
+    }
+
+    function test_owner_can_disable_automation_entirely() public {
+        bytes32 pid = _deposit(-600, 600, 1e18);
+        hook.setPositionRebalancer(pid, hook.AUTOMATION_OFF());
+        vm.warp(block.timestamp + COOLDOWN);
+
+        vm.prank(rebalancer);
+        vm.expectRevert(AutopilotHook.AutomationDisabled.selector);
+        hook.rebalance(pid, -1200, 1200, 0);
+
+        hook.withdraw(pid); // opting out must not trap the position
+    }
+
+    function test_unscoped_position_accepts_any_allowlisted_rebalancer() public {
+        bytes32 pid = _deposit(-600, 600, 1e18);
+        assertEq(hook.positionRebalancer(pid), address(0));
+        vm.warp(block.timestamp + COOLDOWN);
+        vm.prank(rebalancer);
+        hook.rebalance(pid, -1200, 1200, 0);
+    }
+
+    function test_only_position_owner_can_scope_it() public {
+        bytes32 pid = _deposit(-600, 600, 1e18);
+        vm.prank(attacker);
+        vm.expectRevert(AutopilotHook.NotPositionOwner.selector);
+        hook.setPositionRebalancer(pid, attacker);
     }
 
     function test_renounce_ownership_disabled() public {

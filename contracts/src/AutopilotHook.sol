@@ -21,6 +21,8 @@ import {FixedPoint96} from "@uniswap/v4-core/src/libraries/FixedPoint96.sol";
 
 import {LiquidityAmounts} from "@uniswap/v4-periphery/src/libraries/LiquidityAmounts.sol";
 
+import {IAggregatorV3} from "./interfaces/IAggregatorV3.sol";
+
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
@@ -76,12 +78,24 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
     /// @dev Ceiling on the owner-set per-rebalance value tolerance.
     uint16 public constant MAX_LOSS_TOLERANCE_BPS = 500;
     uint16 public constant BPS = 10_000;
+    /// @dev Sentinel for `positionRebalancer`: automation disabled for a position.
+    address public constant AUTOMATION_OFF = address(1);
     /// @dev Ceiling on how far the reference tick may be dragged in one block,
     ///      and on the spot-vs-reference gap a rebalance will tolerate.
     int24 public constant MAX_TICK_MOVE_PER_BLOCK = 500;
     int24 public constant MAX_DEVIATION_TICKS = 2000;
+    /// @dev Time an L2 must have been back up before rebalancing resumes. On
+    ///      resumption the backlog lands at once and spot gaps to fair value in
+    ///      the first blocks, which is exactly when a queued rebalance executes
+    ///      against a price its simulation never saw.
+    uint256 public constant SEQUENCER_GRACE_PERIOD = 3600;
 
     mapping(bytes32 => Position) public positions;
+    /// @dev Optional per-position scope on top of the global allowlist. Zero means
+    ///      "any allowlisted rebalancer"; `AUTOMATION_OFF` means none, so an owner
+    ///      can opt out entirely. Adding a rebalancer globally no longer silently
+    ///      grants authority over positions that predate it.
+    mapping(bytes32 => address) public positionRebalancer;
     mapping(bytes32 => int24) public boundLower;
     mapping(bytes32 => int24) public boundUpper;
     mapping(PoolId => uint256) public poolPositionCount;
@@ -91,6 +105,16 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
     ///      move `maxTickMovePerBlock` per block, which makes dragging it cost
     ///      sustained blocks rather than one flash-loaned transaction.
     mapping(PoolId => PriceRef) public priceRef;
+    /// @dev Chainlink L2 uptime feed. Zero disables the check, which is correct
+    ///      on L1 and wrong on Base — set it after deploying there.
+    /// @dev Curated pairs. The contract cannot detect a fee-on-transfer or
+    ///      rebasing token by inspection, so the restriction has to be a list
+    ///      rather than a check — and an unenforced list is just a comment.
+    mapping(bytes32 => bool) public allowedPair;
+    /// @dev Off by default so existing deployments keep working; turn it on once
+    ///      the list is populated.
+    bool public allowlistEnforced;
+    address public sequencerUptimeFeed;
     int24 public maxTickMovePerBlock;
     int24 public maxDeviationTicks;
     uint64 public minRebalanceInterval;
@@ -125,6 +149,10 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
     event MinRebalanceIntervalSet(uint64 interval);
     event MaxRebalanceLossBpsSet(uint16 bps);
     event PriceGuardSet(int24 maxTickMovePerBlock, int24 maxDeviationTicks);
+    event SequencerUptimeFeedSet(address feed);
+    event PairAllowed(Currency indexed currency0, Currency indexed currency1, bool allowed);
+    event AllowlistEnforcedSet(bool enforced);
+    event PositionRebalancerSet(bytes32 indexed positionId, address rebalancer);
 
     error NotPositionOwner();
     error NotRebalancer();
@@ -147,6 +175,10 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
     error ZeroRecipient();
     error PriceDeviation(int24 spotTick, int24 referenceTick);
     error DeviationBoundTooHigh();
+    error SequencerDown();
+    error SequencerGracePeriod(uint256 readyAt);
+    error PairNotAllowed();
+    error AutomationDisabled();
 
     /// @dev `initialOwner` is explicit rather than `msg.sender`: the hook must be
     ///      deployed through the CREATE2 factory for its address to carry the
@@ -203,6 +235,11 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
         if (liquidity == 0) revert ZeroLiquidity();
         if (address(key.hooks) != address(this)) revert HookMismatch();
         if (Currency.unwrap(key.currency0) == address(0)) revert NativeNotSupported();
+        // Checked on the way in only. Gating withdraw or rebalance would turn a
+        // de-listing into a fund trap for positions already open.
+        if (allowlistEnforced && !allowedPair[_pairKey(key.currency0, key.currency1)]) {
+            revert PairNotAllowed();
+        }
         _validateTicks(key, tickLower, tickUpper);
         _validateTicks(key, minBound, maxBound);
         if (tickLower < minBound || tickUpper > maxBound) revert OutOfBounds();
@@ -304,7 +341,7 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
         nonReentrant
         returns (uint128 newLiquidity)
     {
-        if (!isRebalancer[msg.sender]) revert NotRebalancer();
+        _requireRebalancerFor(positionId);
         Position storage pos = positions[positionId];
         if (!pos.active) revert PositionNotActive();
 
@@ -312,6 +349,8 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
         if (block.timestamp < readyAt) revert RebalanceTooSoon(readyAt);
 
         if (newTickLower == pos.tickLower && newTickUpper == pos.tickUpper) revert NoOpRebalance();
+
+        _requireSequencerUp();
 
         PoolKey memory key = pos.key;
         _requirePriceNotManipulated(key.toId());
@@ -604,6 +643,18 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
         priceRef[id] = PriceRef({tick: next, updatedAt: uint32(block.timestamp), seeded: true});
     }
 
+    /// @dev On an L2, refuses to act while the sequencer is down or has only just
+    ///      come back. A zero feed disables the check for L1 deployments.
+    function _requireSequencerUp() internal view {
+        address feed = sequencerUptimeFeed;
+        if (feed == address(0)) return;
+        (, int256 answer, uint256 startedAt,,) = IAggregatorV3(feed).latestRoundData();
+        // 0 == up, 1 == down. startedAt == 0 means the round has not started.
+        if (answer != 0 || startedAt == 0) revert SequencerDown();
+        uint256 readyAt = startedAt + SEQUENCER_GRACE_PERIOD;
+        if (block.timestamp < readyAt) revert SequencerGracePeriod(readyAt);
+    }
+
     /// @dev Refuses to act while spot is far from the reference. A rebalance moves
     ///      real value at whatever price it finds, so a price the hook cannot
     ///      corroborate is a reason to wait, not to trade.
@@ -625,6 +676,24 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
         }
     }
 
+    /// @dev Global allowlist plus the position owner's optional scope.
+    function _requireRebalancerFor(bytes32 positionId) internal view {
+        if (!isRebalancer[msg.sender]) revert NotRebalancer();
+        address scoped = positionRebalancer[positionId];
+        if (scoped == AUTOMATION_OFF) revert AutomationDisabled();
+        if (scoped != address(0) && scoped != msg.sender) revert NotRebalancer();
+    }
+
+    /// @notice Restrict which rebalancer may act on a position, or disable
+    ///         automation for it entirely with `AUTOMATION_OFF`.
+    function setPositionRebalancer(bytes32 positionId, address rebalancer) external {
+        Position storage pos = positions[positionId];
+        if (!pos.active) revert PositionNotActive();
+        if (pos.owner != msg.sender) revert NotPositionOwner();
+        positionRebalancer[positionId] = rebalancer;
+        emit PositionRebalancerSet(positionId, rebalancer);
+    }
+
     function setRebalancer(address rebalancer, bool allowed) external onlyOwner {
         isRebalancer[rebalancer] = allowed;
         emit RebalancerSet(rebalancer, allowed);
@@ -634,6 +703,25 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
         if (bps > MAX_LOSS_TOLERANCE_BPS) revert LossToleranceTooHigh();
         maxRebalanceLossBps = bps;
         emit MaxRebalanceLossBpsSet(bps);
+    }
+
+    function setAllowedPair(Currency currency0, Currency currency1, bool allowed) external onlyOwner {
+        allowedPair[_pairKey(currency0, currency1)] = allowed;
+        emit PairAllowed(currency0, currency1, allowed);
+    }
+
+    function setAllowlistEnforced(bool enforced) external onlyOwner {
+        allowlistEnforced = enforced;
+        emit AllowlistEnforcedSet(enforced);
+    }
+
+    function _pairKey(Currency currency0, Currency currency1) private pure returns (bytes32) {
+        return keccak256(abi.encode(currency0, currency1));
+    }
+
+    function setSequencerUptimeFeed(address feed) external onlyOwner {
+        sequencerUptimeFeed = feed;
+        emit SequencerUptimeFeedSet(feed);
     }
 
     function setPriceGuard(int24 movePerBlock, int24 deviation) external onlyOwner {

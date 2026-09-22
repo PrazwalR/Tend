@@ -179,10 +179,20 @@ impl Tracker {
         Ok(())
     }
 
+    /// One sample per block, newest last. The per-block collapse is enforced in
+    /// SQL rather than trusted from the in-memory dedup in the watch loop, which
+    /// resets on every reconnect — without it, a reconnect storm could write
+    /// several rows for one block and let sample density be bought with dust
+    /// swaps instead of earned with elapsed time.
     pub fn recent_ticks(&self, pool_id: &str, n: usize) -> Result<Vec<i32>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT tick FROM tick_history WHERE pool_id = ?1 ORDER BY block_number DESC, id DESC LIMIT ?2",
+            "SELECT tick FROM (
+                 SELECT block_number, tick, ROW_NUMBER() OVER (
+                     PARTITION BY block_number ORDER BY id DESC
+                 ) AS rn
+                 FROM tick_history WHERE pool_id = ?1
+             ) WHERE rn = 1 ORDER BY block_number DESC LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![pool_id, n as i64], |r| r.get::<_, i32>(0))?;
         let mut out = Vec::new();
@@ -402,6 +412,30 @@ pub fn compute_position_id(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn recent_ticks_collapses_multiple_samples_in_one_block() {
+        let t = Tracker::open_in_memory().unwrap();
+        // Several swaps land in block 100; the in-memory dedup in the watch loop
+        // resets on reconnect, so the query must not depend on it.
+        t.record_tick("0xpool", 10, 100).unwrap();
+        t.record_tick("0xpool", 11, 100).unwrap();
+        t.record_tick("0xpool", 12, 100).unwrap();
+        t.record_tick("0xpool", 20, 101).unwrap();
+
+        let ticks = t.recent_ticks("0xpool", 10).unwrap();
+        assert_eq!(ticks.len(), 2, "one sample per block: {ticks:?}");
+        assert_eq!(ticks, vec![12, 20], "newest sample wins within a block");
+    }
+
+    #[test]
+    fn recent_ticks_returns_oldest_first() {
+        let t = Tracker::open_in_memory().unwrap();
+        for (i, b) in (200u64..205).enumerate() {
+            t.record_tick("0xp", i as i32, b).unwrap();
+        }
+        assert_eq!(t.recent_ticks("0xp", 10).unwrap(), vec![0, 1, 2, 3, 4]);
+    }
+
     use super::*;
 
     fn sample(id: &str, pool: &str, lower: i32, upper: i32) -> PositionRow {

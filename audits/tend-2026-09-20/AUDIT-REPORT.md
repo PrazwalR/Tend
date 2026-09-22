@@ -297,15 +297,21 @@ that was confirmed to fail against the unfixed contract.
 | G-8 / P-7 / T-6 (partial) | **Fixed** | The dead `sell0 == 0` disjunct removed while extracting `_straddleSwap`. |
 | O-5 + O-6 | **Fixed together** | `EthPrice` now carries an `updated_at` stamp and exposes `get_fresh()`, which returns `None` for a seed-only or stale price. The executor's spend cap consumes `get_fresh()` and **refuses to send** rather than falling back, so a dead feed gates spending off instead of pricing it against a constant. Fixing O-5 alone would have put the cap behind a silently-seeded value, which is why they moved together. Repeated refresh failures escalate from `warn` to `error`. |
 
+| O-4 | **Fixed** | Owner-settable Chainlink L2 uptime feed (zero disables it for L1), checked in `rebalance()` with a 3600s grace period after a restart. The Base feed `0xBCF85224...` was verified on-chain — `description()` returns `"L2 Sequencer Uptime Status Feed"`. |
+| C-5 | **Fixed** | `positionRebalancer` lets an owner scope a position to one rebalancer, or disable automation entirely with the `AUTOMATION_OFF` sentinel. Adding a rebalancer globally no longer silently grants authority over positions that predate it. Opting out cannot trap a position — `withdraw` is unaffected. |
+| T-4 (and the enforcement half of T-2 / T-3) | **Fixed** | Owner-curated pair allowlist, off by default, checked **only in `deposit()`** so de-listing a pair can never strand an open position. This is what turns "we don't support fee-on-transfer" from a comment into a rule. |
+| O-3 | **Partly fixed** | Per-block collapse moved into SQL rather than relying on the in-memory dedup that resets on reconnect, and the Bollinger centre is now a 10%-trimmed mean instead of an arithmetic mean, so a few extreme samples no longer drag the band. The window is still count-based rather than time-weighted. |
+
 ### Still open
 
-- **O-4** — no sequencer-uptime check on Base.
-- **C-5** — users still cannot scope or revoke which rebalancer may act on their
-  position. The value floor now bounds the damage per rebalance, and the
-  interval floor bounds the rate, so this is materially reduced but not closed.
-- **T-2 / T-3 / T-4** — no token allowlist; fee-on-transfer and rebasing pairs
-  are neither supported nor rejected.
-- **O-3** — the off-chain tick-history window is still count-based and unweighted.
+- **O-3 (remainder)** — the tick window counts blocks rather than weighting by
+  elapsed time, so a quiet period and a busy one contribute equally.
+- **T-2 / T-3 (behaviour)** — with the allowlist off, fee-on-transfer pairs still
+  fail at `deposit()` with an opaque `CurrencyNotSettled` from inside v4, and
+  rebasing pairs still strand yield. The allowlist is the mitigation; it has to
+  be turned on and populated.
+- **G-5** — the ≤2 wei rounding shortfall remains analytically derived, with no
+  concrete failing input produced.
 - The remaining Low and Info findings.
 
 ### A note on what the fixes cost

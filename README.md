@@ -7,9 +7,10 @@ through a custom v4 hook — with a spend cap, slippage floor, preflight
 simulation, and optional private-orderflow submission.
 
 > Status: research. An internal multi-agent audit is in
-> [`audits/tend-2026-09-20/`](audits/tend-2026-09-20/AUDIT-REPORT.md); its two
-> Critical findings are fixed, the remaining Highs are not. The hook has not been
-> professionally audited. Do not use with real funds. See [Security](#security).
+> [`audits/tend-2026-09-20/`](audits/tend-2026-09-20/AUDIT-REPORT.md); both
+> Criticals, all five Highs and most Mediums are fixed. The fixes have **not**
+> been re-audited, and the hook has never been professionally audited. Do not use
+> with real funds. See [Security](#security).
 
 ## Why
 
@@ -47,7 +48,9 @@ process, wired by in-process channels. The only network surface is `lpa serve`
   spend cap, slippage floor, receipt timeout, optional private RPC.
 - **`AutopilotHook.sol`** — v4 hook that custodies liquidity and moves ranges
   via PoolManager flash accounting. Ownable2Step, ReentrancyGuard, pausable,
-  per-position tick envelope, rebalancer allowlist, cooldown.
+  per-position tick envelope, rebalancer allowlist with per-position scoping,
+  cooldown floor, protocol-enforced value floor, a truncated per-pool price
+  reference, an optional L2 sequencer check, and an optional pair allowlist.
 
 ## Layout
 

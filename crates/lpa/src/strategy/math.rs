@@ -48,9 +48,31 @@ pub struct Bands {
     pub upper: f64,
 }
 
+/// Fraction trimmed from each tail before averaging. A handful of extreme
+/// samples — the shape a partial poisoning attempt leaves — should not drag the
+/// centre of the band.
+const TRIM_FRACTION: f64 = 0.1;
+
+/// Mean of the middle of the distribution, discarding `TRIM_FRACTION` from each
+/// tail. Falls back to the plain mean when the window is too short to trim.
+pub fn trimmed_mean(xs: &[f64]) -> f64 {
+    let n = xs.len();
+    if n < 5 {
+        return mean(xs);
+    }
+    let mut sorted = xs.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let cut = ((n as f64) * TRIM_FRACTION).floor() as usize;
+    let slice = &sorted[cut..n - cut];
+    mean(slice)
+}
+
 pub fn bollinger(ticks: &[i32], k: f64) -> Bands {
     let xs: Vec<f64> = ticks.iter().map(|&t| t as f64).collect();
-    let sma = mean(&xs);
+    // Trimmed rather than arithmetic: the arithmetic mean is exactly what a few
+    // extreme samples move, and moving it is how an attacker steers both the
+    // rebalance trigger and the width of the range it targets.
+    let sma = trimmed_mean(&xs);
     let sigma = stddev(&xs);
     Bands {
         sigma,
@@ -103,6 +125,28 @@ mod tests {
     #[test]
     fn step_sigma_constant_walk_is_zero() {
         assert!(step_sigma(&[10, 20, 30, 40]) < 1e-9);
+    }
+
+    #[test]
+    fn trimmed_mean_ignores_tail_outliers() {
+        let mut xs: Vec<f64> = (0..20).map(|i| 100.0 + i as f64).collect();
+        let clean = trimmed_mean(&xs);
+        // Replace both tails with absurd values, as a poisoning attempt would.
+        xs[0] = -900_000.0;
+        xs[1] = -900_000.0;
+        xs[18] = 900_000.0;
+        xs[19] = 900_000.0;
+        let poisoned = trimmed_mean(&xs);
+        assert!(
+            (clean - poisoned).abs() < 5.0,
+            "clean {clean} poisoned {poisoned}"
+        );
+    }
+
+    #[test]
+    fn trimmed_mean_falls_back_on_short_windows() {
+        let xs = [1.0, 2.0, 3.0];
+        assert!((trimmed_mean(&xs) - mean(&xs)).abs() < 1e-12);
     }
 
     #[test]
