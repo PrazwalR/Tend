@@ -181,6 +181,21 @@ async fn main() -> anyhow::Result<()> {
             let cfg = ChainConfig::from_name(&chain)?;
             let tracker = Arc::new(Tracker::open(&db)?);
 
+            let eth_seed = file
+                .eth_price_usd
+                .or_else(|| {
+                    std::env::var("ETH_PRICE_USD")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                })
+                .unwrap_or(exec::DEFAULT_ETH_PRICE_USD);
+            let eth_price = chain::oracle::connect_eth_price(
+                cfg.http_url().ok(),
+                cfg.addrs.eth_usd_feed,
+                eth_seed,
+            )
+            .await;
+
             let intent_tx = if execute {
                 let hook_addr =
                     hook_addr.ok_or_else(|| anyhow::anyhow!("--execute requires --hook"))?;
@@ -201,14 +216,7 @@ async fn main() -> anyhow::Result<()> {
                                 .and_then(|v| v.parse().ok())
                         })
                         .unwrap_or(exec::DEFAULT_MAX_GAS_USD),
-                    eth_price_usd: file
-                        .eth_price_usd
-                        .or_else(|| {
-                            std::env::var("ETH_PRICE_USD")
-                                .ok()
-                                .and_then(|v| v.parse().ok())
-                        })
-                        .unwrap_or(exec::DEFAULT_ETH_PRICE_USD),
+                    eth_price: eth_price.clone(),
                     min_interval: std::time::Duration::from_secs(
                         std::env::var("LPA_AUTO_INTERVAL_SECS")
                             .ok()
@@ -230,7 +238,7 @@ async fn main() -> anyhow::Result<()> {
                 auto_execute = execute,
                 "starting watch"
             );
-            chain::subscriber::run_watch(cfg, tracker, hook_addr, intent_tx).await?;
+            chain::subscriber::run_watch(cfg, tracker, hook_addr, intent_tx, eth_price).await?;
         }
         Command::Register {
             chain,
@@ -310,6 +318,12 @@ async fn main() -> anyhow::Result<()> {
                 .ok()
                 .filter(|s| !s.trim().is_empty());
             let executor = exec::Executor::connect(&rpc, &pk, hook_addr, private).await?;
+            let eth_price = chain::oracle::connect_eth_price(
+                Some(rpc.clone()),
+                cfg.addrs.eth_usd_feed,
+                eth_price_usd,
+            )
+            .await;
             tracing::info!(signer = %executor.signer(), hook = %hook_addr, chain = cfg.name, "executor ready");
 
             if dry_run {
@@ -330,7 +344,7 @@ async fn main() -> anyhow::Result<()> {
                         new_upper,
                         slippage_bps,
                         max_gas_usd,
-                        eth_price_usd,
+                        &eth_price,
                     )
                     .await?;
                 println!(

@@ -16,7 +16,7 @@ use tracing::{debug, error, info, warn};
 use tokio::sync::mpsc;
 
 use crate::chain::config::ChainConfig;
-use crate::chain::oracle::{EthPrice, EthPriceOracle};
+use crate::chain::oracle::EthPrice;
 use crate::chain::reader::ChainReader;
 use crate::exec::RebalanceIntent;
 use crate::position::tracker::{PositionRow, Tracker};
@@ -115,28 +115,11 @@ pub async fn run_watch(
     tracker: Arc<Tracker>,
     hook: Option<Address>,
     intent_tx: Option<mpsc::Sender<RebalanceIntent>>,
+    eth_price: EthPrice,
 ) -> Result<()> {
     let engine = StrategyEngine::default();
     let gas_price = Arc::new(AtomicU64::new(INITIAL_GAS_PRICE_WEI));
 
-    // Gas is priced in ETH, so the spend cap is only as honest as the ETH
-    // price. Seed with the operator's figure, then let the on-chain feed
-    // correct it; a feed that never connects keeps the seed and says so.
-    let eth_price = EthPrice::new(
-        std::env::var("ETH_PRICE_USD")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(3000.0),
-    );
-    match cfg.http_url() {
-        Ok(url) => match EthPriceOracle::connect(&url, cfg.addrs.eth_usd_feed).await {
-            Ok(o) => eth_price.spawn_refresher(o),
-            Err(e) => {
-                warn!(error = %e, seed = eth_price.get(), "ETH/USD oracle unavailable; using seeded price")
-            }
-        },
-        Err(e) => warn!(error = %e, seed = eth_price.get(), "no HTTP RPC; using seeded ETH price"),
-    }
     let cost = LiveCostModel::new(gas_price.clone(), eth_price);
     let config = default_config();
 

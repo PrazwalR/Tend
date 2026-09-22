@@ -6,11 +6,17 @@
 **Method**: 8 parallel specialist agents against the [evm-audit-skills](https://github.com/austintgriffith/evm-audit-skills) checklists, followed by synthesis, deduplication, cross-agent conflict resolution, and independent re-verification of the most consequential claims.
 **Chains in scope**: Base (8453), Ethereum (1).
 
-> **Status: DO NOT DEPLOY.** Two Critical findings. The first makes the
-> contract's primary function — rebalancing an out-of-range position — a
-> value-extraction opportunity for any third party. The second means the
-> contract as deployed by its own script has **no owner**, so the pause switch
-> and rebalancer allowlist that every other mitigation depends on do not exist.
+> **Status: still pre-audit, but both Criticals and all five Highs are now
+> fixed** (commits `7593b42`, `779e19d`, and the price-guard commit that
+> follows). Remediation notes are in §10. The contract remains
+> professionally unaudited and a number of Mediums are open — do not use with
+> real funds.
+>
+> *As originally written:* Two Critical findings. The first makes the contract's
+> primary function — rebalancing an out-of-range position — a value-extraction
+> opportunity for any third party. The second means the contract as deployed by
+> its own script has **no owner**, so the pause switch and rebalancer allowlist
+> that every other mitigation depends on do not exist.
 
 ---
 
@@ -270,3 +276,47 @@ Every one of the project's 37 contract tests passes. They share assumptions that
 - **Every non-slippage test passes `minLiquidity = 0`** — the floor is never exercised as a real constraint.
 
 The pattern is consistent: the tests check that operations *complete*, not that they did the *right thing*. That is the same class of blind spot that let the earlier `ZeroLiquidity` bug ship until an end-to-end run caught it.
+
+
+---
+
+## 10. Remediation status
+
+Fixes were written against this report and each is covered by a regression test
+that was confirmed to fail against the unfixed contract.
+
+| ID | Status | Fix |
+|---|---|---|
+| CRIT-1 | **Fixed** | `_swapPriceLimit()` bounds the fill at the first target-range boundary in the direction of travel, instead of the tick extremes. Strict comparisons because v4 reverts `PriceLimitAlreadyExceeded` unless the limit is strictly past spot; returns 0 to skip the swap when no boundary lies beyond spot. Verified: without the fix the three new tests fail with price at `MAX_SQRT_PRICE-1` and ticks at ±887272. |
+| CRIT-2 | **Fixed** | Owner is an explicit constructor argument, not `msg.sender`. The deploy script asserts `owner()` is reachable afterwards. |
+| HIGH-1 | **Fixed** | `maxRebalanceLossBps` — owner-set, hard-capped at 500, enforced by the contract. The position is valued before and after the re-ratio swap **at the same pre-swap price**, so the swap cannot move the yardstick it is measured against, and the rebalancer cannot waive it. |
+| HIGH-2 | **Fixed** | No-op rebalances rejected; `minRebalanceInterval` floored at 60s in both the constructor and the setter, so the single-transaction drain is impossible. |
+| HIGH-3 | **Fixed** | `withdraw(positionId, recipient, asClaims)`. ERC-6909 claims are minted inside the PoolManager without calling the token, so a blacklist on one currency cannot strand the other. One-argument overload retained. |
+| HIGH-4 | **Fixed** | Per-pool truncated price reference maintained in `afterSwap`: advances toward spot at most once per block and by at most `maxTickMovePerBlock`. `rebalance()` refuses to act when spot deviates from it by more than `maxDeviationTicks`. Dragging the reference now costs sustained blocks rather than one flash-loaned transaction. |
+| C-3 | **Fixed** | `lastRebalanceAt` stamped at deposit; test suite warps to a realistic clock. |
+| G-8 / P-7 / T-6 (partial) | **Fixed** | The dead `sell0 == 0` disjunct removed while extracting `_straddleSwap`. |
+| O-5 + O-6 | **Fixed together** | `EthPrice` now carries an `updated_at` stamp and exposes `get_fresh()`, which returns `None` for a seed-only or stale price. The executor's spend cap consumes `get_fresh()` and **refuses to send** rather than falling back, so a dead feed gates spending off instead of pricing it against a constant. Fixing O-5 alone would have put the cap behind a silently-seeded value, which is why they moved together. Repeated refresh failures escalate from `warn` to `error`. |
+
+### Still open
+
+- **O-4** — no sequencer-uptime check on Base.
+- **C-5** — users still cannot scope or revoke which rebalancer may act on their
+  position. The value floor now bounds the damage per rebalance, and the
+  interval floor bounds the rate, so this is materially reduced but not closed.
+- **T-2 / T-3 / T-4** — no token allowlist; fee-on-transfer and rebasing pairs
+  are neither supported nor rejected.
+- **O-3** — the off-chain tick-history window is still count-based and unweighted.
+- The remaining Low and Info findings.
+
+### A note on what the fixes cost
+
+The price guard adds one `SSTORE` per pool per block to `afterSwap`, which every
+swapper in the pool pays. That is a real externality and it was weighed: the
+alternative is a rebalancer trading at a price nothing corroborates. The write is
+gated on `poolPositionCount > 0`, so pools with no autopilot positions are
+unaffected.
+
+The value floor and the price guard both **fail closed**. A genuinely fast market
+move will block a rebalance rather than execute it at a price the hook cannot
+corroborate. For an operation that moves real value on behalf of someone else,
+refusing to act is the correct default.

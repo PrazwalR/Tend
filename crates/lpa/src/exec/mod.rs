@@ -137,7 +137,7 @@ impl Executor {
         upper: i32,
         slippage_bps: u32,
         max_gas_usd: f64,
-        eth_price_usd: f64,
+        eth_price: &crate::chain::oracle::EthPrice,
     ) -> Result<ExecReport> {
         let sim = self.simulate(position_id, lower, upper).await?;
         if !sim.ok {
@@ -157,6 +157,11 @@ impl Executor {
             .estimate_gas()
             .await
             .context("gas estimation failed")?;
+        // Refuse rather than fall back: the cap is meaningless priced against a
+        // seed constant, and an unpriced transaction is not an emergency.
+        let eth_price_usd = eth_price
+            .get_fresh()
+            .ok_or_else(|| anyhow!("no fresh ETH/USD price; refusing to price the spend cap"))?;
         let gas_price = self.provider.get_gas_price().await?;
         let est = cost::rebalance_cost_usd(gas, gas_price, eth_price_usd);
         if !cost::within_spend_cap(est, max_gas_usd) {
@@ -200,7 +205,9 @@ pub struct RebalanceIntent {
 pub struct AutoExec {
     pub slippage_bps: u32,
     pub max_gas_usd: f64,
-    pub eth_price_usd: f64,
+    /// Live handle, not a snapshot: the spend cap is only as honest as the ETH
+    /// price it is denominated in.
+    pub eth_price: crate::chain::oracle::EthPrice,
     pub min_interval: Duration,
 }
 
@@ -238,7 +245,7 @@ pub async fn run_executor_loop(
                 intent.new_upper,
                 cfg.slippage_bps,
                 cfg.max_gas_usd,
-                cfg.eth_price_usd,
+                &cfg.eth_price,
             )
             .await
         {

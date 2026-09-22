@@ -123,11 +123,11 @@ Put the deployed address in `AUTOPILOT_HOOK_ADDRESS`.
   See [`audits/`](audits/) for the full picture before trusting a rebalancer key.
 - **serve** binds `127.0.0.1` by default and requires a bearer token
   (`LPA_API_TOKEN`) on every RPC when set.
-- The executor's spend cap uses a **live gas price** but a **configured ETH
-  price** (`ETH_PRICE_USD`, default 3000). The Chainlink feed — verified by
-  `description()` at connect and rejected when stale — currently reaches only
-  the strategy's EV estimate, not the spend cap. Set `ETH_PRICE_USD` to
-  something realistic until that is wired through (audit O-5).
+- The executor's spend cap uses a live gas price **and** the chain's Chainlink
+  ETH/USD feed, verified by `description()` at connect and rejected when stale.
+  The cap requires a *fresh* read and refuses to send a transaction without one,
+  so a dead feed gates spending off rather than pricing it against a stale
+  constant. `ETH_PRICE_USD` is only a seed for the strategy's estimate.
 - Pool volume (`LPA_VOLUME_USD_PER_BLOCK`) and token1's USD price
   (`LPA_TOKEN1_USD`) remain operator assumptions. Without the latter a position
   cannot be valued, and the EV gate runs fee-and-gas only rather than guessing

@@ -610,6 +610,91 @@ contract AutopilotHookTest is Test, Deployers {
         hook.withdraw(pid, attacker, false);
     }
 
+    // --- HIGH-4 regression: spot must be corroborated before a rebalance ---
+
+    /// A large single-transaction price move cannot drag the reference with it,
+    /// so the rebalance refuses to trade at a price the hook cannot corroborate.
+    function test_rebalance_reverts_when_spot_is_far_from_reference() public {
+        modifyLiquidityRouter.modifyLiquidity(
+            key, ModifyLiquidityParams({tickLower: -60000, tickUpper: 60000, liquidityDelta: 1e21, salt: 0}), ""
+        );
+        bytes32 pid = _deposit(-600, 600, 1e18);
+        _swap(); // seed the reference near the honest tick
+
+        // One transaction, a very large move: the reference may advance by at most
+        // maxTickMovePerBlock, so spot ends up far outside the tolerated band.
+        PoolSwapTest.TestSettings memory ts = PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false});
+        swapRouter.swap(
+            key,
+            SwapParams({zeroForOne: true, amountSpecified: -6e20, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1}),
+            ts,
+            ""
+        );
+
+        vm.warp(block.timestamp + COOLDOWN);
+        vm.prank(rebalancer);
+        vm.expectPartialRevert(AutopilotHook.PriceDeviation.selector);
+        hook.rebalance(pid, -3000, -1800, 0);
+    }
+
+    /// The reference only moves one capped step per block, so a manipulator has to
+    /// hold the price across many blocks rather than one transaction.
+    function test_price_reference_moves_at_most_one_step_per_block() public {
+        modifyLiquidityRouter.modifyLiquidity(
+            key, ModifyLiquidityParams({tickLower: -60000, tickUpper: 60000, liquidityDelta: 1e21, salt: 0}), ""
+        );
+        _deposit(-600, 600, 1e18);
+        _swap();
+        (int24 seeded,,) = hook.priceRef(id);
+
+        PoolSwapTest.TestSettings memory ts = PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false});
+        for (uint256 i = 0; i < 3; i++) {
+            vm.warp(block.timestamp + 12);
+            swapRouter.swap(
+                key,
+                SwapParams({zeroForOne: true, amountSpecified: -2e17, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1}),
+                ts,
+                ""
+            );
+        }
+
+        (int24 moved,,) = hook.priceRef(id);
+        int24 cap = hook.maxTickMovePerBlock();
+        assertGe(seeded - moved, int24(0), "reference should track downward");
+        assertLe(seeded - moved, cap * 3, "reference moved faster than the per-block cap");
+    }
+
+    /// Several swaps inside one block must advance the reference at most once.
+    function test_price_reference_updates_once_per_block() public {
+        _deposit(-600, 600, 1e18);
+        _swap();
+        (int24 first, uint32 at,) = hook.priceRef(id);
+
+        _swap();
+        _swap();
+        (int24 second, uint32 at2,) = hook.priceRef(id);
+
+        assertEq(at, at2, "same block must not re-stamp the reference");
+        assertEq(first, second, "same block must not move the reference");
+    }
+
+    function test_price_guard_is_owner_only_and_bounded() public {
+        vm.prank(attacker);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, attacker));
+        hook.setPriceGuard(100, 500);
+
+        int24 maxMove = hook.MAX_TICK_MOVE_PER_BLOCK();
+        vm.expectRevert(AutopilotHook.DeviationBoundTooHigh.selector);
+        hook.setPriceGuard(maxMove + 1, 500);
+
+        vm.expectRevert(AutopilotHook.DeviationBoundTooHigh.selector);
+        hook.setPriceGuard(0, 500);
+
+        hook.setPriceGuard(100, 500);
+        assertEq(hook.maxTickMovePerBlock(), int24(100));
+        assertEq(hook.maxDeviationTicks(), int24(500));
+    }
+
     function test_renounce_ownership_disabled() public {
         vm.expectRevert(AutopilotHook.RenounceDisabled.selector);
         hook.renounceOwnership();

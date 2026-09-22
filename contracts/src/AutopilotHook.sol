@@ -42,6 +42,12 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
         uint64 lastRebalanceAt;
     }
 
+    struct PriceRef {
+        int24 tick;
+        uint32 updatedAt;
+        bool seeded;
+    }
+
     enum Op {
         Deposit,
         Withdraw,
@@ -70,12 +76,23 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
     /// @dev Ceiling on the owner-set per-rebalance value tolerance.
     uint16 public constant MAX_LOSS_TOLERANCE_BPS = 500;
     uint16 public constant BPS = 10_000;
+    /// @dev Ceiling on how far the reference tick may be dragged in one block,
+    ///      and on the spot-vs-reference gap a rebalance will tolerate.
+    int24 public constant MAX_TICK_MOVE_PER_BLOCK = 500;
+    int24 public constant MAX_DEVIATION_TICKS = 2000;
 
     mapping(bytes32 => Position) public positions;
     mapping(bytes32 => int24) public boundLower;
     mapping(bytes32 => int24) public boundUpper;
     mapping(PoolId => uint256) public poolPositionCount;
     mapping(address => bool) public isRebalancer;
+    /// @dev Manipulation-resistant price reference, one per pool. v4 ships no
+    ///      oracle, so the hook keeps its own: the tick follows spot but may only
+    ///      move `maxTickMovePerBlock` per block, which makes dragging it cost
+    ///      sustained blocks rather than one flash-loaned transaction.
+    mapping(PoolId => PriceRef) public priceRef;
+    int24 public maxTickMovePerBlock;
+    int24 public maxDeviationTicks;
     uint64 public minRebalanceInterval;
     /// @dev Share of a position's value a single rebalance may consume, in bps.
     ///      Protocol-enforced: unlike `minLiquidity` this is not chosen by the
@@ -107,6 +124,7 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
     event RebalancerSet(address indexed rebalancer, bool allowed);
     event MinRebalanceIntervalSet(uint64 interval);
     event MaxRebalanceLossBpsSet(uint16 bps);
+    event PriceGuardSet(int24 maxTickMovePerBlock, int24 maxDeviationTicks);
 
     error NotPositionOwner();
     error NotRebalancer();
@@ -127,6 +145,8 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
     error LossToleranceTooHigh();
     error ValueLossExceeded(uint256 valueAfter, uint256 valueBefore);
     error ZeroRecipient();
+    error PriceDeviation(int24 spotTick, int24 referenceTick);
+    error DeviationBoundTooHigh();
 
     /// @dev `initialOwner` is explicit rather than `msg.sender`: the hook must be
     ///      deployed through the CREATE2 factory for its address to carry the
@@ -147,6 +167,10 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
 
         maxRebalanceLossBps = 100; // 1%
         emit MaxRebalanceLossBpsSet(100);
+
+        maxTickMovePerBlock = MAX_TICK_MOVE_PER_BLOCK;
+        maxDeviationTicks = MAX_DEVIATION_TICKS;
+        emit PriceGuardSet(MAX_TICK_MOVE_PER_BLOCK, MAX_DEVIATION_TICKS);
     }
 
     function getHookPermissions() public pure override returns (Hooks.Permissions memory p) {
@@ -162,6 +186,7 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
         uint256 count = poolPositionCount[id];
         if (count > 0) {
             (, int24 tick,,) = poolManager.getSlot0(id);
+            _updatePriceRef(id, tick);
             emit AutopilotCheck(id, tick, count);
         }
         return (BaseHook.afterSwap.selector, int128(0));
@@ -289,6 +314,7 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
         if (newTickLower == pos.tickLower && newTickUpper == pos.tickUpper) revert NoOpRebalance();
 
         PoolKey memory key = pos.key;
+        _requirePriceNotManipulated(key.toId());
         _validateTicks(key, newTickLower, newTickUpper);
         if (newTickLower < boundLower[positionId] || newTickUpper > boundUpper[positionId]) revert OutOfBounds();
 
@@ -558,6 +584,37 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
         return base > sub ? base - sub : 0;
     }
 
+    /// @dev Advances the pool's reference tick toward spot, at most once per block
+    ///      and by at most `maxTickMovePerBlock`. Clamping is the whole point: an
+    ///      attacker who moves spot arbitrarily far in one transaction moves the
+    ///      reference by one capped step, so the deviation guard still fires.
+    function _updatePriceRef(PoolId id, int24 tick) internal {
+        PriceRef memory ref = priceRef[id];
+        if (!ref.seeded) {
+            priceRef[id] = PriceRef({tick: tick, updatedAt: uint32(block.timestamp), seeded: true});
+            return;
+        }
+        if (uint32(block.timestamp) == ref.updatedAt) return;
+
+        int24 cap = maxTickMovePerBlock;
+        int24 next = tick;
+        if (next > ref.tick + cap) next = ref.tick + cap;
+        else if (next < ref.tick - cap) next = ref.tick - cap;
+
+        priceRef[id] = PriceRef({tick: next, updatedAt: uint32(block.timestamp), seeded: true});
+    }
+
+    /// @dev Refuses to act while spot is far from the reference. A rebalance moves
+    ///      real value at whatever price it finds, so a price the hook cannot
+    ///      corroborate is a reason to wait, not to trade.
+    function _requirePriceNotManipulated(PoolId id) internal view {
+        PriceRef memory ref = priceRef[id];
+        if (!ref.seeded) return; // no history yet; nothing to compare against
+        (, int24 spotTick,,) = poolManager.getSlot0(id);
+        int24 diff = spotTick > ref.tick ? spotTick - ref.tick : ref.tick - spotTick;
+        if (diff > maxDeviationTicks) revert PriceDeviation(spotTick, ref.tick);
+    }
+
     function _validateTicks(PoolKey memory key, int24 tickLower, int24 tickUpper) internal pure {
         int24 spacing = key.tickSpacing;
         if (spacing <= 0) revert InvalidTickRange();
@@ -577,6 +634,16 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
         if (bps > MAX_LOSS_TOLERANCE_BPS) revert LossToleranceTooHigh();
         maxRebalanceLossBps = bps;
         emit MaxRebalanceLossBpsSet(bps);
+    }
+
+    function setPriceGuard(int24 movePerBlock, int24 deviation) external onlyOwner {
+        if (movePerBlock <= 0 || deviation <= 0) revert DeviationBoundTooHigh();
+        if (movePerBlock > MAX_TICK_MOVE_PER_BLOCK || deviation > MAX_DEVIATION_TICKS) {
+            revert DeviationBoundTooHigh();
+        }
+        maxTickMovePerBlock = movePerBlock;
+        maxDeviationTicks = deviation;
+        emit PriceGuardSet(movePerBlock, deviation);
     }
 
     function setMinRebalanceInterval(uint64 interval) external onlyOwner {
