@@ -23,6 +23,9 @@ import {LiquidityAmounts} from "@uniswap/v4-periphery/src/libraries/LiquidityAmo
 
 import {IAggregatorV3} from "./interfaces/IAggregatorV3.sol";
 
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
@@ -33,6 +36,7 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
     using PoolIdLibrary for PoolKey;
     using CurrencySettler for Currency;
     using BalanceDeltaLibrary for BalanceDelta;
+    using SafeERC20 for IERC20;
 
     struct Position {
         address owner;
@@ -46,7 +50,7 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
 
     struct PriceRef {
         int24 tick;
-        uint32 updatedAt;
+        uint40 updatedAt;
         bool seeded;
     }
 
@@ -77,6 +81,7 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
     uint64 public constant MIN_REBALANCE_INTERVAL = 60;
     /// @dev Ceiling on the owner-set per-rebalance value tolerance.
     uint16 public constant MAX_LOSS_TOLERANCE_BPS = 500;
+    uint16 public constant MIN_LOSS_TOLERANCE_BPS = 25;
     uint16 public constant BPS = 10_000;
     /// @dev Sentinel for `positionRebalancer`: automation disabled for a position.
     address public constant AUTOMATION_OFF = address(1);
@@ -84,11 +89,19 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
     ///      and on the spot-vs-reference gap a rebalance will tolerate.
     int24 public constant MAX_TICK_MOVE_PER_BLOCK = 500;
     int24 public constant MAX_DEVIATION_TICKS = 2000;
+    /// @dev Ceiling on how far the re-ratio swap may move sqrtPrice from spot.
+    uint16 public constant MAX_SWAP_IMPACT_BPS = 2000;
     /// @dev Time an L2 must have been back up before rebalancing resumes. On
     ///      resumption the backlog lands at once and spot gaps to fair value in
     ///      the first blocks, which is exactly when a queued rebalance executes
     ///      against a price its simulation never saw.
     uint256 public constant SEQUENCER_GRACE_PERIOD = 3600;
+    /// @dev Gas ceiling for the uptime-feed staticcall, so a hostile feed cannot
+    ///      consume the whole block.
+    uint256 public constant SEQUENCER_CALL_GAS = 100_000;
+    /// @dev A price reference older than this carries no information and must not
+    ///      be allowed to veto a rebalance.
+    uint256 public constant PRICE_REF_STALE_AFTER = 1 hours;
 
     mapping(bytes32 => Position) public positions;
     /// @dev Optional per-position scope on top of the global allowlist. Zero means
@@ -117,6 +130,12 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
     address public sequencerUptimeFeed;
     int24 public maxTickMovePerBlock;
     int24 public maxDeviationTicks;
+    /// @dev Bounds the re-ratio swap's price impact directly, in bps of
+    ///      sqrtPrice. Without it the only backstop is the after-the-fact value
+    ///      guard, whose input — pool depth at execution time — any LP in the
+    ///      pool controls, making a revert cheap to force and the position
+    ///      un-rebalanceable.
+    uint16 public maxSwapImpactBps;
     uint64 public minRebalanceInterval;
     /// @dev Share of a position's value a single rebalance may consume, in bps.
     ///      Protocol-enforced: unlike `minLiquidity` this is not chosen by the
@@ -149,6 +168,12 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
     event MinRebalanceIntervalSet(uint64 interval);
     event MaxRebalanceLossBpsSet(uint16 bps);
     event PriceGuardSet(int24 maxTickMovePerBlock, int24 maxDeviationTicks);
+    event MaxSwapImpactBpsSet(uint16 bps);
+    /// @dev Freed value the re-ratio swap could not deploy, returned to the owner
+    ///      as loose tokens. A bounded swap makes a partial fill the normal
+    ///      outcome in a thin pool, and silence about it is how half a position
+    ///      ends up sitting outside the position.
+    event RebalanceResidual(bytes32 indexed positionId, uint256 amount0, uint256 amount1);
     event SequencerUptimeFeedSet(address feed);
     event PairAllowed(Currency indexed currency0, Currency indexed currency1, bool allowed);
     event AllowlistEnforcedSet(bool enforced);
@@ -180,6 +205,8 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
     error PairNotAllowed();
     error AutomationDisabled();
     error FeeOnTransferNotSupported(Currency currency, uint256 expected, uint256 received);
+    error FeedHasNoCode();
+    error SwapImpactTooHigh();
 
     /// @dev `initialOwner` is explicit rather than `msg.sender`: the hook must be
     ///      deployed through the CREATE2 factory for its address to carry the
@@ -201,6 +228,7 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
         maxRebalanceLossBps = 100; // 1%
         emit MaxRebalanceLossBpsSet(100);
 
+        maxSwapImpactBps = 1000; // 10% of sqrtPrice
         maxTickMovePerBlock = MAX_TICK_MOVE_PER_BLOCK;
         maxDeviationTicks = MAX_DEVIATION_TICKS;
         emit PriceGuardSet(MAX_TICK_MOVE_PER_BLOCK, MAX_DEVIATION_TICKS);
@@ -225,6 +253,9 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
         return (BaseHook.afterSwap.selector, int128(0));
     }
 
+    /// @notice Open a position, leaving automation open to any allowlisted
+    ///         rebalancer. Scoping it afterwards takes a second transaction; use
+    ///         the overload below to express the choice atomically instead.
     function deposit(
         PoolKey calldata key,
         int24 tickLower,
@@ -232,7 +263,36 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
         uint128 liquidity,
         int24 minBound,
         int24 maxBound
-    ) external whenNotPaused nonReentrant returns (bytes32 positionId) {
+    ) external returns (bytes32) {
+        return _deposit(key, tickLower, tickUpper, liquidity, minBound, maxBound, address(0));
+    }
+
+    /// @param rebalancer Scope for this position: `address(0)` accepts any
+    ///        allowlisted rebalancer, `AUTOMATION_OFF` accepts none, any other
+    ///        address accepts only that one. Setting it here rather than in a
+    ///        follow-up call means a rebalancer added to the global allowlist
+    ///        later never gains authority the owner did not choose.
+    function deposit(
+        PoolKey calldata key,
+        int24 tickLower,
+        int24 tickUpper,
+        uint128 liquidity,
+        int24 minBound,
+        int24 maxBound,
+        address rebalancer
+    ) external returns (bytes32) {
+        return _deposit(key, tickLower, tickUpper, liquidity, minBound, maxBound, rebalancer);
+    }
+
+    function _deposit(
+        PoolKey calldata key,
+        int24 tickLower,
+        int24 tickUpper,
+        uint128 liquidity,
+        int24 minBound,
+        int24 maxBound,
+        address rebalancer
+    ) internal whenNotPaused nonReentrant returns (bytes32 positionId) {
         if (liquidity == 0) revert ZeroLiquidity();
         if (address(key.hooks) != address(this)) revert HookMismatch();
         if (Currency.unwrap(key.currency0) == address(0)) revert NativeNotSupported();
@@ -249,6 +309,10 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
         positionId = keccak256(abi.encode(msg.sender, id, depositNonce++));
         boundLower[positionId] = minBound;
         boundUpper[positionId] = maxBound;
+        if (rebalancer != address(0)) {
+            positionRebalancer[positionId] = rebalancer;
+            emit PositionRebalancerSet(positionId, rebalancer);
+        }
 
         poolManager.unlock(
             abi.encode(
@@ -427,10 +491,14 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
     ///      later as an opaque `CurrencyNotSettled` from inside `unlock` — true,
     ///      but useless to whoever is trying to work out why their deposit failed.
     function _settleExact(Currency currency, address payer, uint256 amount) private {
-        uint256 balanceBefore = currency.balanceOf(address(poolManager));
-        currency.settle(poolManager, payer, amount, false);
-        uint256 received = currency.balanceOf(address(poolManager)) - balanceBefore;
-        if (received < amount) revert FeeOnTransferNotSupported(currency, amount, received);
+        // The credited figure comes from `settle()` itself rather than a
+        // before/after balanceOf diff: the PoolManager's global balance can move
+        // for reasons unrelated to this payer, and a decrease would underflow into
+        // a bare Panic(0x11) — worse diagnostics than the error it replaces.
+        poolManager.sync(currency);
+        IERC20(Currency.unwrap(currency)).safeTransferFrom(payer, address(poolManager), amount);
+        uint256 paid = poolManager.settle();
+        if (paid < amount) revert FeeOnTransferNotSupported(currency, amount, paid);
     }
 
     function _doWithdraw(Callback memory cb) internal {
@@ -514,6 +582,13 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
         // Whatever the ratio maths left over is dust; it goes back to the owner
         // rather than accumulating in the hook.
         BalanceDelta net = removed + swapped + added;
+        if (net.amount0() > 0 || net.amount1() > 0) {
+            emit RebalanceResidual(
+                cb.positionId,
+                net.amount0() > 0 ? uint256(uint128(net.amount0())) : 0,
+                net.amount1() > 0 ? uint256(uint128(net.amount1())) : 0
+            );
+        }
         if (net.amount0() > 0) {
             cb.key.currency0.take(poolManager, cb.owner, uint256(uint128(net.amount0())), false);
         }
@@ -537,11 +612,15 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
         bool zeroForOne;
         uint256 amountIn;
 
-        if (sqrtPriceX96 <= sqrtA) {
+        // Strict: at spot == sqrtA or spot == sqrtB the one-sided branches would
+        // dump a whole side and then aim the price limit at the *far* boundary,
+        // traversing the entire range and landing on newLiquidity == 0. The
+        // straddle branch handles equality correctly.
+        if (sqrtPriceX96 < sqrtA) {
             // Range sits entirely above spot: it is funded with token0 only.
             if (have1 == 0) return BalanceDeltaLibrary.ZERO_DELTA;
             (zeroForOne, amountIn) = (false, have1);
-        } else if (sqrtPriceX96 >= sqrtB) {
+        } else if (sqrtPriceX96 > sqrtB) {
             // Range sits entirely below spot: token1 only.
             if (have0 == 0) return BalanceDeltaLibrary.ZERO_DELTA;
             (zeroForOne, amountIn) = (true, have0);
@@ -600,21 +679,42 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
     ///      the correct side of spot, hence the strict comparisons.
     function _swapPriceLimit(uint160 spot, uint160 sqrtA, uint160 sqrtB, bool zeroForOne)
         internal
-        pure
+        view
         returns (uint160)
     {
         uint160 edge = zeroForOne
             ? (sqrtB < spot ? sqrtB : sqrtA)  // highest boundary below spot
             : (sqrtA > spot ? sqrtA : sqrtB); // lowest boundary above spot
-        if (zeroForOne) return edge < spot ? edge : 0;
-        return edge > spot ? edge : 0;
+
+        // v4 rejects a limit sitting exactly on MIN/MAX_SQRT_PRICE, and
+        // `_validateTicks` permits min/maxUsableTick — which equal MIN/MAX_TICK
+        // for tick spacings 1, 2, 4 and 8. Nudge inside the open interval rather
+        // than reverting a rebalance that worked before this limit existed.
+        // Take whichever bound is tighter: the range boundary, or a fixed
+        // deviation from spot. The range boundary alone is not a bound on impact
+        // — in a pool thin enough, reaching it IS a large move — and an LP can
+        // make the pool that thin for one block at no cost.
+        uint256 bps = maxSwapImpactBps;
+        if (zeroForOne) {
+            uint160 impact = uint160((uint256(spot) * (BPS - bps)) / BPS);
+            uint160 limit = edge > impact ? edge : impact;
+            if (limit >= spot) return 0;
+            return limit <= TickMath.MIN_SQRT_PRICE ? TickMath.MIN_SQRT_PRICE + 1 : limit;
+        }
+        uint160 impactUp = uint160((uint256(spot) * (BPS + bps)) / BPS);
+        uint160 limitUp = edge < impactUp ? edge : impactUp;
+        if (limitUp <= spot) return 0;
+        return limitUp >= TickMath.MAX_SQRT_PRICE ? TickMath.MAX_SQRT_PRICE - 1 : limitUp;
     }
 
     /// @dev Reverts when a rebalance consumed more of the position's value than
     ///      the owner-set tolerance allows. Both figures must be measured at the
     ///      same price for the comparison to mean anything.
     function _guardValueLoss(uint256 valueBefore, uint256 valueAfter) private view {
-        if (valueAfter * BPS < valueBefore * (BPS - maxRebalanceLossBps)) {
+        // mulDiv rather than two multiplications: `valueBefore` scales with the
+        // square of sqrtPriceX96, so `valueBefore * BPS` can overflow at extreme
+        // prices and revert a rebalance the guard was meant to merely measure.
+        if (valueAfter < FullMath.mulDiv(valueBefore, BPS - maxRebalanceLossBps, BPS)) {
             revert ValueLossExceeded(valueAfter, valueBefore);
         }
     }
@@ -642,25 +742,39 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
     function _updatePriceRef(PoolId id, int24 tick) internal {
         PriceRef memory ref = priceRef[id];
         if (!ref.seeded) {
-            priceRef[id] = PriceRef({tick: tick, updatedAt: uint32(block.timestamp), seeded: true});
+            priceRef[id] = PriceRef({tick: tick, updatedAt: uint40(block.timestamp), seeded: true});
             return;
         }
-        if (uint32(block.timestamp) == ref.updatedAt) return;
+        if (uint40(block.timestamp) == ref.updatedAt) return;
 
         int24 cap = maxTickMovePerBlock;
         int24 next = tick;
         if (next > ref.tick + cap) next = ref.tick + cap;
         else if (next < ref.tick - cap) next = ref.tick - cap;
 
-        priceRef[id] = PriceRef({tick: next, updatedAt: uint32(block.timestamp), seeded: true});
+        priceRef[id] = PriceRef({tick: next, updatedAt: uint40(block.timestamp), seeded: true});
     }
 
     /// @dev On an L2, refuses to act while the sequencer is down or has only just
     ///      come back. A zero feed disables the check for L1 deployments.
+    /// @dev The feed address is owner-set, so this call is only as well-behaved
+    ///      as whatever is deployed there. A bare high-level call would let a
+    ///      reverting, retired or returndata-bombing feed halt every rebalance —
+    ///      a measured 4.1M gas for a 1MB response. Bound the gas, bound the
+    ///      returndata, and treat any malformed answer as "check unavailable"
+    ///      rather than propagating it.
     function _requireSequencerUp() internal view {
         address feed = sequencerUptimeFeed;
         if (feed == address(0)) return;
-        (, int256 answer, uint256 startedAt,,) = IAggregatorV3(feed).latestRoundData();
+
+        (bool ok, bytes memory data) =
+            feed.staticcall{gas: SEQUENCER_CALL_GAS}(abi.encodeWithSelector(IAggregatorV3.latestRoundData.selector));
+        // A feed that cannot answer tells us nothing about the sequencer. Failing
+        // open here is deliberate: the alternative hands whoever controls that
+        // address a protocol-wide kill switch.
+        if (!ok || data.length != 160) return;
+
+        (, int256 answer, uint256 startedAt,,) = abi.decode(data, (uint80, int256, uint256, uint256, uint80));
         // 0 == up, 1 == down. startedAt == 0 means the round has not started.
         if (answer != 0 || startedAt == 0) revert SequencerDown();
         uint256 readyAt = startedAt + SEQUENCER_GRACE_PERIOD;
@@ -711,8 +825,17 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
         emit RebalancerSet(rebalancer, allowed);
     }
 
+    function setMaxSwapImpactBps(uint16 bps) external onlyOwner {
+        if (bps == 0 || bps > MAX_SWAP_IMPACT_BPS) revert SwapImpactTooHigh();
+        maxSwapImpactBps = bps;
+        emit MaxSwapImpactBpsSet(bps);
+    }
+
     function setMaxRebalanceLossBps(uint16 bps) external onlyOwner {
-        if (bps > MAX_LOSS_TOLERANCE_BPS) revert LossToleranceTooHigh();
+        // Floored as well as capped: a tolerance below the pool fee makes every
+        // rebalance revert, which is a protocol-wide off-switch wearing the
+        // costume of a safety parameter.
+        if (bps < MIN_LOSS_TOLERANCE_BPS || bps > MAX_LOSS_TOLERANCE_BPS) revert LossToleranceTooHigh();
         maxRebalanceLossBps = bps;
         emit MaxRebalanceLossBpsSet(bps);
     }
@@ -727,11 +850,18 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
         emit AllowlistEnforcedSet(enforced);
     }
 
+    /// @dev Order-independent. v4 guarantees `currency0 < currency1` at the
+    ///      deposit lookup, but the setter accepts either order, and hashing them
+    ///      as given would write a key nothing ever reads while still emitting a
+    ///      success event — a mitigation that looks deployed and is not.
     function _pairKey(Currency currency0, Currency currency1) private pure returns (bytes32) {
-        return keccak256(abi.encode(currency0, currency1));
+        (Currency a, Currency b) =
+            Currency.unwrap(currency0) < Currency.unwrap(currency1) ? (currency0, currency1) : (currency1, currency0);
+        return keccak256(abi.encode(a, b));
     }
 
     function setSequencerUptimeFeed(address feed) external onlyOwner {
+        if (feed != address(0) && feed.code.length == 0) revert FeedHasNoCode();
         sequencerUptimeFeed = feed;
         emit SequencerUptimeFeedSet(feed);
     }

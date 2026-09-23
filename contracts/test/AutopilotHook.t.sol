@@ -496,18 +496,44 @@ contract AutopilotHookTest is Test, Deployers {
 
     /// The rebalancer supplies `minLiquidity`, so it cannot be the real bound.
     /// A zero owner tolerance must stop a rebalance the rebalancer would allow.
+    /// The rebalancer supplies `minLiquidity`, so it cannot be the real bound.
+    /// A 1% fee tier makes the re-ratio swap cost more than the tightest
+    /// permitted tolerance, and the protocol-side guard must reject it even
+    /// though the rebalancer waived its own.
     function test_value_floor_binds_even_when_rebalancer_waives_slippage() public {
+        PoolKey memory fat = PoolKey(currency0, currency1, 10000, 200, IHooks(hook));
+        manager.initialize(fat, SQRT_PRICE_1_1);
         modifyLiquidityRouter.modifyLiquidity(
-            key, ModifyLiquidityParams({tickLower: -60000, tickUpper: 60000, liquidityDelta: 1e21, salt: 0}), ""
+            fat, ModifyLiquidityParams({tickLower: -60000, tickUpper: 60000, liquidityDelta: 1e21, salt: 0}), ""
         );
-        bytes32 pid = _deposit(-600, 600, 1e18);
-        hook.setMaxRebalanceLossBps(0); // tolerate no value loss at all
+
+        bytes32 pid = hook.deposit(fat, -600, 600, 1e18, TickMath.minUsableTick(200), TickMath.maxUsableTick(200));
+        hook.setMaxRebalanceLossBps(hook.MIN_LOSS_TOLERANCE_BPS()); // 25 bps, tightest permitted
         vm.warp(block.timestamp + COOLDOWN);
 
-        // minLiquidity = 0 waives the rebalancer-side guard entirely.
+        // minLiquidity = 0 waives the rebalancer-side guard entirely; the
+        // protocol-side floor must still bind.
         vm.prank(rebalancer);
         vm.expectPartialRevert(AutopilotHook.ValueLossExceeded.selector);
         hook.rebalance(pid, 600, 1200, 0);
+    }
+
+    /// The same move under a tolerance that accommodates the fee must succeed —
+    /// otherwise the test above would pass for the wrong reason.
+    function test_value_floor_permits_the_same_move_at_a_realistic_tolerance() public {
+        PoolKey memory fat = PoolKey(currency0, currency1, 10000, 200, IHooks(hook));
+        manager.initialize(fat, SQRT_PRICE_1_1);
+        modifyLiquidityRouter.modifyLiquidity(
+            fat, ModifyLiquidityParams({tickLower: -60000, tickUpper: 60000, liquidityDelta: 1e21, salt: 0}), ""
+        );
+
+        bytes32 pid = hook.deposit(fat, -600, 600, 1e18, TickMath.minUsableTick(200), TickMath.maxUsableTick(200));
+        hook.setMaxRebalanceLossBps(hook.MAX_LOSS_TOLERANCE_BPS());
+        vm.warp(block.timestamp + COOLDOWN);
+
+        vm.prank(rebalancer);
+        uint128 newLiq = hook.rebalance(pid, 600, 1200, 0);
+        assertGt(newLiq, 0);
     }
 
     function test_value_floor_allows_a_normal_rebalance() public {
@@ -519,6 +545,83 @@ contract AutopilotHookTest is Test, Deployers {
         vm.prank(rebalancer);
         uint128 newLiq = hook.rebalance(pid, -1200, 1200, 0);
         assertGt(newLiq, 0);
+    }
+
+    /// A tolerance below the pool fee makes every rebalance revert — an
+    /// off-switch wearing the costume of a safety parameter.
+    /// Re-audit R-1: an LP holding most of a pool's depth could pull it for one
+    /// block, which made the re-ratio swap's price impact exceed the value
+    /// tolerance and reverted the rebalance — pinning the position out of range
+    /// at no cost to the griefer. Bounding the swap's impact up front means a
+    /// thin pool yields a smaller partial fill instead of a revert.
+    function test_liquidity_pull_does_not_brick_an_out_of_range_rebalance() public {
+        // Griefer supplies the bulk of the pool's depth.
+        modifyLiquidityRouter.modifyLiquidity(
+            key, ModifyLiquidityParams({tickLower: -60000, tickUpper: 60000, liquidityDelta: 1e18, salt: 0}), ""
+        );
+        modifyLiquidityRouter.modifyLiquidity(
+            key,
+            ModifyLiquidityParams({
+                tickLower: -60000, tickUpper: 60000, liquidityDelta: 4e18, salt: bytes32(uint256(1))
+            }),
+            ""
+        );
+
+        bytes32 pid = _deposit(-600, 600, 1e18);
+
+        // Push the position out of range, downward.
+        PoolSwapTest.TestSettings memory ts = PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false});
+        swapRouter.swap(
+            key,
+            SwapParams({zeroForOne: true, amountSpecified: -3e17, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1}),
+            ts,
+            ""
+        );
+        (, int24 drifted,,) = manager.getSlot0(id);
+        assertLt(drifted, int24(-600), "position should be out of range");
+
+        vm.warp(block.timestamp + COOLDOWN);
+
+        // The grief: withdraw the dominant depth in the same block as the rebalance.
+        modifyLiquidityRouter.modifyLiquidity(
+            key,
+            ModifyLiquidityParams({
+                tickLower: -60000, tickUpper: 60000, liquidityDelta: -4e18, salt: bytes32(uint256(1))
+            }),
+            ""
+        );
+
+        vm.prank(rebalancer);
+        uint128 newLiq = hook.rebalance(pid, -2400, -1200, 0);
+        assertGt(newLiq, 0, "pulling pool depth must not make a position un-rebalanceable");
+    }
+
+    function test_swap_impact_bound_is_owner_only_and_bounded() public {
+        vm.prank(attacker);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, attacker));
+        hook.setMaxSwapImpactBps(100);
+
+        uint16 cap = hook.MAX_SWAP_IMPACT_BPS();
+        vm.expectRevert(AutopilotHook.SwapImpactTooHigh.selector);
+        hook.setMaxSwapImpactBps(cap + 1);
+
+        vm.expectRevert(AutopilotHook.SwapImpactTooHigh.selector);
+        hook.setMaxSwapImpactBps(0);
+
+        hook.setMaxSwapImpactBps(250);
+        assertEq(hook.maxSwapImpactBps(), 250);
+    }
+
+    function test_loss_tolerance_has_a_floor() public {
+        uint16 floorBps = hook.MIN_LOSS_TOLERANCE_BPS();
+        vm.expectRevert(AutopilotHook.LossToleranceTooHigh.selector);
+        hook.setMaxRebalanceLossBps(0);
+
+        vm.expectRevert(AutopilotHook.LossToleranceTooHigh.selector);
+        hook.setMaxRebalanceLossBps(floorBps - 1);
+
+        hook.setMaxRebalanceLossBps(floorBps);
+        assertEq(hook.maxRebalanceLossBps(), floorBps);
     }
 
     function test_loss_tolerance_is_owner_only_and_capped() public {
@@ -670,11 +773,11 @@ contract AutopilotHookTest is Test, Deployers {
     function test_price_reference_updates_once_per_block() public {
         _deposit(-600, 600, 1e18);
         _swap();
-        (int24 first, uint32 at,) = hook.priceRef(id);
+        (int24 first, uint40 at,) = hook.priceRef(id);
 
         _swap();
         _swap();
-        (int24 second, uint32 at2,) = hook.priceRef(id);
+        (int24 second, uint40 at2,) = hook.priceRef(id);
 
         assertEq(at, at2, "same block must not re-stamp the reference");
         assertEq(first, second, "same block must not move the reference");
@@ -901,6 +1004,66 @@ contract AutopilotHookTest is Test, Deployers {
                 "unexpected revert - possible settlement shortfall"
             );
         }
+    }
+
+    // --- Re-audit M-1 regression: the price limit must stay inside v4's bounds ---
+
+    /// tickSpacing 1/2/4/8 make min/maxUsableTick equal MIN/MAX_TICK, whose sqrt
+    /// prices are exactly the closed bounds v4 rejects. The limit introduced to
+    /// fix CRIT-1 landed on them and reverted a rebalance that worked before it.
+    function test_rebalance_to_full_range_on_spacing_one() public {
+        PoolKey memory k1 = PoolKey(currency0, currency1, 100, 1, IHooks(hook));
+        manager.initialize(k1, SQRT_PRICE_1_1);
+
+        modifyLiquidityRouter.modifyLiquidity(
+            k1, ModifyLiquidityParams({tickLower: -60000, tickUpper: 60000, liquidityDelta: 1e21, salt: 0}), ""
+        );
+        int24 lo = TickMath.minUsableTick(1);
+        int24 hi = TickMath.maxUsableTick(1);
+
+        bytes32 pid = hook.deposit(k1, 100, 200, 1e18, lo, hi);
+        vm.warp(block.timestamp + COOLDOWN);
+
+        vm.prank(rebalancer);
+        uint128 newLiq = hook.rebalance(pid, lo, hi, 0);
+        assertGt(newLiq, 0, "full-range rebalance must not revert on the price bound");
+    }
+
+    // --- Re-audit A-2: consent must be expressible atomically at deposit ---
+
+    /// Scoping via a follow-up transaction leaves a window in which a rebalancer
+    /// added later has authority the owner never chose. The overload closes it.
+    function test_deposit_can_scope_rebalancer_atomically() public {
+        bytes32 pid =
+            hook.deposit(key, -600, 600, 1e18, TickMath.minUsableTick(60), TickMath.maxUsableTick(60), rebalancer);
+        assertEq(hook.positionRebalancer(pid), rebalancer);
+
+        hook.setRebalancer(attacker, true); // added AFTER the position existed
+        vm.warp(block.timestamp + COOLDOWN);
+
+        vm.prank(attacker);
+        vm.expectRevert(AutopilotHook.NotRebalancer.selector);
+        hook.rebalance(pid, -1200, 1200, 0);
+    }
+
+    function test_deposit_can_disable_automation_atomically() public {
+        bytes32 pid = hook.deposit(
+            key, -600, 600, 1e18, TickMath.minUsableTick(60), TickMath.maxUsableTick(60), hook.AUTOMATION_OFF()
+        );
+        vm.warp(block.timestamp + COOLDOWN);
+        vm.prank(rebalancer);
+        vm.expectRevert(AutopilotHook.AutomationDisabled.selector);
+        hook.rebalance(pid, -1200, 1200, 0);
+        hook.withdraw(pid); // still exitable
+    }
+
+    /// The six-argument form must keep its previous meaning.
+    function test_deposit_without_scope_accepts_any_allowlisted_rebalancer() public {
+        bytes32 pid = _deposit(-600, 600, 1e18);
+        assertEq(hook.positionRebalancer(pid), address(0));
+        vm.warp(block.timestamp + COOLDOWN);
+        vm.prank(rebalancer);
+        hook.rebalance(pid, -1200, 1200, 0);
     }
 
     function test_renounce_ownership_disabled() public {
