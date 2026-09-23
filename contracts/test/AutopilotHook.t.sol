@@ -20,6 +20,7 @@ import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {BaseHook} from "uniswap-hooks/src/base/BaseHook.sol";
 import {AutopilotHook} from "../src/AutopilotHook.sol";
 import {MockSequencerFeed} from "./mocks/MockSequencerFeed.sol";
+import {FeeOnTransferERC20} from "./mocks/FeeOnTransferERC20.sol";
 
 contract AutopilotHookTest is Test, Deployers {
     using StateLibrary for IPoolManager;
@@ -835,6 +836,71 @@ contract AutopilotHookTest is Test, Deployers {
         vm.prank(attacker);
         vm.expectRevert(AutopilotHook.NotPositionOwner.selector);
         hook.setPositionRebalancer(pid, attacker);
+    }
+
+    // --- T-2 regression: a fee-on-transfer deposit must say what went wrong ---
+
+    /// Without the settle check this surfaces as v4's `CurrencyNotSettled` from
+    /// deep inside `unlock` — accurate, and useless for diagnosis.
+    function test_fee_on_transfer_deposit_reverts_legibly() public {
+        FeeOnTransferERC20 fot = new FeeOnTransferERC20();
+        MockERC20 other = MockERC20(Currency.unwrap(currency1));
+        fot.mint(address(this), 1e24);
+        fot.approve(address(hook), type(uint256).max);
+
+        (Currency c0, Currency c1) = address(fot) < address(other)
+            ? (Currency.wrap(address(fot)), currency1)
+            : (currency1, Currency.wrap(address(fot)));
+        PoolKey memory fotKey = PoolKey(c0, c1, 3000, 60, IHooks(hook));
+        manager.initialize(fotKey, SQRT_PRICE_1_1);
+
+        vm.expectPartialRevert(AutopilotHook.FeeOnTransferNotSupported.selector);
+        hook.deposit(fotKey, -600, 600, 1e18, -1200, 1200);
+    }
+
+    /// The guard must not fire for a well-behaved token.
+    function test_settle_guard_does_not_affect_normal_tokens() public {
+        bytes32 pid = _deposit(-600, 600, 1e18);
+        (,,,,, bool active,) = hook.positions(pid);
+        assertTrue(active);
+    }
+
+    // --- G-5: hunt for the rounding shortfall the audit derived analytically ---
+
+    /// The audit reasoned that round-down in `getLiquidityForAmounts` against
+    /// round-up in `getAmount0Delta` could leave a <=2 wei debt and revert the
+    /// whole rebalance with `CurrencyNotSettled`, but produced no concrete input.
+    /// Fuzzing the rebalance across liquidity sizes and target ranges is the
+    /// cheapest way to find one if it exists.
+    function testFuzz_rebalance_settles_across_sizes_and_ranges(uint128 liq, int24 shift) public {
+        liq = uint128(bound(liq, 1e12, 1e22));
+        shift = int24(bound(shift, -5000, 5000));
+        int24 lower = (shift / 60) * 60;
+        int24 upper = lower + 1200;
+        if (lower <= TickMath.minUsableTick(60) || upper >= TickMath.maxUsableTick(60)) return;
+
+        modifyLiquidityRouter.modifyLiquidity(
+            key, ModifyLiquidityParams({tickLower: -60000, tickUpper: 60000, liquidityDelta: 1e22, salt: 0}), ""
+        );
+        bytes32 pid = hook.deposit(key, -600, 600, liq, TickMath.minUsableTick(60), TickMath.maxUsableTick(60));
+        vm.warp(block.timestamp + COOLDOWN);
+
+        vm.prank(rebalancer);
+        // Any revert here should be a named hook error, never a settlement
+        // failure leaking out of v4.
+        try hook.rebalance(pid, lower, upper, 0) returns (uint128 newLiq) {
+            assertGt(newLiq, 0);
+        } catch (bytes memory err) {
+            bytes4 sel = bytes4(err);
+            assertTrue(
+                sel == AutopilotHook.ZeroLiquidity.selector || sel == AutopilotHook.NothingFreed.selector
+                    || sel == AutopilotHook.ValueLossExceeded.selector || sel == AutopilotHook.PriceDeviation.selector
+                    || sel == AutopilotHook.SlippageExceeded.selector || sel == AutopilotHook.InvalidTickRange.selector
+                    || sel == AutopilotHook.TicksNotAligned.selector || sel == AutopilotHook.NoOpRebalance.selector
+                    || sel == AutopilotHook.OutOfBounds.selector,
+                "unexpected revert - possible settlement shortfall"
+            );
+        }
     }
 
     function test_renounce_ownership_disabled() public {

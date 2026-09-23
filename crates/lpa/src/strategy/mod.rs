@@ -16,6 +16,9 @@ pub struct DecideInput<'a> {
     pub tick_spacing: i32,
     pub fee_pips: u32,
     pub ticks: &'a [i32],
+    /// Block-span weights for `ticks`, oldest first. Empty falls back to the
+    /// unweighted statistics, which is what the synthetic-series tests use.
+    pub weighted: &'a [(i32, u64)],
     pub config: &'a PositionConfig,
     /// USD value backing the position, or 0 when it could not be priced.
     /// Zero disables the IL, slippage and MEV terms of the EV gate.
@@ -168,7 +171,11 @@ impl StrategyEngine {
         } else {
             2.0
         };
-        let bands = math::bollinger(input.ticks, k);
+        let bands = if input.weighted.is_empty() {
+            math::bollinger(input.ticks, k)
+        } else {
+            math::bollinger_weighted(input.weighted, k)
+        };
         let spacing = input.tick_spacing.max(1);
         let half = self.half_width(strategy, &bands, input);
         let new_lower = math::clamp_tick(
@@ -313,6 +320,7 @@ mod tests {
             tick_spacing: 60,
             fee_pips: 3000,
             ticks,
+            weighted: &[],
             config: cfg,
             position_value_usd: 0.0,
         }

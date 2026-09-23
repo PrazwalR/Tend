@@ -302,17 +302,35 @@ that was confirmed to fail against the unfixed contract.
 | T-4 (and the enforcement half of T-2 / T-3) | **Fixed** | Owner-curated pair allowlist, off by default, checked **only in `deposit()`** so de-listing a pair can never strand an open position. This is what turns "we don't support fee-on-transfer" from a comment into a rule. |
 | O-3 | **Partly fixed** | Per-block collapse moved into SQL rather than relying on the in-memory dedup that resets on reconnect, and the Bollinger centre is now a 10%-trimmed mean instead of an arithmetic mean, so a few extreme samples no longer drag the band. The window is still count-based rather than time-weighted. |
 
+| O-3 (remainder) | **Fixed** | `recent_ticks_weighted` pairs each sample with the number of blocks it prevailed, and the bands are now computed with a weighted, weight-trimmed mean. A tick that stood for one block carries a tenth the influence of one that stood for ten, so band influence is earned with elapsed time rather than bought with swap frequency. |
+| T-2 (diagnosability) | **Fixed** | `_settleExact` compares the PoolManager's balance across the settle and reverts `FeeOnTransferNotSupported(currency, expected, received)`. Confirmed: without it the same deposit surfaces as v4's `CurrencyNotSettled()` from inside `unlock`. |
+| G-5 | **Not reproduced** | A fuzz over rebalance liquidity (1e12–1e22) and target range (±5000 ticks) found **no settlement shortfall in 20,001 runs**; every revert was a named hook error. The finding was analytically derived and no concrete input was ever produced, by its author or here. Recorded as not-reproduced rather than fixed — absence of a counterexample is evidence, not proof. |
+
 ### Still open
 
-- **O-3 (remainder)** — the tick window counts blocks rather than weighting by
-  elapsed time, so a quiet period and a busy one contribute equally.
-- **T-2 / T-3 (behaviour)** — with the allowlist off, fee-on-transfer pairs still
-  fail at `deposit()` with an opaque `CurrencyNotSettled` from inside v4, and
-  rebasing pairs still strand yield. The allowlist is the mitigation; it has to
-  be turned on and populated.
-- **G-5** — the ≤2 wei rounding shortfall remains analytically derived, with no
-  concrete failing input produced.
+- **T-3** — rebasing pairs still strand yield and risk last-withdrawer
+  insolvency. This is a v4-wide property, not something the hook can fix; the
+  allowlist is the mitigation and it has to be turned on and populated.
 - The remaining Low and Info findings.
+
+### What re-auditing would need to cover
+
+These fixes added roughly 300 lines of security-sensitive logic to a contract
+audited in its *previous* shape. Each is covered by a regression test confirmed
+to fail against the unfixed code, which shows the fix addresses its finding — it
+does not show the fix introduced nothing new. The new surface worth pointing a
+fresh audit at:
+
+- `_swapPriceLimit` boundary selection, especially the equality cases at
+  `spot == sqrtA` and `spot == sqrtB`.
+- The value guard's pre-swap price measurement, and whether measuring at a price
+  an attacker set one block earlier weakens it.
+- The truncated price reference: seeding, and whether a long-idle pool's stale
+  reference blocks legitimate rebalances.
+- `_settleExact`'s balance delta against tokens that do something unusual
+  mid-transfer.
+- The interaction of five independent revert paths on `rebalance()`, which is now
+  a fair number of ways for a legitimate rebalance to fail closed.
 
 ### A note on what the fixes cost
 

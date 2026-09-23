@@ -179,6 +179,7 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
     error SequencerGracePeriod(uint256 readyAt);
     error PairNotAllowed();
     error AutomationDisabled();
+    error FeeOnTransferNotSupported(Currency currency, uint256 expected, uint256 received);
 
     /// @dev `initialOwner` is explicit rather than `msg.sender`: the hook must be
     ///      deployed through the CREATE2 factory for its address to carry the
@@ -414,11 +415,22 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
             ""
         );
         if (delta.amount0() < 0) {
-            cb.key.currency0.settle(poolManager, cb.owner, uint256(uint128(-delta.amount0())), false);
+            _settleExact(cb.key.currency0, cb.owner, uint256(uint128(-delta.amount0())));
         }
         if (delta.amount1() < 0) {
-            cb.key.currency1.settle(poolManager, cb.owner, uint256(uint128(-delta.amount1())), false);
+            _settleExact(cb.key.currency1, cb.owner, uint256(uint128(-delta.amount1())));
         }
+    }
+
+    /// @dev Settles and checks the PoolManager actually received the full amount.
+    ///      A fee-on-transfer token delivers less, which v4 would surface much
+    ///      later as an opaque `CurrencyNotSettled` from inside `unlock` — true,
+    ///      but useless to whoever is trying to work out why their deposit failed.
+    function _settleExact(Currency currency, address payer, uint256 amount) private {
+        uint256 balanceBefore = currency.balanceOf(address(poolManager));
+        currency.settle(poolManager, payer, amount, false);
+        uint256 received = currency.balanceOf(address(poolManager)) - balanceBefore;
+        if (received < amount) revert FeeOnTransferNotSupported(currency, amount, received);
     }
 
     function _doWithdraw(Callback memory cb) internal {

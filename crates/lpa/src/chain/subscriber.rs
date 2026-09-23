@@ -573,6 +573,10 @@ async fn propose_rebalance(ctx: &Ctx<'_>, pool_hex: &str, tick: i32, position_id
         .tracker
         .recent_ticks(pool_hex, STRATEGY_TICK_WINDOW)
         .unwrap_or_default();
+    let weighted = ctx
+        .tracker
+        .recent_ticks_weighted(pool_hex, STRATEGY_TICK_WINDOW)
+        .unwrap_or_default();
     let entry_tick = pos
         .entry_tick
         .unwrap_or((pos.tick_lower + pos.tick_upper) / 2);
@@ -586,6 +590,7 @@ async fn propose_rebalance(ctx: &Ctx<'_>, pool_hex: &str, tick: i32, position_id
         tick_spacing: pos.tick_spacing.unwrap_or(DEFAULT_TICK_SPACING),
         fee_pips: pos.fee.unwrap_or(DEFAULT_FEE_PIPS),
         ticks: &ticks,
+        weighted: &weighted,
         config: ctx.config,
         position_value_usd: position_value_usd(ctx, &pos).await,
     };

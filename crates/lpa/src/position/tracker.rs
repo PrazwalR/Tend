@@ -203,6 +203,44 @@ impl Tracker {
         Ok(out)
     }
 
+    /// Samples paired with the number of blocks each one prevailed, oldest first.
+    /// A tick that stood for 50 blocks and one that stood for a single block are
+    /// not equal evidence about where price has been, and counting them equally
+    /// is what lets an attacker buy influence over the band with swap frequency
+    /// rather than with time.
+    pub fn recent_ticks_weighted(&self, pool_id: &str, n: usize) -> Result<Vec<(i32, u64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT block_number, tick FROM (
+                 SELECT block_number, tick, ROW_NUMBER() OVER (
+                     PARTITION BY block_number ORDER BY id DESC
+                 ) AS rn
+                 FROM tick_history WHERE pool_id = ?1
+             ) WHERE rn = 1 ORDER BY block_number DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![pool_id, n as i64], |r| {
+            Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i32>(1)?))
+        })?;
+        let mut desc: Vec<(u64, i32)> = Vec::new();
+        for r in rows {
+            desc.push(r?);
+        }
+        desc.reverse(); // oldest first
+
+        let mut out = Vec::with_capacity(desc.len());
+        for (i, &(block, tick)) in desc.iter().enumerate() {
+            // How long this sample stood: the gap to the next observation, or one
+            // block for the newest sample, which has not been superseded yet.
+            let span = desc
+                .get(i + 1)
+                .map(|&(nb, _)| nb.saturating_sub(block))
+                .unwrap_or(1)
+                .max(1);
+            out.push((tick, span));
+        }
+        Ok(out)
+    }
+
     pub fn set_config(&self, position_id: &str, c: &ConfigRow) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(

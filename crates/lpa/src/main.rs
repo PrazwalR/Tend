@@ -370,6 +370,7 @@ async fn main() -> anyhow::Result<()> {
                 .get_position(&position_id)?
                 .ok_or_else(|| anyhow::anyhow!("position not found: {position_id}"))?;
             let ticks = tracker.recent_ticks(&pos.pool_id, window)?;
+            let weighted = tracker.recent_ticks_weighted(&pos.pool_id, window)?;
             let current_tick = pos
                 .current_tick
                 .or_else(|| ticks.last().copied())
@@ -396,6 +397,7 @@ async fn main() -> anyhow::Result<()> {
                 tick_spacing,
                 fee_pips,
                 ticks: &ticks,
+                weighted: &weighted,
                 config: &config,
                 position_value_usd: position_value_usd.unwrap_or(0.0),
             };

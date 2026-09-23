@@ -49,6 +49,7 @@ fn decide(t: &Tracker, pool: &str) -> Option<crate::strategy::Decision> {
         tick_spacing: 60,
         fee_pips: 3000,
         ticks: &ticks,
+        weighted: &t.recent_ticks_weighted(pool, 200).unwrap(),
         config: &cfg,
         position_value_usd: 0.0,
     };
