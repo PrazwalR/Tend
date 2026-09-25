@@ -169,6 +169,24 @@ impl Tracker {
         Ok(crosses)
     }
 
+    /// Positions the daemon last saw out of range. The watch loop only proposes
+    /// a rebalance on the in -> out transition, so without a periodic sweep over
+    /// this set a single failed attempt would leave a position stranded until
+    /// price re-entered its range and left again.
+    pub fn out_of_range_positions(&self) -> Result<Vec<PositionRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT position_id, owner, pool_id, chain_id, tick_lower, tick_upper, current_tick, in_range, entry_tick, fee, tick_spacing
+             FROM positions WHERE in_range = 0 AND current_tick IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], row_to_position)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     pub fn record_tick(&self, pool_id: &str, tick: i32, block: u64) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -450,6 +468,39 @@ pub fn compute_position_id(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn out_of_range_sweep_selects_only_known_out_of_range_positions() {
+        let t = Tracker::open_in_memory().unwrap();
+        let mk = |id: &str, lo: i32, hi: i32| PositionRow {
+            position_id: id.into(),
+            owner: "0x1111111111111111111111111111111111111111".into(),
+            pool_id: "0xpool".into(),
+            chain_id: "8453".into(),
+            tick_lower: lo,
+            tick_upper: hi,
+            current_tick: None,
+            in_range: false,
+            entry_tick: None,
+            fee: None,
+            tick_spacing: None,
+        };
+        t.register(&mk("0xin", -600, 600)).unwrap();
+        t.register(&mk("0xout", 600, 1200)).unwrap();
+        t.register(&mk("0xunseen", 600, 1200)).unwrap();
+        t.update_pool_tick("0xpool", 0).unwrap();
+
+        // Never observed a tick: nothing to decide on yet.
+        t.register(&mk("0xunseen", 600, 1200)).unwrap();
+
+        let ids: Vec<String> = t
+            .out_of_range_positions()
+            .unwrap()
+            .into_iter()
+            .map(|p| p.position_id)
+            .collect();
+        assert_eq!(ids, vec!["0xout".to_string()]);
+    }
+
     #[test]
     fn recent_ticks_collapses_multiple_samples_in_one_block() {
         let t = Tracker::open_in_memory().unwrap();

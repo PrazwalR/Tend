@@ -264,6 +264,7 @@ async fn watch_once(
                         if let Err(e) = ctx.tracker.set_last_indexed_block(&ctx.chain_key(), head) {
                             warn!(error = %e, "watermark update failed");
                         }
+                        sweep_out_of_range(ctx).await;
                     }
                     _ => {
                         warn!("WS heartbeat health-check failed; forcing reconnect");
@@ -563,6 +564,28 @@ async fn position_value_usd(ctx: &Ctx<'_>, p: &PositionRow) -> f64 {
         return 0.0;
     }
     value_token1 * token1_usd
+}
+
+/// Re-proposes every position still out of range. Only in auto-execute mode:
+/// without an executor the proposal is just a log line, and repeating it every
+/// heartbeat would be noise. The strategy still gates each proposal, and the
+/// executor throttles sent transactions per position.
+async fn sweep_out_of_range(ctx: &Ctx<'_>) {
+    if ctx.intent_tx.is_none() {
+        return;
+    }
+    let positions = match ctx.tracker.out_of_range_positions() {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(error = %e, "out-of-range sweep query failed");
+            return;
+        }
+    };
+    for p in positions {
+        if let Some(tick) = p.current_tick {
+            propose_rebalance(ctx, &p.pool_id, tick, &p.position_id).await;
+        }
+    }
 }
 
 async fn propose_rebalance(ctx: &Ctx<'_>, pool_hex: &str, tick: i32, position_id: &str) {

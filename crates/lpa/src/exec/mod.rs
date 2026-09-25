@@ -10,10 +10,51 @@ use anyhow::{anyhow, bail, Context, Result};
 use std::time::Duration;
 
 sol! {
+    struct HookPoolKey {
+        address currency0;
+        address currency1;
+        uint24 fee;
+        int24 tickSpacing;
+        address hooks;
+    }
+
     #[sol(rpc)]
     interface IAutopilotHook {
         function rebalance(bytes32 positionId, int24 newTickLower, int24 newTickUpper, uint128 minLiquidity) external returns (uint128);
         function isRebalancer(address who) external view returns (bool);
+        function pokePriceRef(HookPoolKey key) external;
+        function positions(bytes32 positionId) external view returns (
+            address owner,
+            HookPoolKey key,
+            int24 tickLower,
+            int24 tickUpper,
+            uint128 liquidity,
+            bool active,
+            uint64 lastRebalanceAt
+        );
+
+        error PriceDeviation(int24 spotTick, int24 referenceTick);
+    }
+}
+
+/// Why a rebalance preflight was refused. Only one of these has a remedy the
+/// daemon can apply itself; the rest resolve with time or not at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreflightBlock {
+    /// Spot is further from the hook's price reference than it tolerates. On a
+    /// pool with no further swaps the reference never catches up on its own, so
+    /// the daemon pokes it one step per block.
+    PriceDeviation,
+    Other,
+}
+
+pub fn classify_preflight(revert: &str) -> PreflightBlock {
+    use alloy::sol_types::SolError;
+    let selector = alloy::primitives::hex::encode(IAutopilotHook::PriceDeviation::SELECTOR);
+    if revert.to_lowercase().contains(&selector) {
+        PreflightBlock::PriceDeviation
+    } else {
+        PreflightBlock::Other
     }
 }
 
@@ -189,6 +230,53 @@ impl Executor {
     }
 }
 
+impl Executor {
+    /// The pool a position lives in: its key, and the v4 pool id derived from it.
+    pub async fn pool_of(&self, position_id: B256) -> Result<(HookPoolKey, B256)> {
+        use alloy::sol_types::SolValue;
+        let read = IAutopilotHook::new(self.hook, &self.provider);
+        let key = read.positions(position_id).call().await?.key;
+        let pool_id = alloy::primitives::keccak256(key.abi_encode());
+        Ok((key, pool_id))
+    }
+
+    /// Advances a pool's price reference one capped step toward spot. Subject to
+    /// the same fresh-price spend cap as a rebalance, since the daemon pays for it.
+    pub async fn poke(
+        &self,
+        key: HookPoolKey,
+        max_gas_usd: f64,
+        eth_price: &crate::chain::oracle::EthPrice,
+    ) -> Result<String> {
+        let read = IAutopilotHook::new(self.hook, &self.provider);
+        let gas = read
+            .pokePriceRef(key.clone())
+            .from(self.signer)
+            .estimate_gas()
+            .await
+            .context("poke gas estimation failed")?;
+        let eth_price_usd = eth_price
+            .get_fresh()
+            .ok_or_else(|| anyhow!("no fresh ETH/USD price; refusing to price a poke"))?;
+        let gas_price = self.provider.get_gas_price().await?;
+        let est = cost::rebalance_cost_usd(gas, gas_price, eth_price_usd);
+        if !cost::within_spend_cap(est, max_gas_usd) {
+            bail!("spend cap exceeded for poke: ${est:.2} > ${max_gas_usd:.2}");
+        }
+
+        let hook = IAutopilotHook::new(self.hook, &self.submit);
+        let receipt = hook
+            .pokePriceRef(key)
+            .send()
+            .await?
+            .with_timeout(Some(self.tx_timeout))
+            .get_receipt()
+            .await
+            .map_err(|e| anyhow!("poke unconfirmed: {e}"))?;
+        Ok(format!("{:#x}", receipt.transaction_hash))
+    }
+}
+
 fn to_i24(v: i32) -> Result<I24> {
     if !(I24_MIN..=I24_MAX).contains(&v) {
         bail!("tick out of int24 range: {v}");
@@ -225,6 +313,8 @@ pub async fn run_executor_loop(
         "AUTO-EXECUTE enabled — the daemon will send real rebalance transactions"
     );
     let mut last: HashMap<String, Instant> = HashMap::new();
+    let mut last_poke: HashMap<B256, Instant> = HashMap::new();
+    let mut last_block: HashMap<String, String> = HashMap::new();
     while let Some(intent) = rx.recv().await {
         if last
             .get(&intent.position_id)
@@ -232,12 +322,41 @@ pub async fn run_executor_loop(
         {
             continue;
         }
-        last.insert(intent.position_id.clone(), Instant::now());
-
         let pid = match intent.position_id.parse::<B256>() {
             Ok(p) => p,
             Err(_) => continue,
         };
+
+        // Preflight first. A refused eth_call costs nothing, so it must not burn
+        // the per-position interval — that is reserved for transactions actually
+        // sent. Otherwise one blocked attempt would suppress retries for minutes.
+        let sim = match executor
+            .simulate(pid, intent.new_lower, intent.new_upper)
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, position = %intent.position_id, "preflight call failed");
+                continue;
+            }
+        };
+        if !sim.ok {
+            let reason = sim.revert.unwrap_or_default();
+            let block = classify_preflight(&reason);
+            // Warn once per distinct reason, then stay quiet: the sweep retries
+            // every heartbeat and would otherwise repeat the same line forever.
+            if last_block.get(&intent.position_id) != Some(&reason) {
+                tracing::warn!(position = %intent.position_id, ?block, reason = %reason, "rebalance blocked at preflight");
+                last_block.insert(intent.position_id.clone(), reason);
+            }
+            if block == PreflightBlock::PriceDeviation {
+                poke_once(&executor, &cfg, pid, &intent.position_id, &mut last_poke).await;
+            }
+            continue;
+        }
+        last_block.remove(&intent.position_id);
+
+        last.insert(intent.position_id.clone(), Instant::now());
         match executor
             .execute(
                 pid,
@@ -261,5 +380,91 @@ pub async fn run_executor_loop(
                 "auto-rebalance skipped (preflight/cap/cooldown)"
             ),
         }
+    }
+}
+
+/// Minimum spacing between pokes of one pool. The reference moves at most one
+/// step per block, so poking faster than blocks arrive only spends gas.
+const POKE_MIN_INTERVAL: Duration = Duration::from_secs(12);
+
+async fn poke_once(
+    executor: &Executor,
+    cfg: &AutoExec,
+    pid: B256,
+    position_id: &str,
+    last_poke: &mut std::collections::HashMap<B256, std::time::Instant>,
+) {
+    let (key, pool_id) = match executor.pool_of(pid).await {
+        Ok(k) => k,
+        Err(e) => {
+            tracing::warn!(error = %e, position = %position_id, "could not resolve pool to poke");
+            return;
+        }
+    };
+    // Several positions can share a pool, and the sweep proposes each of them
+    // every heartbeat; throttle on the pool before spending anything.
+    if !poke_due(last_poke.get(&pool_id).copied(), std::time::Instant::now()) {
+        return;
+    }
+    last_poke.insert(pool_id, std::time::Instant::now());
+    match executor.poke(key, cfg.max_gas_usd, &cfg.eth_price).await {
+        Ok(tx) => {
+            tracing::info!(tx = %tx, position = %position_id, "poked price reference toward spot")
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, position = %position_id, "price-reference poke failed")
+        }
+    }
+}
+
+fn poke_due(last: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    last.is_none_or(|t| now.duration_since(t) >= POKE_MIN_INTERVAL)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn classifies_price_deviation_from_revert_text() {
+        use alloy::sol_types::SolError;
+        let sel = alloy::primitives::hex::encode(IAutopilotHook::PriceDeviation::SELECTOR);
+        let text = format!(
+            "server returned an error response: error code 3: execution reverted, data: \"0x{sel}00000000\""
+        );
+        assert_eq!(classify_preflight(&text), PreflightBlock::PriceDeviation);
+        assert_eq!(
+            classify_preflight(&text.to_uppercase()),
+            PreflightBlock::PriceDeviation
+        );
+    }
+
+    #[test]
+    fn other_reverts_are_not_poked() {
+        // RebalanceTooSoon — resolves with time, not with a poke.
+        assert_eq!(
+            classify_preflight("execution reverted, data: \"0x2ddcae9c0000\""),
+            PreflightBlock::Other
+        );
+        assert_eq!(classify_preflight(""), PreflightBlock::Other);
+    }
+
+    #[test]
+    fn poke_selector_matches_the_contract_error() {
+        use alloy::sol_types::SolError;
+        // cast sig "PriceDeviation(int24,int24)"
+        assert_eq!(
+            alloy::primitives::hex::encode(IAutopilotHook::PriceDeviation::SELECTOR),
+            "1782bd94"
+        );
+    }
+
+    #[test]
+    fn poke_throttle() {
+        let now = Instant::now();
+        assert!(poke_due(None, now), "first poke of a pool is always due");
+        assert!(!poke_due(Some(now), now), "not twice in one interval");
+        assert!(poke_due(Some(now), now + POKE_MIN_INTERVAL));
     }
 }

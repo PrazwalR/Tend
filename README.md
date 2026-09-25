@@ -38,7 +38,10 @@ process, wired by in-process channels. The only network surface is `lpa serve`
 - **Monitor** — alloy WS subscription to the v4 `PoolManager` `Swap` event and
   the hook's position events; SQLite tracks positions and per-block tick history.
   A per-chain watermark plus an `eth_getLogs` backfill closes the gap after a
-  restart; reorged position events resync from the hook's own storage.
+  restart; reorged position events resync from the hook's own storage. In
+  auto-execute mode a heartbeat sweep retries every out-of-range position, and a
+  rebalance refused because spot has run ahead of the hook's price reference
+  triggers a `pokePriceRef` to walk the reference back within tolerance.
 - **Strategy** — concentrated-LP impermanent-loss, block-sampled Bollinger
   bands, and an expected-value gate
   (`E[fee gain] + E[IL avoided] − gas − slippage − MEV > 0`). Expected IL is
@@ -138,6 +141,13 @@ Put the deployed address in `AUTOPILOT_HOOK_ADDRESS`.
 - Position liquidity, token amounts and uncollected fees are read from the v4
   `StateView` lens. Without `--hook` (or an HTTP RPC) those fields stream empty
   rather than guessed.
+
+## Range orders
+
+The daemon rebalances every out-of-range position toward spot, including one opened
+out of range on purpose. To keep a range order, open it with automation off:
+`deposit(key, lower, upper, liquidity, minBound, maxBound, AUTOMATION_OFF)`, or call
+`setPositionRebalancer(positionId, AUTOMATION_OFF)` afterwards.
 
 ## End-to-end
 

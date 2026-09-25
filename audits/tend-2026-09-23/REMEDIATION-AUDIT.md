@@ -224,11 +224,36 @@ the new tests initially failed for that reason alone. The tests now read the blo
 through the `vm.getBlockNumber()` cheatcode. Every existing test was checked: none rolls or
 warps more than once in a single function, so none was silently hollowed out.
 
-### Remaining gap: the daemon does not poke
+### Remaining gap: the daemon does not poke — CLOSED
 
-The contract now gives a stuck position a bounded way out, but **nothing calls it**. The
-daemon only attempts a rebalance when a swap event arrives — and the quiet-pool case is
-precisely the one where no swap events arrive. In production today, R-2(c) is fixed only
-if the position owner or someone else calls `pokePriceRef` by hand. Closing it properly
-needs the daemon to sweep blocked out-of-range positions on its heartbeat, poking and
-retrying. That is a daemon change and is the next item.
+Closing it exposed a wider daemon bug. The watch loop proposed a rebalance only on the
+in → out-of-range **transition**, so any first attempt refused for any reason — price
+deviation, cooldown, spend cap, stale ETH price — was never retried unless price re-entered
+the range and left again. A position deposited out of range was never managed at all,
+because it never had a transition.
+
+Fixed in the daemon:
+
+- **Heartbeat sweep** over every out-of-range position (auto-execute mode only), so a
+  refused rebalance is retried until it succeeds or the strategy declines it.
+- **Refused preflights no longer consume the per-position throttle.** A failed `eth_call`
+  costs nothing; only a sent transaction starts the interval. Previously one refusal
+  suppressed retries for five minutes.
+- **`PriceDeviation` triggers a poke**, recognised by selector `0x1782bd94`, throttled per
+  pool *before* anything is spent, and priced against the same fresh-ETH spend cap as a
+  rebalance.
+
+Proven end to end: E2E stage 7 makes one large one-block move on a forked Base pool and
+then stops swapping. Result — 15 preflight refusals citing `PriceDeviation`, 8 pokes, then
+a successful rebalance, with no further swaps.
+
+**The old E2E was passing because of the bug.** Its stage 6 used to land on `[-900, -720]`:
+the position rebalanced once, exited that range again as price kept falling, had its next
+attempt refused by the cooldown, and was abandoned. The assertion only checked that the
+range moved, and it moved exactly once. With the sweep the position follows price across
+cooldown windows, landing at `[-4680, -1260]`.
+
+**Behaviour change to note.** Positions opened *deliberately* out of range — a range order
+placed above or below spot — are now rebalanced toward spot like any other out-of-range
+position, where before they were left alone by accident. The opt-out already exists:
+deposit with `rebalancer = AUTOMATION_OFF`, or call `setPositionRebalancer` afterwards.

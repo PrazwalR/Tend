@@ -213,5 +213,35 @@ echo "daemon db range: $DB_RANGE"
 [[ "$DB_RANGE" == "$NEW_LOWER,$NEW_UPPER" ]] \
   || fail "daemon db range $DB_RANGE disagrees with chain [$NEW_LOWER,$NEW_UPPER]"
 
+step "stage 7 — a position stuck behind the price guard on a quiet pool recovers"
+# One large move in a single block, then no more swaps. The price reference may
+# follow only one capped step per block, so the next rebalance is refused with
+# PriceDeviation — and since nothing else will ever swap here, only the daemon's
+# heartbeat sweep and its pokes can move the reference back within tolerance.
+MARK=$(wc -l < "$DAEMON_LOG")
+# Past the cooldown FIRST: the contract checks it before the price guard, and a
+# RebalanceTooSoon would otherwise mask the condition under test.
+cast rpc evm_increaseTime 120 --rpc-url "$RPC" >/dev/null 2>&1 || true
+cast rpc evm_mine --rpc-url "$RPC" >/dev/null 2>&1 || true
+swap true -3e20
+echo "large one-block move done; no further swaps"
+
+since() { tail -n +"$((MARK + 1))" "$DAEMON_LOG"; }
+DEADLINE=$((SECONDS + 240))
+RECOVERED=0
+while (( SECONDS < DEADLINE )); do
+  if since | grep -q "auto-rebalanced on-chain"; then RECOVERED=1; break; fi
+  sleep 5
+done
+
+BLOCKED=$(since | grep -c "PriceDeviation" || true)
+POKES=$(since | grep -c "poked price reference toward spot" || true)
+echo "preflight refusals citing PriceDeviation: $BLOCKED"
+echo "pokes sent: $POKES"
+(( BLOCKED > 0 )) || fail "stage 7 never reproduced the stuck condition (no PriceDeviation refusal)"
+(( POKES > 0 )) || fail "daemon never poked the price reference"
+(( RECOVERED == 1 )) || fail "position stayed stuck behind the price guard"
+echo "OK: stuck position recovered via sweep + poke with no further swaps"
+
 echo
 echo "E2E PASSED — full loop verified against a real v4 PoolManager."
