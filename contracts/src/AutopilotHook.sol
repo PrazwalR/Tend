@@ -48,9 +48,16 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
         uint64 lastRebalanceAt;
     }
 
+    /// @dev `tick` follows spot but is clamped to `anchor ± maxTickMovePerBlock`,
+    ///      where `anchor` is the reference as it stood when the block began. The
+    ///      LAST write in a block wins: a same-block displace-and-restore ends the
+    ///      block with the reference back where it started, so dragging it takes a
+    ///      price held across block boundaries against arbitrage, not a free
+    ///      round trip. One slot: 3 + 3 + 8 + 1 bytes.
     struct PriceRef {
         int24 tick;
-        uint40 updatedAt;
+        int24 anchor;
+        uint64 atBlock;
         bool seeded;
     }
 
@@ -199,6 +206,7 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
     error ValueLossExceeded(uint256 valueAfter, uint256 valueBefore);
     error ZeroRecipient();
     error PriceDeviation(int24 spotTick, int24 referenceTick);
+    error PriceReferenceUnseeded();
     error DeviationBoundTooHigh();
     error SequencerDown();
     error SequencerGracePeriod(uint256 readyAt);
@@ -345,6 +353,10 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
             // every position would bypass the cooldown entirely.
             lastRebalanceAt: uint64(block.timestamp)
         });
+        if (poolPositionCount[id] == 0) {
+            (, int24 spot,,) = poolManager.getSlot0(id);
+            _seedPriceRef(id, spot);
+        }
         poolPositionCount[id] += 1;
         emit PositionOpened(positionId, msg.sender, id, tickLower, tickUpper, liquidity, key.fee, key.tickSpacing);
     }
@@ -739,20 +751,48 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
     ///      and by at most `maxTickMovePerBlock`. Clamping is the whole point: an
     ///      attacker who moves spot arbitrarily far in one transaction moves the
     ///      reference by one capped step, so the deviation guard still fires.
-    function _updatePriceRef(PoolId id, int24 tick) internal {
+    function _updatePriceRef(PoolId id, int24 spot) internal {
         PriceRef memory ref = priceRef[id];
         if (!ref.seeded) {
-            priceRef[id] = PriceRef({tick: tick, updatedAt: uint40(block.timestamp), seeded: true});
+            _seedPriceRef(id, spot);
             return;
         }
-        if (uint40(block.timestamp) == ref.updatedAt) return;
-
+        bool newBlock = ref.atBlock != block.number;
+        if (newBlock) {
+            // Last block's final value becomes this block's anchor.
+            ref.anchor = ref.tick;
+            ref.atBlock = uint64(block.number);
+        }
         int24 cap = maxTickMovePerBlock;
-        int24 next = tick;
-        if (next > ref.tick + cap) next = ref.tick + cap;
-        else if (next < ref.tick - cap) next = ref.tick - cap;
+        int24 next = spot;
+        if (next > ref.anchor + cap) next = ref.anchor + cap;
+        else if (next < ref.anchor - cap) next = ref.anchor - cap;
+        // Every swapper in the pool pays for this write, so skip it when it would
+        // change nothing — common once spot sits beyond the cap for the block.
+        if (!newBlock && next == ref.tick) return;
+        ref.tick = next;
+        priceRef[id] = ref;
+    }
 
-        priceRef[id] = PriceRef({tick: next, updatedAt: uint40(block.timestamp), seeded: true});
+    /// @dev Called when a pool gains its first position. Reseeding here — not on
+    ///      the first swap — means no third party chooses the anchor, and a
+    ///      reference left frozen while the pool had no positions is replaced
+    ///      rather than trusted.
+    function _seedPriceRef(PoolId id, int24 spot) internal {
+        priceRef[id] = PriceRef({tick: spot, anchor: spot, atBlock: uint64(block.number), seeded: true});
+    }
+
+    /// @notice Advance a pool's reference one capped step toward spot. Anyone may
+    ///         call it; it is rate-limited to one step per block, so it gives an
+    ///         attacker nothing a dust swap would not. Its purpose is liveness: on
+    ///         a pool that went quiet after a large move, nothing else would ever
+    ///         pull the reference back toward spot, and every rebalance there would
+    ///         stay blocked with no deadline.
+    function pokePriceRef(PoolKey calldata key) external {
+        PoolId id = key.toId();
+        if (poolPositionCount[id] == 0) return;
+        (, int24 spot,,) = poolManager.getSlot0(id);
+        _updatePriceRef(id, spot);
     }
 
     /// @dev On an L2, refuses to act while the sequencer is down or has only just
@@ -786,10 +826,15 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
     ///      corroborate is a reason to wait, not to trade.
     function _requirePriceNotManipulated(PoolId id) internal view {
         PriceRef memory ref = priceRef[id];
-        if (!ref.seeded) return; // no history yet; nothing to compare against
+        // Seeding at the first deposit makes this unreachable for any pool with a
+        // position, so reaching it means an invariant broke: fail closed.
+        if (!ref.seeded) revert PriceReferenceUnseeded();
+        // Compare against where the reference stood when this block began, not
+        // its intra-block value, which a swap earlier in this block may have moved.
+        int24 anchor = ref.atBlock == block.number ? ref.anchor : ref.tick;
         (, int24 spotTick,,) = poolManager.getSlot0(id);
-        int24 diff = spotTick > ref.tick ? spotTick - ref.tick : ref.tick - spotTick;
-        if (diff > maxDeviationTicks) revert PriceDeviation(spotTick, ref.tick);
+        int24 diff = spotTick > anchor ? spotTick - anchor : anchor - spotTick;
+        if (diff > maxDeviationTicks) revert PriceDeviation(spotTick, anchor);
     }
 
     function _validateTicks(PoolKey memory key, int24 tickLower, int24 tickUpper) internal pure {

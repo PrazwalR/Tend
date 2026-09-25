@@ -147,18 +147,8 @@ Recorded rather than fixed, with the reason.
   to what is actually deployable at the post-swap price, or reverting when the undeployed
   fraction exceeds a threshold. Both are behavioural changes that deserve their own design
   pass rather than being bolted on during a remediation round.
-- **R-2 (price reference lifecycle)** — HIGH. Three defects: seeding is unauthenticated and
-  one-shot, so the first swap after a pool's first deposit chooses the anchor; the reference
-  freezes entirely while `poolPositionCount == 0`, so a later depositor can inherit a fossil;
-  and there is no time-based convergence, so on a pool that goes quiet after a large move the
-  reference never catches up and `rebalance()` is blocked with no deadline. Exit is preserved
-  throughout. The fix is a lifecycle redesign — seed at deposit, invalidate on count→0, and
-  let the cap scale with elapsed time — not a patch.
-- **R-3 (reference walk)** — MEDIUM. Only the first swap of a block moves the reference, so
-  an attacker who is first-in-block can displace price, let the reference advance one capped
-  step, and restore price in the same block, carrying no cross-block risk. Five such blocks
-  put the reference 2500 ticks from an honest spot. The reviewer could not measure the cost
-  at a realistic depth ratio and rated it Medium on that basis.
+- **R-2 / R-3 / A-4 — fixed in a follow-up redesign; see §7.** One gap remains, and it
+  is in the daemon, not the contract — described there.
 - **R-6 (boundary equality)** — LOW. At `spot == sqrtA` / `spot == sqrtB` the limit selects
   the *far* edge, letting the swap traverse the whole range. Absorbed by the value guard in
   every configuration tested, so it manifests as an unnecessary revert rather than a bad fill.
@@ -174,8 +164,6 @@ Recorded rather than fixed, with the reason.
   push, inside the deviation bound, produced a **137 bps** real loss against a 100 bps
   configured tolerance. Measuring against `priceRef` instead would make the two guards
   multiply rather than compose.
-- **A-4** — the reference is never checked for freshness, so a stale one can veto
-  indefinitely. Overlaps R-2.
 
 ## 6. What the reviewers could not measure
 
@@ -187,3 +175,60 @@ Stated so the gaps are not mistaken for clean results:
 - Whether the REG-1 grief can be mounted without already holding a majority of the pool's
   active liquidity.
 - Whether R-6's boundary equality can be steered into a bad *fill* rather than a revert.
+
+---
+
+## 7. Follow-up: price-reference lifecycle redesign
+
+R-2, R-3 and A-4 share a root: the reference's lifecycle had accreted rather than been
+designed. Fixed together rather than patched individually.
+
+| Defect | Old behaviour | Now |
+|---|---|---|
+| R-2(a) seeding | Seeded by the first swap after a pool's first deposit, so whoever landed that swap chose the anchor | Seeded from spot **inside the depositor's own transaction** when a pool goes from 0 to 1 position |
+| R-2(b) fossil | Frozen while a pool had no positions, then trusted by the next depositor | Reseeded on every 0 → 1 transition |
+| R-2(c) no convergence | After one large move on a pool that then went quiet, nothing ever pulled the reference back; rebalancing stayed blocked with no deadline | Permissionless `pokePriceRef()` advances one capped step per block |
+| R-3 free walk | First write per second won, so displace → update → restore in one block moved the reference a full step at no cross-block risk | **Last write per block wins**, clamped to the block-start anchor. A same-block round trip ends the block with the reference back home |
+| — | Deviation checked against the intra-block value, which a front-run earlier in the same block could itself have moved | Checked against the **block-start anchor** |
+| A-7 | Guard skipped entirely while unseeded | Seeding is guaranteed at first deposit, so unseeded is an invariant break — fails closed |
+
+**Why there is no separate freshness check (A-4).** In v4 a pool's spot price moves only
+through swaps in that pool, and every such swap updates the reference. So the reference
+can only go stale in two ways: the count-0 freeze (now reseeded) and lag after a large
+move (now pokeable). A timestamp check would add a third mechanism for a failure mode the
+other two already cover. Time-scaling the per-block cap was considered and rejected: on a
+quiet pool it would let an attacker who holds a displaced price across a *single* block
+boundary set the reference in one step.
+
+**Poke gives an attacker nothing.** It applies the same clamp as a swap and is rate-limited
+to one step per block, so anything it does, a dust swap could already do.
+
+**Verified against the old semantics**, not just reasoned: restoring first-write-wins and
+the intra-block comparison inside the new struct makes the R-3 tests fail with exactly
+the defects they target —
+
+    [FAIL: a restored price must leave the reference where it was: -500 != 0]
+    [FAIL: next call did not revert as expected]   (a 2400-tick front-run passed)
+
+**Cost.** Last-writer-wins means every swap in a pool holding autopilot positions now
+writes the reference slot, where previously only the first per second did — roughly
++2.9k gas for each swap after the first in a block (EVM-derived, not measured). The write
+is skipped when it would change nothing, which is common once spot sits past the cap.
+Pools with no autopilot positions remain untouched.
+
+### A test-harness trap found on the way
+
+Under `via_ir`, repeated reads of `block.number` inside one test function are folded, so
+`vm.roll(block.number + 1)` in a loop rolls to the *same* block every iteration. Three of
+the new tests initially failed for that reason alone. The tests now read the block number
+through the `vm.getBlockNumber()` cheatcode. Every existing test was checked: none rolls or
+warps more than once in a single function, so none was silently hollowed out.
+
+### Remaining gap: the daemon does not poke
+
+The contract now gives a stuck position a bounded way out, but **nothing calls it**. The
+daemon only attempts a rebalance when a swap event arrives — and the quiet-pool case is
+precisely the one where no swap events arrive. In production today, R-2(c) is fixed only
+if the position owner or someone else calls `pokePriceRef` by hand. Closing it properly
+needs the daemon to sweep blocked out-of-range positions on its heartbeat, poking and
+retrying. That is a daemon change and is the next item.

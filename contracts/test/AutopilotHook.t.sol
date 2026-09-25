@@ -742,47 +742,6 @@ contract AutopilotHookTest is Test, Deployers {
         hook.rebalance(pid, -3000, -1800, 0);
     }
 
-    /// The reference only moves one capped step per block, so a manipulator has to
-    /// hold the price across many blocks rather than one transaction.
-    function test_price_reference_moves_at_most_one_step_per_block() public {
-        modifyLiquidityRouter.modifyLiquidity(
-            key, ModifyLiquidityParams({tickLower: -60000, tickUpper: 60000, liquidityDelta: 1e21, salt: 0}), ""
-        );
-        _deposit(-600, 600, 1e18);
-        _swap();
-        (int24 seeded,,) = hook.priceRef(id);
-
-        PoolSwapTest.TestSettings memory ts = PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false});
-        for (uint256 i = 0; i < 3; i++) {
-            vm.warp(block.timestamp + 12);
-            swapRouter.swap(
-                key,
-                SwapParams({zeroForOne: true, amountSpecified: -2e17, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1}),
-                ts,
-                ""
-            );
-        }
-
-        (int24 moved,,) = hook.priceRef(id);
-        int24 cap = hook.maxTickMovePerBlock();
-        assertGe(seeded - moved, int24(0), "reference should track downward");
-        assertLe(seeded - moved, cap * 3, "reference moved faster than the per-block cap");
-    }
-
-    /// Several swaps inside one block must advance the reference at most once.
-    function test_price_reference_updates_once_per_block() public {
-        _deposit(-600, 600, 1e18);
-        _swap();
-        (int24 first, uint40 at,) = hook.priceRef(id);
-
-        _swap();
-        _swap();
-        (int24 second, uint40 at2,) = hook.priceRef(id);
-
-        assertEq(at, at2, "same block must not re-stamp the reference");
-        assertEq(first, second, "same block must not move the reference");
-    }
-
     function test_price_guard_is_owner_only_and_bounded() public {
         vm.prank(attacker);
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, attacker));
@@ -1064,6 +1023,165 @@ contract AutopilotHookTest is Test, Deployers {
         vm.warp(block.timestamp + COOLDOWN);
         vm.prank(rebalancer);
         hook.rebalance(pid, -1200, 1200, 0);
+    }
+
+    // --- Re-audit R-2 / R-3: price-reference lifecycle ---
+
+    function _deepPool() internal {
+        modifyLiquidityRouter.modifyLiquidity(
+            key, ModifyLiquidityParams({tickLower: -60000, tickUpper: 60000, liquidityDelta: 1e21, salt: 0}), ""
+        );
+    }
+
+    /// Swap until spot sits exactly on `target`.
+    function _swapTo(int24 target) internal {
+        (, int24 now_,,) = manager.getSlot0(id);
+        if (now_ == target) return;
+        bool down = target < now_;
+        swapRouter.swap(
+            key,
+            SwapParams({
+                zeroForOne: down, amountSpecified: -1e30, sqrtPriceLimitX96: TickMath.getSqrtPriceAtTick(target)
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+    }
+
+    /// `vm.roll(block.number + 1)` is unsafe under via_ir: repeated reads of
+    /// `block.number` in one test function get folded, so a loop keeps rolling to
+    /// the same block. Read the real value from the cheatcode instead.
+    function _nextBlock() internal {
+        vm.roll(vm.getBlockNumber() + 1);
+    }
+
+    function _ref() internal view returns (int24 tick, int24 anchor) {
+        (tick, anchor,,) = hook.priceRef(id);
+    }
+
+    /// R-2(a): the anchor must come from the depositor's own transaction, not
+    /// from whichever swap happens to land first afterwards.
+    function test_deposit_seeds_reference_at_spot() public {
+        _deepPool();
+        _swapTo(-1200);
+        _deposit(-1800, -600, 1e18);
+        (int24 t, int24 a) = _ref();
+        assertEq(t, int24(-1200));
+        assertEq(a, int24(-1200));
+    }
+
+    /// The reference moves at most one capped step per block, whatever the swaps.
+    function test_reference_moves_at_most_one_step_per_block() public {
+        _deepPool();
+        _deposit(-600, 600, 1e18);
+        int24 cap = hook.maxTickMovePerBlock();
+        for (uint256 i = 1; i <= 3; i++) {
+            _nextBlock();
+            _swapTo(-20000 - int24(int256(i)) * 60);
+            (int24 t,) = _ref();
+            assertEq(t, -cap * int24(int256(i)), "one capped step per block");
+        }
+    }
+
+    /// R-3: displacing spot and restoring it inside one block used to drag the
+    /// reference a full step for free. Last-writer-wins returns it home.
+    function test_same_block_round_trip_does_not_drag_reference() public {
+        _deepPool();
+        _deposit(-600, 600, 1e18);
+        _nextBlock();
+
+        _swapTo(-5000); // displace
+        _swapTo(0); // restore, same block
+
+        (int24 t,) = _ref();
+        assertEq(t, int24(0), "a restored price must leave the reference where it was");
+    }
+
+    /// R-3: the deviation check reads the block-start anchor, so a front-run
+    /// earlier in the same block cannot move the yardstick it is measured by.
+    function test_rebalance_measures_against_block_start_anchor() public {
+        _deepPool();
+        bytes32 pid = _deposit(-600, 600, 1e18);
+        vm.warp(block.timestamp + COOLDOWN);
+        _nextBlock();
+
+        // 2400 ticks: past the 2000 bound from the anchor, but only 1900 from the
+        // intra-block value the front-run itself produced.
+        _swapTo(-2400);
+
+        vm.prank(rebalancer);
+        vm.expectPartialRevert(AutopilotHook.PriceDeviation.selector);
+        hook.rebalance(pid, -3000, -1800, 0);
+    }
+
+    /// R-2(b): a pool that lost all its positions stops updating the reference.
+    /// The next depositor must get a fresh seed, not a fossil.
+    function test_reference_reseeded_when_pool_regains_a_position() public {
+        _deepPool();
+        bytes32 first = _deposit(-600, 600, 1e18);
+        hook.withdraw(first);
+
+        for (uint256 i = 0; i < 5; i++) {
+            _nextBlock();
+            _swapTo(-5000 - int24(int256(i)) * 60);
+        }
+        (, int24 spot,,) = manager.getSlot0(id);
+
+        bytes32 second = hook.deposit(key, -5400, -4800, 1e18, TickMath.minUsableTick(60), TickMath.maxUsableTick(60));
+        (int24 t,) = _ref();
+        assertEq(t, spot, "reseeded at current spot");
+
+        vm.warp(block.timestamp + COOLDOWN);
+        _nextBlock();
+        vm.prank(rebalancer);
+        hook.rebalance(second, -6000, -4800, 0); // a fossil would revert PriceDeviation here
+    }
+
+    /// R-2(c): after one large move on a pool that then goes quiet, nothing but
+    /// a swap moved the reference, so rebalancing stayed blocked indefinitely.
+    /// Poking gives it a bounded deadline.
+    function test_quiet_pool_unblocked_by_poke() public {
+        _deepPool();
+        bytes32 pid = _deposit(-600, 600, 1e18);
+        vm.warp(block.timestamp + COOLDOWN);
+
+        _nextBlock();
+        _swapTo(-3000); // reference follows only to -500
+        _nextBlock();
+
+        vm.prank(rebalancer);
+        vm.expectPartialRevert(AutopilotHook.PriceDeviation.selector);
+        hook.rebalance(pid, -3600, -2400, 0);
+
+        // No swaps from here on. Poke once per block.
+        for (uint256 i = 0; i < 3; i++) {
+            hook.pokePriceRef(key);
+            _nextBlock();
+        }
+
+        vm.prank(rebalancer);
+        hook.rebalance(pid, -3600, -2400, 0);
+    }
+
+    /// Poking is no faster than a swap: many pokes in one block, one step.
+    function test_poke_is_rate_limited_per_block() public {
+        _deepPool();
+        _deposit(-600, 600, 1e18);
+        _nextBlock();
+        _swapTo(-10000);
+        _nextBlock();
+
+        for (uint256 i = 0; i < 10; i++) {
+            hook.pokePriceRef(key);
+        }
+        (int24 t,) = _ref();
+        assertEq(t, -2 * hook.maxTickMovePerBlock(), "ten pokes in one block move one step");
+    }
+
+    function test_poke_is_a_noop_on_a_pool_without_positions() public {
+        hook.pokePriceRef(key);
+        (,,, bool seeded) = hook.priceRef(id);
+        assertFalse(seeded);
     }
 
     function test_renounce_ownership_disabled() public {
