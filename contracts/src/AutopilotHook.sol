@@ -25,6 +25,7 @@ import {IAggregatorV3} from "./interfaces/IAggregatorV3.sol";
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
@@ -46,6 +47,14 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
         uint128 liquidity;
         bool active;
         uint64 lastRebalanceAt;
+    }
+
+    /// @dev Tokens a rebalance freed but could not redeploy, held for the
+    ///      position as ERC-6909 claims on the PoolManager. They are folded into
+    ///      the next rebalance and paid out on withdraw.
+    struct Idle {
+        uint128 amount0;
+        uint128 amount1;
     }
 
     /// @dev `tick` follows spot but is clamped to `anchor ± maxTickMovePerBlock`,
@@ -119,6 +128,13 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
     mapping(bytes32 => int24) public boundLower;
     mapping(bytes32 => int24) public boundUpper;
     mapping(PoolId => uint256) public poolPositionCount;
+    /// @dev The swap inside a rebalance is bounded, so it can stop short and
+    ///      leave part of the position undeployable at the new range. Paying that
+    ///      part out to the owner rebuilt the position with a fraction of its
+    ///      capital while every guard passed. Reverting instead would hand any LP
+    ///      able to thin the pool a free way to block rebalances. So the remainder
+    ///      stays with the position here until a later rebalance can place it.
+    mapping(bytes32 => Idle) public idle;
     mapping(address => bool) public isRebalancer;
     /// @dev Manipulation-resistant price reference, one per pool. v4 ships no
     ///      oracle, so the hook keeps its own: the tick follows spot but may only
@@ -180,6 +196,8 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
     ///      as loose tokens. A bounded swap makes a partial fill the normal
     ///      outcome in a thin pool, and silence about it is how half a position
     ///      ends up sitting outside the position.
+    /// @dev The position's idle balance after a rebalance: what could not be
+    ///      redeployed at the new range and is held for the next one.
     event RebalanceResidual(bytes32 indexed positionId, uint256 amount0, uint256 amount1);
     event SequencerUptimeFeedSet(address feed);
     event PairAllowed(Currency indexed currency0, Currency indexed currency1, bool allowed);
@@ -425,7 +443,12 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
         uint64 readyAt = pos.lastRebalanceAt + minRebalanceInterval;
         if (block.timestamp < readyAt) revert RebalanceTooSoon(readyAt);
 
-        if (newTickLower == pos.tickLower && newTickUpper == pos.tickUpper) revert NoOpRebalance();
+        // Rebalancing onto the current range is how an idle balance gets placed,
+        // so it is only a no-op when there is nothing idle to place.
+        if (newTickLower == pos.tickLower && newTickUpper == pos.tickUpper) {
+            Idle memory held = idle[positionId];
+            if (held.amount0 == 0 && held.amount1 == 0) revert NoOpRebalance();
+        }
 
         _requireSequencerUp();
 
@@ -524,12 +547,23 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
             }),
             ""
         );
-        if (delta.amount0() > 0) {
-            cb.key.currency0.take(poolManager, cb.recipient, uint256(uint128(delta.amount0())), cb.asClaims);
-        }
-        if (delta.amount1() > 0) {
-            cb.key.currency1.take(poolManager, cb.recipient, uint256(uint128(delta.amount1())), cb.asClaims);
-        }
+        (uint256 held0, uint256 held1) = _releaseIdle(cb);
+        uint256 out0 = (delta.amount0() > 0 ? uint256(uint128(delta.amount0())) : 0) + held0;
+        uint256 out1 = (delta.amount1() > 0 ? uint256(uint128(delta.amount1())) : 0) + held1;
+        if (out0 > 0) cb.key.currency0.take(poolManager, cb.recipient, out0, cb.asClaims);
+        if (out1 > 0) cb.key.currency1.take(poolManager, cb.recipient, out1, cb.asClaims);
+    }
+
+    /// @dev Burns the position's held claims, crediting this unlock with them,
+    ///      and clears the record. The caller must spend or re-hold the credit.
+    function _releaseIdle(Callback memory cb) private returns (uint256 held0, uint256 held1) {
+        Idle memory held = idle[cb.positionId];
+        held0 = held.amount0;
+        held1 = held.amount1;
+        if (held0 == 0 && held1 == 0) return (0, 0);
+        delete idle[cb.positionId];
+        if (held0 > 0) poolManager.burn(address(this), cb.key.currency0.toId(), held0);
+        if (held1 > 0) poolManager.burn(address(this), cb.key.currency1.toId(), held1);
     }
 
     function _doRebalance(Callback memory cb) internal returns (uint128 newLiquidity) {
@@ -543,8 +577,9 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
             }),
             ""
         );
-        uint256 freed0 = removed.amount0() > 0 ? uint256(uint128(removed.amount0())) : 0;
-        uint256 freed1 = removed.amount1() > 0 ? uint256(uint128(removed.amount1())) : 0;
+        (uint256 held0, uint256 held1) = _releaseIdle(cb);
+        uint256 freed0 = (removed.amount0() > 0 ? uint256(uint128(removed.amount0())) : 0) + held0;
+        uint256 freed1 = (removed.amount1() > 0 ? uint256(uint128(removed.amount1())) : 0) + held1;
         if (freed0 == 0 && freed1 == 0) revert NothingFreed();
 
         // Value the holdings BEFORE the swap, at the price before the swap moves
@@ -591,22 +626,25 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
             ""
         );
 
-        // Whatever the ratio maths left over is dust; it goes back to the owner
-        // rather than accumulating in the hook.
-        BalanceDelta net = removed + swapped + added;
-        if (net.amount0() > 0 || net.amount1() > 0) {
-            emit RebalanceResidual(
-                cb.positionId,
-                net.amount0() > 0 ? uint256(uint128(net.amount0())) : 0,
-                net.amount1() > 0 ? uint256(uint128(net.amount1())) : 0
-            );
+        // Whatever could not be placed stays with the position as claims. `freed`
+        // already counts the released idle balance and the swap, so subtracting
+        // what the new range consumed is the whole remainder.
+        _holdIdle(cb, _sub(freed0, added.amount0()), _sub(freed1, added.amount1()));
+    }
+
+    function _holdIdle(Callback memory cb, uint256 left0, uint256 left1) private {
+        if (left0 > 0) poolManager.mint(address(this), cb.key.currency0.toId(), left0);
+        if (left1 > 0) poolManager.mint(address(this), cb.key.currency1.toId(), left1);
+        if (left0 > 0 || left1 > 0) {
+            idle[cb.positionId] = Idle(SafeCast.toUint128(left0), SafeCast.toUint128(left1));
+            emit RebalanceResidual(cb.positionId, left0, left1);
         }
-        if (net.amount0() > 0) {
-            cb.key.currency0.take(poolManager, cb.owner, uint256(uint128(net.amount0())), false);
-        }
-        if (net.amount1() > 0) {
-            cb.key.currency1.take(poolManager, cb.owner, uint256(uint128(net.amount1())), false);
-        }
+    }
+
+    /// @dev `base` less what an add-liquidity delta consumed (a negative delta).
+    function _sub(uint256 base, int128 consumed) private pure returns (uint256) {
+        if (consumed >= 0) return base + uint256(uint128(consumed));
+        return base - uint256(uint128(-consumed));
     }
 
     /// @dev Swaps the surplus side so the freed tokens roughly match the ratio
@@ -652,6 +690,46 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
         uint160 limit = _swapPriceLimit(sqrtPriceX96, sqrtA, sqrtB, zeroForOne);
         if (limit == 0) return BalanceDeltaLibrary.ZERO_DELTA;
 
+        BalanceDelta first = poolManager.swap(
+            cb.key,
+            SwapParams({zeroForOne: zeroForOne, amountSpecified: -int256(amountIn), sqrtPriceLimitX96: limit}),
+            ""
+        );
+        return first
+            + _correctOvershoot(
+            cb, [sqrtPriceX96, sqrtA, sqrtB], _add(have0, first.amount0()), _add(have1, first.amount1()), zeroForOne
+        );
+    }
+
+    /// @dev The first leg is sized at the pre-swap price, and its own impact moves
+    ///      price the way that makes the range want more of what was just sold, so
+    ///      it tends to overshoot (the fee pulls the other way). From a range edge
+    ///      it sells everything and leaves nothing for the side the range needs
+    ///      once price is inside, which computes to zero liquidity. One corrective
+    ///      leg, re-sized at the post-swap price, fixes an overshoot. It only runs
+    ///      in the reverse direction: it moves price back toward where it started,
+    ///      so it cannot widen the impact the first leg was bounded to. An
+    ///      undershoot is left alone and ends up in the idle balance.
+    /// @param prices [spot before the first leg, range lower, range upper].
+    function _correctOvershoot(
+        Callback memory cb,
+        uint160[3] memory prices,
+        uint256 have0,
+        uint256 have1,
+        bool firstZeroForOne
+    ) private returns (BalanceDelta) {
+        (uint160 origin, uint160 sqrtA, uint160 sqrtB) = (prices[0], prices[1], prices[2]);
+        (uint160 sqrtNow,,,) = poolManager.getSlot0(cb.key.toId());
+        if (sqrtNow <= sqrtA || sqrtNow >= sqrtB) return BalanceDeltaLibrary.ZERO_DELTA;
+
+        (bool zeroForOne, uint256 amountIn) = _straddleSwap(sqrtNow, sqrtA, sqrtB, cb.liquidity, have0, have1);
+        if (amountIn == 0 || zeroForOne == firstZeroForOne) return BalanceDeltaLibrary.ZERO_DELTA;
+
+        uint160 limit = _swapPriceLimit(sqrtNow, sqrtA, sqrtB, zeroForOne);
+        if (limit == 0) return BalanceDeltaLibrary.ZERO_DELTA;
+        // Never back past where the rebalance started.
+        if (zeroForOne ? limit < origin : limit > origin) limit = origin;
+        if (zeroForOne ? limit >= sqrtNow : limit <= sqrtNow) return BalanceDeltaLibrary.ZERO_DELTA;
         return poolManager.swap(
             cb.key,
             SwapParams({zeroForOne: zeroForOne, amountSpecified: -int256(amountIn), sqrtPriceLimitX96: limit}),

@@ -260,6 +260,92 @@ contract AutopilotHookTest is Test, Deployers {
         assertGt(liq, 0);
     }
 
+    // REG-2. A one-sided target in a pool with no other depth: the bounded swap
+    // cannot fill, so half the position cannot be placed. It used to be paid out
+    // to the owner as loose tokens while the rebalance reported success.
+    function test_undeployable_remainder_stays_with_position() public {
+        MockERC20 t0 = MockERC20(Currency.unwrap(currency0));
+        MockERC20 t1 = MockERC20(Currency.unwrap(currency1));
+        bytes32 pid = _deposit(-600, 600, 1e18);
+        uint256 b0 = t0.balanceOf(address(this));
+        uint256 b1 = t1.balanceOf(address(this));
+
+        vm.warp(block.timestamp + COOLDOWN);
+        vm.prank(rebalancer);
+        hook.rebalance(pid, 600, 1200, 0);
+
+        assertEq(t0.balanceOf(address(this)), b0, "nothing paid out mid-rebalance");
+        assertEq(t1.balanceOf(address(this)), b1, "nothing paid out mid-rebalance");
+
+        (uint128 held0, uint128 held1) = hook.idle(pid);
+        assertGt(uint256(held0) + held1, 0, "the undeployable part is recorded");
+        assertEq(manager.balanceOf(address(hook), currency0.toId()), held0, "backed 1:1 by claims");
+        assertEq(manager.balanceOf(address(hook), currency1.toId()), held1, "backed 1:1 by claims");
+    }
+
+    function test_withdraw_pays_out_idle_balance() public {
+        MockERC20 t0 = MockERC20(Currency.unwrap(currency0));
+        MockERC20 t1 = MockERC20(Currency.unwrap(currency1));
+        bytes32 pid = _deposit(-600, 600, 1e18);
+        vm.warp(block.timestamp + COOLDOWN);
+        vm.prank(rebalancer);
+        hook.rebalance(pid, 600, 1200, 0);
+        (uint128 held0, uint128 held1) = hook.idle(pid);
+
+        uint256 b0 = t0.balanceOf(address(this));
+        uint256 b1 = t1.balanceOf(address(this));
+        hook.withdraw(pid);
+
+        // The rebuilt range sits above spot, so its liquidity comes back as token0
+        // alone; every token1 the owner receives is the idle balance.
+        assertEq(t1.balanceOf(address(this)) - b1, held1, "idle token1 returned in full");
+        assertGe(t0.balanceOf(address(this)) - b0, held0, "idle token0 returned with the liquidity");
+        (uint128 after0, uint128 after1) = hook.idle(pid);
+        assertEq(uint256(after0) + after1, 0, "idle record cleared");
+        assertEq(manager.balanceOf(address(hook), currency0.toId()), 0, "no claims left behind");
+        assertEq(manager.balanceOf(address(hook), currency1.toId()), 0, "no claims left behind");
+    }
+
+    function test_idle_balance_redeployed_when_depth_returns() public {
+        bytes32 pid = _deposit(-600, 600, 1e18);
+        vm.warp(block.timestamp + COOLDOWN);
+        vm.prank(rebalancer);
+        hook.rebalance(pid, 600, 1200, 0);
+        (uint128 h0, uint128 h1) = hook.idle(pid);
+        (,,,, uint128 liqBefore,,) = hook.positions(pid);
+        (uint160 sqrtP,,,) = manager.getSlot0(id);
+        uint256 idleBefore = _value(h0, h1, sqrtP);
+
+        // Depth arrives; the same range is now a valid target, because there is
+        // something idle to place in it.
+        modifyLiquidityRouter.modifyLiquidity(
+            key, ModifyLiquidityParams({tickLower: -60000, tickUpper: 60000, liquidityDelta: 1e20, salt: 0}), ""
+        );
+        _nextBlock();
+        vm.warp(block.timestamp + COOLDOWN);
+        vm.prank(rebalancer);
+        hook.rebalance(pid, 600, 1200, 0);
+
+        (,,,, uint128 liqAfter,,) = hook.positions(pid);
+        (h0, h1) = hook.idle(pid);
+        (sqrtP,,,) = manager.getSlot0(id);
+        assertGt(liqAfter, liqBefore, "idle capital is back in the position");
+        assertLt(_value(h0, h1, sqrtP) * 20, idleBefore, "at most 5% of it still idle");
+    }
+
+    function test_same_range_rebalance_is_still_a_noop_without_idle() public {
+        bytes32 pid = _deposit(-600, 600, 1e18);
+        vm.warp(block.timestamp + COOLDOWN);
+        vm.prank(rebalancer);
+        vm.expectRevert(AutopilotHook.NoOpRebalance.selector);
+        hook.rebalance(pid, -600, 600, 0);
+    }
+
+    function _value(uint256 a0, uint256 a1, uint160 sqrtP) internal pure returns (uint256) {
+        uint256 p = uint256(sqrtP) * sqrtP >> 96;
+        return (a0 * p >> 96) + a1;
+    }
+
     function test_deposit_rejects_foreign_hook() public {
         PoolKey memory foreign = PoolKey(currency0, currency1, 3000, 60, IHooks(address(0xDEAD)));
         vm.expectRevert(AutopilotHook.HookMismatch.selector);
