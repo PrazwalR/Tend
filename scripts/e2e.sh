@@ -52,6 +52,10 @@ trap cleanup EXIT
 fail() { echo "FAIL: $*"; echo "--- daemon ---"; tail -40 "$DAEMON_LOG" 2>/dev/null || true; exit 1; }
 step() { echo; echo "=== $* ==="; }
 
+# The heartbeat is pushed out of reach on purpose. It only fires after a quiet
+# spell, which a busy mainnet pool never has, so nothing that has to work there
+# may depend on it; with it disabled, stage 7's recovery proves the sweep runs
+# on its own timer.
 start_daemon() {
   RPC_BASE="$RPC" RPC_WS_BASE="$WS" \
   AUTOPILOT_HOOK_ADDRESS="$HOOK" \
@@ -60,7 +64,8 @@ start_daemon() {
   RUST_LOG=lpa=debug \
   LPA_MIN_TICKS=6 \
   LPA_AUTO_INTERVAL_SECS=1 \
-  LPA_WS_HEARTBEAT_SECS=5 \
+  LPA_WS_HEARTBEAT_SECS=100000 \
+  LPA_SWEEP_SECS=5 \
   LPA_VOLUME_USD_PER_BLOCK=5000000 \
   DEFAULT_MAX_GAS_USD=500 \
     ./target/debug/lpa --log-format json watch --chain base --execute >>"$DAEMON_LOG" 2>&1 &
@@ -217,12 +222,26 @@ step "stage 7 — a position stuck behind the price guard on a quiet pool recove
 # One large move in a single block, then no more swaps. The price reference may
 # follow only one capped step per block, so the next rebalance is refused with
 # PriceDeviation — and since nothing else will ever swap here, only the daemon's
-# heartbeat sweep and its pokes can move the reference back within tolerance.
-MARK=$(wc -l < "$DAEMON_LOG")
+# sweep and its pokes can move the reference back within tolerance.
+#
+# Let the daemon finish following stage 4's price walk first. Its sweep keeps
+# re-rebalancing positions that fell out of range again, and a rebalance landing
+# after the mark would both read as the recovery and restart the cooldown.
+SETTLE_DEADLINE=$((SECONDS + 180))
+while (( SECONDS < SETTLE_DEADLINE )); do
+  L0=$(wc -l < "$DAEMON_LOG")
+  # Anvil only mines on a transaction, so with no swaps block.timestamp stands
+  # still and a cooldown never elapses. A live chain keeps producing blocks.
+  cast rpc evm_mine --rpc-url "$RPC" >/dev/null 2>&1 || true
+  sleep 15
+  tail -n +"$((L0 + 1))" "$DAEMON_LOG" | grep -qE "intent queued|auto-rebalanced on-chain" || break
+done
+(( SECONDS < SETTLE_DEADLINE )) || fail "daemon never settled after stage 6"
 # Past the cooldown FIRST: the contract checks it before the price guard, and a
 # RebalanceTooSoon would otherwise mask the condition under test.
 cast rpc evm_increaseTime 120 --rpc-url "$RPC" >/dev/null 2>&1 || true
 cast rpc evm_mine --rpc-url "$RPC" >/dev/null 2>&1 || true
+MARK=$(wc -l < "$DAEMON_LOG")
 swap true -3e20
 echo "large one-block move done; no further swaps"
 

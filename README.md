@@ -39,9 +39,12 @@ process, wired by in-process channels. The only network surface is `lpa serve`
   the hook's position events; SQLite tracks positions and per-block tick history.
   A per-chain watermark plus an `eth_getLogs` backfill closes the gap after a
   restart; reorged position events resync from the hook's own storage. In
-  auto-execute mode a heartbeat sweep retries every out-of-range position, and a
+  auto-execute mode a periodic sweep retries every out-of-range position, and a
   rebalance refused because spot has run ahead of the hook's price reference
   triggers a `pokePriceRef` to walk the reference back within tolerance.
+  Whatever a rebalance's bounded swap could not place stays with the position
+  as an idle balance in the hook; the sweep places it back with a same-range
+  rebalance once it is worth a transaction, and `withdraw` pays it out.
 - **Strategy** — concentrated-LP impermanent-loss, block-sampled Bollinger
   bands, and an expected-value gate
   (`E[fee gain] + E[IL avoided] − gas − slippage − MEV > 0`). Expected IL is

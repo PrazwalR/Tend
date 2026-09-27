@@ -10,7 +10,7 @@ use alloy::sol_types::SolEvent;
 use anyhow::Result;
 use dashmap::DashMap;
 use futures_util::StreamExt;
-use tokio::time::{sleep, timeout};
+use tokio::time::{interval, sleep, timeout, MissedTickBehavior};
 use tracing::{debug, error, info, warn};
 
 use tokio::sync::mpsc;
@@ -70,6 +70,11 @@ const PRUNE_EVERY: u32 = 500;
 const INITIAL_GAS_PRICE_WEI: u64 = 5_000_000_000;
 /// Default seconds of silence before the WS heartbeat health-check runs.
 const DEFAULT_HEARTBEAT_SECS: u64 = 30;
+/// Default seconds between sweeps for stuck or under-deployed positions.
+const DEFAULT_SWEEP_SECS: u64 = 30;
+/// Idle share of a position, in bps, worth a transaction to place. Below it the
+/// idle balance waits for the next rebalance, which folds it in for free.
+const DEFAULT_IDLE_REDEPLOY_BPS: f64 = 100.0;
 /// Timeout for the heartbeat block-number probe.
 const HEALTH_PROBE_TIMEOUT_SECS: u64 = 5;
 /// A connection alive this long resets the reconnect backoff.
@@ -229,9 +234,24 @@ async fn watch_once(
             .and_then(|s| s.parse().ok())
             .unwrap_or(DEFAULT_HEARTBEAT_SECS),
     );
+    // A fixed cadence, unlike the heartbeat: the heartbeat only fires after
+    // silence, so on a pool with a swap every few seconds it never fires at all
+    // and anything hung off it would never run where it matters most.
+    let mut sweep = interval(Duration::from_secs(
+        std::env::var("LPA_SWEEP_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&s: &u64| s > 0)
+            .unwrap_or(DEFAULT_SWEEP_SECS),
+    ));
+    sweep.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut since_prune = 0u32;
     loop {
         tokio::select! {
+            _ = sweep.tick() => {
+                sweep_out_of_range(ctx).await;
+                sweep_idle(ctx).await;
+            }
             maybe_log = stream.next() => match maybe_log {
                 Some(log) => {
                     let block = log.block_number;
@@ -264,7 +284,6 @@ async fn watch_once(
                         if let Err(e) = ctx.tracker.set_last_indexed_block(&ctx.chain_key(), head) {
                             warn!(error = %e, "watermark update failed");
                         }
-                        sweep_out_of_range(ctx).await;
                     }
                     _ => {
                         warn!("WS heartbeat health-check failed; forcing reconnect");
@@ -588,6 +607,127 @@ async fn sweep_out_of_range(ctx: &Ctx<'_>) {
     }
 }
 
+/// Queues a same-range rebalance for any in-range position holding a material
+/// idle balance: what an earlier rebalance's bounded swap could not place. The
+/// hook accepts an otherwise no-op range precisely when something is idle.
+async fn sweep_idle(ctx: &Ctx<'_>) {
+    let (Some(tx), Some(reader)) = (ctx.intent_tx, ctx.reader) else {
+        return;
+    };
+    let threshold_bps = std::env::var("LPA_IDLE_REDEPLOY_BPS")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(DEFAULT_IDLE_REDEPLOY_BPS);
+    let positions = match ctx.tracker.in_range_positions() {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(error = %e, "idle sweep query failed");
+            return;
+        }
+    };
+    for p in positions {
+        let (Ok(pool_id), Ok(position_id)) =
+            (p.pool_id.parse::<B256>(), p.position_id.parse::<B256>())
+        else {
+            continue;
+        };
+        let (idle0, idle1) = match reader.idle_balance(position_id).await {
+            Ok(v) => v,
+            Err(e) => {
+                debug!(position_id = %p.position_id, error = %e, "idle balance read failed");
+                continue;
+            }
+        };
+        if idle0 == 0 && idle1 == 0 {
+            continue;
+        }
+        let Ok(snap) = reader
+            .position_snapshot(pool_id, position_id, p.tick_lower, p.tick_upper)
+            .await
+        else {
+            continue;
+        };
+        let to_f64 = |v: alloy::primitives::U256| -> f64 { format!("{v}").parse().unwrap_or(0.0) };
+        let share = idle_share_bps(
+            (idle0 as f64, idle1 as f64),
+            (to_f64(snap.amount0), to_f64(snap.amount1)),
+            snap.current_tick,
+        );
+        if share < threshold_bps {
+            continue;
+        }
+        let allowed = idle_gate()
+            .lock()
+            .unwrap()
+            .allow(&p.position_id, share, Instant::now());
+        if !allowed {
+            continue;
+        }
+        let intent = RebalanceIntent {
+            position_id: p.position_id.clone(),
+            new_lower: p.tick_lower,
+            new_upper: p.tick_upper,
+        };
+        match tx.try_send(intent) {
+            Ok(()) => {
+                info!(position_id = %p.position_id, idle_bps = share, "idle balance redeploy queued")
+            }
+            Err(_) => {
+                warn!(position_id = %p.position_id, "auto-execute queue full; dropped idle redeploy")
+            }
+        }
+    }
+}
+
+/// Before the first redeploy of a position, and after each one that made progress.
+const IDLE_REDEPLOY_BASE: Duration = Duration::from_secs(600);
+const IDLE_REDEPLOY_MAX: Duration = Duration::from_secs(86_400);
+
+fn idle_gate() -> &'static std::sync::Mutex<RedeployGate> {
+    static GATE: std::sync::OnceLock<std::sync::Mutex<RedeployGate>> = std::sync::OnceLock::new();
+    GATE.get_or_init(Default::default)
+}
+
+/// Rate-limits idle redeploys per position. In a pool with no other depth the
+/// bounded swap fills nothing, the idle share never falls, and an unconditional
+/// retry would pay for a no-progress rebalance on every sweep forever. So each
+/// retry that finds the share not at least 10% lower doubles the wait. The base
+/// wait outlasts the hook cooldown and the executor throttle, so by the next
+/// check the previous attempt has had its chance to land.
+#[derive(Default)]
+pub(crate) struct RedeployGate {
+    entries: std::collections::HashMap<String, (f64, Instant, u32)>,
+}
+
+impl RedeployGate {
+    pub(crate) fn allow(&mut self, position_id: &str, share_bps: f64, now: Instant) -> bool {
+        let strikes = match self.entries.get(position_id) {
+            None => 0,
+            Some(&(_, not_before, _)) if now < not_before => return false,
+            Some(&(prev, _, strikes)) if share_bps > prev * 0.9 => strikes + 1,
+            Some(_) => 0,
+        };
+        let wait = IDLE_REDEPLOY_BASE
+            .saturating_mul(1u32 << strikes.min(16))
+            .min(IDLE_REDEPLOY_MAX);
+        self.entries
+            .insert(position_id.to_string(), (share_bps, now + wait, strikes));
+        true
+    }
+}
+
+/// Idle value as a share of everything the position owns, in bps, both sides
+/// valued in token1 at the current tick.
+pub(crate) fn idle_share_bps(idle: (f64, f64), deployed: (f64, f64), tick: i32) -> f64 {
+    let price = 1.0001f64.powi(tick);
+    let idle_value = idle.0 * price + idle.1;
+    let total = idle_value + deployed.0 * price + deployed.1;
+    if !(total.is_finite() && total > 0.0) {
+        return 0.0;
+    }
+    idle_value / total * 10_000.0
+}
+
 async fn propose_rebalance(ctx: &Ctx<'_>, pool_hex: &str, tick: i32, position_id: &str) {
     let Ok(Some(pos)) = ctx.tracker.get_position(position_id) else {
         return;
@@ -649,6 +789,56 @@ async fn propose_rebalance(ctx: &Ctx<'_>, pool_hex: &str, tick: i32, position_id
 #[cfg(test)]
 mod tests {
     use super::{handle, next_backoff, Ctx, PositionClosed, PositionOpened, Rebalanced, Swap};
+    use super::{idle_share_bps, RedeployGate, IDLE_REDEPLOY_BASE, IDLE_REDEPLOY_MAX};
+    use std::time::Instant;
+
+    #[test]
+    fn idle_share_values_both_sides_at_the_current_tick() {
+        // tick 0: price 1, so the share is a plain ratio of token counts.
+        assert!((idle_share_bps((50.0, 50.0), (450.0, 450.0), 0) - 1000.0).abs() < 1e-6);
+        assert_eq!(idle_share_bps((0.0, 0.0), (1.0, 1.0), 0), 0.0);
+        assert_eq!(idle_share_bps((0.0, 0.0), (0.0, 0.0), 0), 0.0);
+        // At a higher price token0 is worth more, so idle token0 weighs more.
+        assert!(
+            idle_share_bps((10.0, 0.0), (0.0, 100.0), 6932)
+                > idle_share_bps((10.0, 0.0), (0.0, 100.0), 0)
+        );
+    }
+
+    #[test]
+    fn redeploy_gate_backs_off_while_no_progress_is_made() {
+        let mut g = RedeployGate::default();
+        let t0 = Instant::now();
+        assert!(g.allow("p", 5000.0, t0), "first attempt goes through");
+        assert!(
+            !g.allow("p", 5000.0, t0 + IDLE_REDEPLOY_BASE / 2),
+            "throttled inside the window"
+        );
+
+        // No progress: each retry waits twice as long as the one before.
+        let t1 = t0 + IDLE_REDEPLOY_BASE;
+        assert!(g.allow("p", 5000.0, t1));
+        assert!(!g.allow(
+            "p",
+            5000.0,
+            t1 + IDLE_REDEPLOY_BASE * 2 - std::time::Duration::from_secs(1)
+        ));
+        let t2 = t1 + IDLE_REDEPLOY_BASE * 2;
+        assert!(g.allow("p", 5000.0, t2));
+
+        // Progress resets the wait to the base.
+        let t3 = t2 + IDLE_REDEPLOY_BASE * 4;
+        assert!(g.allow("p", 1000.0, t3));
+        assert!(g.allow("p", 100.0, t3 + IDLE_REDEPLOY_BASE));
+
+        // The wait is capped.
+        let mut g = RedeployGate::default();
+        let mut t = Instant::now();
+        for _ in 0..40 {
+            assert!(g.allow("q", 5000.0, t));
+            t += IDLE_REDEPLOY_MAX;
+        }
+    }
     use crate::position::tracker::{PositionRow, Tracker};
     use crate::strategy::{default_config, EstimateCostModel, StrategyEngine};
     use alloy::primitives::aliases::{I24, U160, U24};

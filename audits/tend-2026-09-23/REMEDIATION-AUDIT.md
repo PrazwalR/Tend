@@ -66,6 +66,8 @@ than extra fields on `Rebalanced`, so the indexer's existing signature keeps wor
 **The underlying behaviour is unchanged** — the value still lands outside the position. This
 is mitigation by visibility, not a fix, and is recorded as open below.
 
+**Fixed in a follow-up — see §8.**
+
 ---
 
 ## 2. The false claim
@@ -142,11 +144,7 @@ Re-verified rather than assumed:
 
 Recorded rather than fixed, with the reason.
 
-- **REG-2 (residual strand)** — now visible via `RebalanceResidual`, but the value still
-  lands outside the position. Properly fixing it means either shifting the redeposit range
-  to what is actually deployable at the post-swap price, or reverting when the undeployed
-  fraction exceeds a threshold. Both are behavioural changes that deserve their own design
-  pass rather than being bolted on during a remediation round.
+- **REG-2 (residual strand)** — fixed in a follow-up; see §8.
 - **R-2 / R-3 / A-4 — fixed in a follow-up redesign; see §7.** One gap remains, and it
   is in the daemon, not the contract — described there.
 - **R-6 (boundary equality)** — LOW. At `spot == sqrtA` / `spot == sqrtB` the limit selects
@@ -234,8 +232,11 @@ because it never had a transition.
 
 Fixed in the daemon:
 
-- **Heartbeat sweep** over every out-of-range position (auto-execute mode only), so a
-  refused rebalance is retried until it succeeds or the strategy declines it.
+- **Periodic sweep** over every out-of-range position (auto-execute mode only), so a
+  refused rebalance is retried until it succeeds or the strategy declines it. First
+  shipped hung off the WS heartbeat, which only fires after 30 s of silence, so on a
+  pool that swaps more often than that it never ran. It now has its own fixed timer
+  (`LPA_SWEEP_SECS`, default 30); see §8.
 - **Refused preflights no longer consume the per-position throttle.** A failed `eth_call`
   costs nothing; only a sent transaction starts the interval. Previously one refusal
   suppressed retries for five minutes.
@@ -247,13 +248,64 @@ Proven end to end: E2E stage 7 makes one large one-block move on a forked Base p
 then stops swapping. Result — 15 preflight refusals citing `PriceDeviation`, 8 pokes, then
 a successful rebalance, with no further swaps.
 
-**The old E2E was passing because of the bug.** Its stage 6 used to land on `[-900, -720]`:
-the position rebalanced once, exited that range again as price kept falling, had its next
-attempt refused by the cooldown, and was abandoned. The assertion only checked that the
-range moved, and it moved exactly once. With the sweep the position follows price across
-cooldown windows, landing at `[-4680, -1260]`.
+**The old E2E was passing because of the bug.** In stage 4 the position rebalanced once,
+left that range again as price kept falling, had its next attempt refused by the cooldown,
+and was abandoned. Stage 6 only checked that the range moved, and it had moved once. With
+the sweep the position follows price across cooldown windows. Stage 6 reads the range at
+one instant while that is still happening, so the range it prints depends on timing
+(`[-900, -720]` and `[-4680, -1260]` have both been observed). Its invariants, that the
+range moved and that the daemon's DB agrees with the chain, hold either way.
 
 **Behaviour change to note.** Positions opened *deliberately* out of range — a range order
 placed above or below spot — are now rebalanced toward spot like any other out-of-range
 position, where before they were left alone by accident. The opt-out already exists:
 deposit with `rebalancer = AUTOMATION_OFF`, or call `setPositionRebalancer` afterwards.
+
+## 8. REG-2 fixed: the undeployable remainder stays with the position
+
+The two options recorded in §5 were both wrong on inspection:
+
+- **Revert above a residual threshold.** Measured first: ordinary rebalances leave
+  3–28 bps behind, and the one-sided and thin-pool shapes leave 50–96%. A threshold between
+  those reverts exactly the thin-pool case, which is **REG-1 again**: any LP able to thin
+  the pool for a block could block rebalances for free.
+  `test_liquidity_pull_does_not_brick_an_out_of_range_rebalance` fails under it.
+- **Shift the range to what is deployable.** That substitutes the contract's choice of
+  range for the rebalancer's, and still leaves the remainder of an unfillable swap.
+
+**What shipped instead.** The remainder is never paid out mid-rebalance. It is held for the
+position as ERC-6909 claims on the PoolManager (`idle[positionId]`), backed 1:1 by the
+hook's claim balance. The next rebalance burns the claims and folds them into the freed
+amounts, and `withdraw` pays them out. A rebalance onto the position's *current* range,
+which is otherwise `NoOpRebalance`, is accepted when something is idle, because that is how
+an idle balance gets placed. `RebalanceResidual` now reports the idle balance after the
+rebalance.
+
+**A sizing flaw it exposed.** The re-ratio swap is sized at the pre-swap price. Its own impact
+moves price the way that makes the range want more of what was just sold, so it tends to
+overshoot. At the extreme, from spot exactly on a range edge, it sold everything, price moved
+inside, and the side the range now needed was empty: `ZeroLiquidity`. A second leg,
+re-sized at the post-swap price, now corrects an overshoot. It runs only in the reverse
+direction and is clamped at the starting price, so it cannot widen the impact bound. For a
+position whose price has left its range, the residual went from **28 bps to 0.04 bps**. The
+other measured shapes are unchanged at 3–9 bps: they undershoot, because of the fee, and
+the remainder goes to the idle balance.
+
+**Daemon.** A sweep reads `idle()` for in-range positions and queues a same-range rebalance
+when the idle share is at least `LPA_IDLE_REDEPLOY_BPS` (default 100). In a pool with no
+other depth a redeploy fills nothing and would repeat forever, so each retry that finds the
+share not at least 10% lower doubles its wait (base 10 min, capped at a day).
+
+**Verified.**
+- `test_undeployable_remainder_stays_with_position`: the owner's balances are unchanged,
+  and the idle record equals the hook's claim balance.
+- `test_withdraw_pays_out_idle_balance`: all idle funds are returned and no claims are left.
+- `test_idle_balance_redeployed_when_depth_returns`: liquidity rises and less than 5% stays
+  idle. It fails with `ZeroLiquidity` if the corrective leg is removed.
+- `test_same_range_rebalance_is_still_a_noop_without_idle`.
+- The E2E now runs with the WS heartbeat disabled, so stage 7's recovery depends only on the
+  sweep's own timer.
+
+**Not exercised end to end.** No E2E stage produces a material idle balance, so the
+redeploy sweep is covered only by unit tests of its threshold and backoff.
+

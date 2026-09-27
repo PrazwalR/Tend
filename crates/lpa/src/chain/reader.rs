@@ -41,6 +41,7 @@ sol! {
             bool active,
             uint64 lastRebalanceAt
         );
+        function idle(bytes32 positionId) external view returns (uint128 amount0, uint128 amount1);
     }
 }
 
@@ -161,6 +162,14 @@ impl ChainReader {
             liquidity: p.liquidity,
             active: p.active,
         }))
+    }
+
+    /// Tokens a rebalance could not place, held by the hook for the position
+    /// until the next rebalance or withdraw.
+    pub async fn idle_balance(&self, position_id: B256) -> Result<(u128, u128)> {
+        let hook = IAutopilotHookRead::new(self.hook, &self.provider);
+        let r = hook.idle(position_id).call().await?;
+        Ok((r.amount0, r.amount1))
     }
 }
 

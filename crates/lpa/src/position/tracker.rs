@@ -174,12 +174,22 @@ impl Tracker {
     /// this set a single failed attempt would leave a position stranded until
     /// price re-entered its range and left again.
     pub fn out_of_range_positions(&self) -> Result<Vec<PositionRow>> {
+        self.positions_with_range_state(false)
+    }
+
+    /// In-range positions with an observed tick: the candidates for placing an
+    /// idle balance back into the range they already hold.
+    pub fn in_range_positions(&self) -> Result<Vec<PositionRow>> {
+        self.positions_with_range_state(true)
+    }
+
+    fn positions_with_range_state(&self, in_range: bool) -> Result<Vec<PositionRow>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT position_id, owner, pool_id, chain_id, tick_lower, tick_upper, current_tick, in_range, entry_tick, fee, tick_spacing
-             FROM positions WHERE in_range = 0 AND current_tick IS NOT NULL",
+             FROM positions WHERE in_range = ?1 AND current_tick IS NOT NULL",
         )?;
-        let rows = stmt.query_map([], row_to_position)?;
+        let rows = stmt.query_map(params![in_range], row_to_position)?;
         let mut out = Vec::new();
         for r in rows {
             out.push(r?);
@@ -499,6 +509,14 @@ mod tests {
             .map(|p| p.position_id)
             .collect();
         assert_eq!(ids, vec!["0xout".to_string()]);
+
+        let ids: Vec<String> = t
+            .in_range_positions()
+            .unwrap()
+            .into_iter()
+            .map(|p| p.position_id)
+            .collect();
+        assert_eq!(ids, vec!["0xin".to_string()]);
     }
 
     #[test]
