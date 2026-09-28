@@ -72,6 +72,8 @@ const INITIAL_GAS_PRICE_WEI: u64 = 5_000_000_000;
 const DEFAULT_HEARTBEAT_SECS: u64 = 30;
 /// Default seconds between sweeps for stuck or under-deployed positions.
 const DEFAULT_SWEEP_SECS: u64 = 30;
+/// Upper bound on one sweep pass; see the watch loop.
+const SWEEP_TIMEOUT: Duration = Duration::from_secs(20);
 /// Idle share of a position, in bps, worth a transaction to place. Below it the
 /// idle balance waits for the next rebalance, which folds it in for free.
 const DEFAULT_IDLE_REDEPLOY_BPS: f64 = 100.0;
@@ -249,8 +251,17 @@ async fn watch_once(
     loop {
         tokio::select! {
             _ = sweep.tick() => {
-                sweep_out_of_range(ctx).await;
-                sweep_idle(ctx).await;
+                // Inline in the watch loop, so a hung RPC here would also stop
+                // log processing; bound it and let the next tick try again.
+                let started = Instant::now();
+                let pass = async {
+                    sweep_out_of_range(ctx).await;
+                    sweep_idle(ctx).await;
+                };
+                match timeout(SWEEP_TIMEOUT, pass).await {
+                    Ok(()) => debug!(elapsed_ms = started.elapsed().as_millis() as u64, "sweep pass done"),
+                    Err(_) => warn!(timeout_secs = SWEEP_TIMEOUT.as_secs(), "sweep pass timed out; abandoned until next tick"),
+                }
             }
             maybe_log = stream.next() => match maybe_log {
                 Some(log) => {
@@ -639,6 +650,7 @@ async fn sweep_idle(ctx: &Ctx<'_>) {
             }
         };
         if idle0 == 0 && idle1 == 0 {
+            idle_gate().lock().unwrap().forget(&p.position_id);
             continue;
         }
         let Ok(snap) = reader
@@ -654,12 +666,15 @@ async fn sweep_idle(ctx: &Ctx<'_>) {
             snap.current_tick,
         );
         if share < threshold_bps {
+            idle_gate().lock().unwrap().forget(&p.position_id);
             continue;
         }
-        let allowed = idle_gate()
-            .lock()
-            .unwrap()
-            .allow(&p.position_id, share, Instant::now());
+        let allowed = idle_gate().lock().unwrap().allow(
+            &p.position_id,
+            share,
+            Instant::now(),
+            redeploy_wait(),
+        );
         if !allowed {
             continue;
         }
@@ -679,9 +694,19 @@ async fn sweep_idle(ctx: &Ctx<'_>) {
     }
 }
 
-/// Before the first redeploy of a position, and after each one that made progress.
+/// Wait after first seeing an idle balance, and after each redeploy that made
+/// progress. It must outlast the hook's cooldown: idle balances appear only as
+/// the result of a rebalance, so an immediate attempt would always be refused.
 const IDLE_REDEPLOY_BASE: Duration = Duration::from_secs(600);
 const IDLE_REDEPLOY_MAX: Duration = Duration::from_secs(86_400);
+
+fn redeploy_wait() -> Duration {
+    std::env::var("LPA_IDLE_REDEPLOY_WAIT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(IDLE_REDEPLOY_BASE)
+}
 
 fn idle_gate() -> &'static std::sync::Mutex<RedeployGate> {
     static GATE: std::sync::OnceLock<std::sync::Mutex<RedeployGate>> = std::sync::OnceLock::new();
@@ -691,28 +716,46 @@ fn idle_gate() -> &'static std::sync::Mutex<RedeployGate> {
 /// Rate-limits idle redeploys per position. In a pool with no other depth the
 /// bounded swap fills nothing, the idle share never falls, and an unconditional
 /// retry would pay for a no-progress rebalance on every sweep forever. So each
-/// retry that finds the share not at least 10% lower doubles the wait. The base
-/// wait outlasts the hook cooldown and the executor throttle, so by the next
-/// check the previous attempt has had its chance to land.
+/// retry that finds the share not at least 10% lower than at the previous
+/// attempt doubles the wait. The first sighting only starts the clock.
 #[derive(Default)]
 pub(crate) struct RedeployGate {
-    entries: std::collections::HashMap<String, (f64, Instant, u32)>,
+    /// Share at the last attempt (`None` before any), earliest next attempt,
+    /// consecutive attempts without progress.
+    entries: std::collections::HashMap<String, (Option<f64>, Instant, u32)>,
 }
 
 impl RedeployGate {
-    pub(crate) fn allow(&mut self, position_id: &str, share_bps: f64, now: Instant) -> bool {
+    pub(crate) fn allow(
+        &mut self,
+        position_id: &str,
+        share_bps: f64,
+        now: Instant,
+        base: Duration,
+    ) -> bool {
         let strikes = match self.entries.get(position_id) {
-            None => 0,
+            None => {
+                self.entries
+                    .insert(position_id.to_string(), (None, now + base, 0));
+                return false;
+            }
             Some(&(_, not_before, _)) if now < not_before => return false,
-            Some(&(prev, _, strikes)) if share_bps > prev * 0.9 => strikes + 1,
+            Some(&(Some(prev), _, strikes)) if share_bps > prev * 0.9 => strikes + 1,
             Some(_) => 0,
         };
-        let wait = IDLE_REDEPLOY_BASE
+        let wait = base
             .saturating_mul(1u32 << strikes.min(16))
             .min(IDLE_REDEPLOY_MAX);
-        self.entries
-            .insert(position_id.to_string(), (share_bps, now + wait, strikes));
+        self.entries.insert(
+            position_id.to_string(),
+            (Some(share_bps), now + wait, strikes),
+        );
         true
+    }
+
+    /// Nothing material is idle any more; a later balance starts a fresh clock.
+    pub(crate) fn forget(&mut self, position_id: &str) {
+        self.entries.remove(position_id);
     }
 }
 
@@ -807,36 +850,51 @@ mod tests {
 
     #[test]
     fn redeploy_gate_backs_off_while_no_progress_is_made() {
+        let base = IDLE_REDEPLOY_BASE;
         let mut g = RedeployGate::default();
         let t0 = Instant::now();
-        assert!(g.allow("p", 5000.0, t0), "first attempt goes through");
         assert!(
-            !g.allow("p", 5000.0, t0 + IDLE_REDEPLOY_BASE / 2),
-            "throttled inside the window"
+            !g.allow("p", 5000.0, t0, base),
+            "first sighting only starts the clock"
+        );
+        assert!(
+            !g.allow("p", 5000.0, t0 + base / 2, base),
+            "still inside the cooldown-covering wait"
+        );
+        let t1 = t0 + base;
+        assert!(
+            g.allow("p", 5000.0, t1, base),
+            "first attempt once the wait is over"
         );
 
-        // No progress: each retry waits twice as long as the one before.
-        let t1 = t0 + IDLE_REDEPLOY_BASE;
-        assert!(g.allow("p", 5000.0, t1));
+        // No progress since that attempt: the next wait doubles.
+        let t2 = t1 + base;
+        assert!(g.allow("p", 5000.0, t2, base));
         assert!(!g.allow(
             "p",
             5000.0,
-            t1 + IDLE_REDEPLOY_BASE * 2 - std::time::Duration::from_secs(1)
+            t2 + base * 2 - std::time::Duration::from_secs(1),
+            base
         ));
-        let t2 = t1 + IDLE_REDEPLOY_BASE * 2;
-        assert!(g.allow("p", 5000.0, t2));
+        let t3 = t2 + base * 2;
+        assert!(g.allow("p", 5000.0, t3, base));
 
         // Progress resets the wait to the base.
-        let t3 = t2 + IDLE_REDEPLOY_BASE * 4;
-        assert!(g.allow("p", 1000.0, t3));
-        assert!(g.allow("p", 100.0, t3 + IDLE_REDEPLOY_BASE));
+        let t4 = t3 + base * 4;
+        assert!(g.allow("p", 1000.0, t4, base));
+        assert!(g.allow("p", 100.0, t4 + base, base));
+
+        // Forgetting restarts the clock rather than allowing at once.
+        g.forget("p");
+        assert!(!g.allow("p", 5000.0, t4 + base * 10, base));
 
         // The wait is capped.
         let mut g = RedeployGate::default();
         let mut t = Instant::now();
+        assert!(!g.allow("q", 5000.0, t, base));
         for _ in 0..40 {
-            assert!(g.allow("q", 5000.0, t));
             t += IDLE_REDEPLOY_MAX;
+            assert!(g.allow("q", 5000.0, t, base));
         }
     }
     use crate::position::tracker::{PositionRow, Tracker};
