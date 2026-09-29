@@ -16,7 +16,13 @@ pub struct DecideInput<'a> {
     pub tick_spacing: i32,
     pub fee_pips: u32,
     pub ticks: &'a [i32],
+    /// Block-span weights for `ticks`, oldest first. Empty falls back to the
+    /// unweighted statistics, which is what the synthetic-series tests use.
+    pub weighted: &'a [(i32, u64)],
     pub config: &'a PositionConfig,
+    /// USD value backing the position, or 0 when it could not be priced.
+    /// Zero disables the IL, slippage and MEV terms of the EV gate.
+    pub position_value_usd: f64,
 }
 
 pub struct Decision {
@@ -39,8 +45,10 @@ fn env_f64(key: &str, default: f64) -> f64 {
         .unwrap_or(default)
 }
 
-/// Gas a rebalance (remove + add liquidity) costs, used to price the EV gate.
-const REBALANCE_GAS_UNITS: u64 = 270_000;
+/// Gas a rebalance costs, used to price the EV gate. Covers remove + re-ratio
+/// swap + add; measured at ~290k against a forked Base PoolManager, rounded up
+/// so the gate errs toward not trading.
+const REBALANCE_GAS_UNITS: u64 = 320_000;
 
 /// Fallback pool parameters when a tracked position has no stored fee/tick
 /// spacing (e.g. an off-chain `lpa register` without `--fee`/`--tick-spacing`).
@@ -63,15 +71,18 @@ impl CostModel for EstimateCostModel {
 
 pub struct LiveCostModel {
     gas_price_wei: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    eth_price_usd: f64,
+    eth_price: crate::chain::oracle::EthPrice,
     volume_usd_per_block: f64,
 }
 
 impl LiveCostModel {
-    pub fn new(gas_price_wei: std::sync::Arc<std::sync::atomic::AtomicU64>) -> Self {
+    pub fn new(
+        gas_price_wei: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        eth_price: crate::chain::oracle::EthPrice,
+    ) -> Self {
         Self {
             gas_price_wei,
-            eth_price_usd: env_f64("ETH_PRICE_USD", 3000.0),
+            eth_price,
             volume_usd_per_block: env_f64("LPA_VOLUME_USD_PER_BLOCK", 50_000.0),
         }
     }
@@ -82,7 +93,7 @@ impl CostModel for LiveCostModel {
         let gp = self
             .gas_price_wei
             .load(std::sync::atomic::Ordering::Relaxed) as f64;
-        (REBALANCE_GAS_UNITS as f64 * gp / 1e18) * self.eth_price_usd
+        (REBALANCE_GAS_UNITS as f64 * gp / 1e18) * self.eth_price.get()
     }
     fn volume_usd_per_block(&self, _pool_id: &str) -> f64 {
         self.volume_usd_per_block
@@ -124,6 +135,10 @@ pub fn default_config() -> PositionConfig {
 pub struct StrategyEngine {
     pub horizon_blocks: f64,
     pub min_ticks: usize,
+    /// Spread paid to re-ratio the position, in bps of position value.
+    pub slippage_bps: f64,
+    /// Allowance for value lost to searchers on a public rebalance, in bps.
+    pub mev_bps: f64,
 }
 
 impl Default for StrategyEngine {
@@ -135,6 +150,8 @@ impl Default for StrategyEngine {
         Self {
             horizon_blocks: 300.0,
             min_ticks,
+            slippage_bps: env_f64("LPA_SLIPPAGE_BPS", 30.0),
+            mev_bps: env_f64("LPA_MEV_BPS", 10.0),
         }
     }
 }
@@ -154,7 +171,11 @@ impl StrategyEngine {
         } else {
             2.0
         };
-        let bands = math::bollinger(input.ticks, k);
+        let bands = if input.weighted.is_empty() {
+            math::bollinger(input.ticks, k)
+        } else {
+            math::bollinger_weighted(input.weighted, k)
+        };
         let spacing = input.tick_spacing.max(1);
         let half = self.half_width(strategy, &bands, input);
         let new_lower = math::clamp_tick(
@@ -191,6 +212,7 @@ impl StrategyEngine {
 
         let ev = ev::EvInputs {
             current_tick: tick,
+            entry_tick: input.entry_tick,
             step_sigma: math::step_sigma(input.ticks),
             horizon_blocks: self.horizon_blocks,
             cur_lower: input.cur_lower,
@@ -200,6 +222,9 @@ impl StrategyEngine {
             volume_usd_per_block: cost.volume_usd_per_block(input.pool_id),
             fee_tier_pips: input.fee_pips as f64,
             cost_usd: est_cost,
+            position_value_usd: input.position_value_usd,
+            slippage_bps: self.slippage_bps,
+            mev_bps: self.mev_bps,
         };
         if !ev::should_rebalance(&ev) {
             return None;
@@ -295,7 +320,9 @@ mod tests {
             tick_spacing: 60,
             fee_pips: 3000,
             ticks,
+            weighted: &[],
             config: cfg,
+            position_value_usd: 0.0,
         }
     }
 

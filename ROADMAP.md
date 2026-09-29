@@ -1,6 +1,10 @@
 # LP Autopilot — Build Roadmap
 
-Status: planning locked, no code yet. Build is strictly phased; each phase ends in build → test → audit → commit.
+Status: P0–P8 landed. Build is strictly phased; each phase ends in build → test → audit → commit.
+
+Verify the tree with `cargo test --workspace`, `forge test`, and
+`npm run typecheck`; `scripts/e2e.sh` runs the whole loop against an anvil
+fork of Base (skips without `RPC_BASE`).
 
 ## Locked architecture (v1)
 
@@ -46,7 +50,10 @@ chain WS ──► monitor ──chan──► strategy ──chan──► exec
 
 ## Phases
 
-**P0 — Scaffolding.** Cargo workspace, foundry init, packages/sdk init, `.gitignore`, `.env.example`. Commit skeleton.
+All phases below are implemented. Notes record what each one actually turned
+up, not just what was planned.
+
+**P0 — Scaffolding.** Done. Cargo workspace, foundry init, packages/sdk init, `.gitignore`, `.env.example`. Commit skeleton.
 
 **P1 — Proto + codegen + walking skeleton.** `autopilot.proto`; Rust codegen via `tonic-prost-build`; TS codegen via `buf`. `lpa serve` answers `Ping` over tonic-web. *Test:* `grpcurl` Ping + a Connect-ES client Ping.
 
@@ -62,7 +69,32 @@ chain WS ──► monitor ──chan──► strategy ──chan──► exec
 
 **P7 — serve + TS SDK.** tonic + tonic-web `AutopilotStrategy`; Connect-ES SDK; React hook. *Test:* SDK ↔ serve integration (register → stream → command).
 
-**P8 — E2E + hardening.** Full flow on testnet, per-feature audit, failure-mode tests (RPC drop, reorg, stuck tx).
+**P8 — E2E + hardening.** Done. `scripts/e2e.sh` drives the full loop against a
+forked-Base anvil: deploy hook → daemon watches → position opened → swaps push
+price out of range → daemon decides and sends a real rebalance tx → hook moves
+the range → daemon re-indexes it. The run also restarts the daemon mid-flight
+to prove the watermark + backfill path recovers a position opened while it was
+down.
+
+*This phase found a real bug.* `_doRebalance` removed liquidity and immediately
+re-added it with no swap in between. A position that has drifted out of range
+holds one token only, so any range straddling spot computed zero liquidity and
+reverted with `ZeroLiquidity()` — the exact scenario the product exists to
+handle. The unit tests all rebalanced while still *in* range, where both tokens
+are present, so none of them caught it. Fixed by re-ratioing through
+`poolManager.swap` inside the same unlock; the regression tests fail with
+`ZeroLiquidity()` against the old code.
+
+## Still open
+
+- Pool volume (`LPA_VOLUME_USD_PER_BLOCK`) and token1 USD price
+  (`LPA_TOKEN1_USD`) are operator assumptions. Without the latter a position
+  cannot be valued, so the EV gate's IL/slippage/MEV terms stay switched off.
+- Reorg recovery resyncs position lifecycle state from the hook, but tick
+  history from orphaned blocks is not rewound.
+- The hook remains unaudited. The re-ratio swap is new and security-sensitive:
+  it moves funds through the pool inside the rebalance, bounded only by the
+  caller's `minLiquidity` floor.
 
 ## Open questions for later
 

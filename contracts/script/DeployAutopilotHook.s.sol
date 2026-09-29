@@ -13,18 +13,22 @@ contract DeployAutopilotHook is Script {
     function run() external returns (AutopilotHook hook) {
         address manager = vm.envAddress("POOL_MANAGER");
         address rebalancer = vm.envAddress("REBALANCER_ADDRESS");
+        // Explicit: the CREATE2 factory is msg.sender inside the constructor, so
+        // an implicit owner would be unreachable forever.
+        address hookOwner = vm.envOr("HOOK_OWNER", msg.sender);
         uint64 cooldown = uint64(vm.envOr("REBALANCE_COOLDOWN_SECS", uint256(3600)));
 
         uint160 flags = uint160(Hooks.AFTER_SWAP_FLAG);
-        bytes memory args = abi.encode(IPoolManager(manager), rebalancer, cooldown);
+        bytes memory args = abi.encode(IPoolManager(manager), hookOwner, rebalancer, cooldown);
         (address predicted, bytes32 salt) =
             HookMiner.find(CREATE2_DEPLOYER, flags, type(AutopilotHook).creationCode, args);
 
         vm.startBroadcast();
-        hook = new AutopilotHook{salt: salt}(IPoolManager(manager), rebalancer, cooldown);
+        hook = new AutopilotHook{salt: salt}(IPoolManager(manager), hookOwner, rebalancer, cooldown);
         vm.stopBroadcast();
 
         require(address(hook) == predicted, "hook address mismatch");
+        require(hook.owner() == hookOwner, "hook owner not reachable");
         console2.log("AutopilotHook deployed at", address(hook));
     }
 }

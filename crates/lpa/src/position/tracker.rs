@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS positions (
     entry_tick      INTEGER,
     fee             INTEGER,
     tick_spacing    INTEGER,
+    opened_at       INTEGER,
     last_updated_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_positions_pool ON positions(pool_id);
@@ -38,6 +39,10 @@ CREATE TABLE IF NOT EXISTS configs (
     max_gas_usd       REAL NOT NULL,
     auto_compound_fees INTEGER NOT NULL,
     use_flashbots     INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS index_state (
+    chain_id   TEXT PRIMARY KEY,
+    last_block INTEGER NOT NULL
 );
 ";
 
@@ -104,8 +109,10 @@ impl Tracker {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT OR REPLACE INTO positions
-             (position_id, owner, pool_id, chain_id, tick_lower, tick_upper, current_tick, in_range, entry_tick, fee, tick_spacing, last_updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, strftime('%s','now'))",
+             (position_id, owner, pool_id, chain_id, tick_lower, tick_upper, current_tick, in_range, entry_tick, fee, tick_spacing, opened_at, last_updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                     COALESCE((SELECT opened_at FROM positions WHERE position_id = ?1), strftime('%s','now')),
+                     strftime('%s','now'))",
             params![
                 p.position_id, p.owner, p.pool_id, p.chain_id,
                 p.tick_lower, p.tick_upper, p.current_tick, p.in_range as i64, entry,
@@ -162,6 +169,34 @@ impl Tracker {
         Ok(crosses)
     }
 
+    /// Positions the daemon last saw out of range. The watch loop only proposes
+    /// a rebalance on the in -> out transition, so without a periodic sweep over
+    /// this set a single failed attempt would leave a position stranded until
+    /// price re-entered its range and left again.
+    pub fn out_of_range_positions(&self) -> Result<Vec<PositionRow>> {
+        self.positions_with_range_state(false)
+    }
+
+    /// In-range positions with an observed tick: the candidates for placing an
+    /// idle balance back into the range they already hold.
+    pub fn in_range_positions(&self) -> Result<Vec<PositionRow>> {
+        self.positions_with_range_state(true)
+    }
+
+    fn positions_with_range_state(&self, in_range: bool) -> Result<Vec<PositionRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT position_id, owner, pool_id, chain_id, tick_lower, tick_upper, current_tick, in_range, entry_tick, fee, tick_spacing
+             FROM positions WHERE in_range = ?1 AND current_tick IS NOT NULL",
+        )?;
+        let rows = stmt.query_map(params![in_range], row_to_position)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     pub fn record_tick(&self, pool_id: &str, tick: i32, block: u64) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -172,10 +207,20 @@ impl Tracker {
         Ok(())
     }
 
+    /// One sample per block, newest last. The per-block collapse is enforced in
+    /// SQL rather than trusted from the in-memory dedup in the watch loop, which
+    /// resets on every reconnect — without it, a reconnect storm could write
+    /// several rows for one block and let sample density be bought with dust
+    /// swaps instead of earned with elapsed time.
     pub fn recent_ticks(&self, pool_id: &str, n: usize) -> Result<Vec<i32>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT tick FROM tick_history WHERE pool_id = ?1 ORDER BY block_number DESC, id DESC LIMIT ?2",
+            "SELECT tick FROM (
+                 SELECT block_number, tick, ROW_NUMBER() OVER (
+                     PARTITION BY block_number ORDER BY id DESC
+                 ) AS rn
+                 FROM tick_history WHERE pool_id = ?1
+             ) WHERE rn = 1 ORDER BY block_number DESC LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![pool_id, n as i64], |r| r.get::<_, i32>(0))?;
         let mut out = Vec::new();
@@ -183,6 +228,44 @@ impl Tracker {
             out.push(r?);
         }
         out.reverse();
+        Ok(out)
+    }
+
+    /// Samples paired with the number of blocks each one prevailed, oldest first.
+    /// A tick that stood for 50 blocks and one that stood for a single block are
+    /// not equal evidence about where price has been, and counting them equally
+    /// is what lets an attacker buy influence over the band with swap frequency
+    /// rather than with time.
+    pub fn recent_ticks_weighted(&self, pool_id: &str, n: usize) -> Result<Vec<(i32, u64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT block_number, tick FROM (
+                 SELECT block_number, tick, ROW_NUMBER() OVER (
+                     PARTITION BY block_number ORDER BY id DESC
+                 ) AS rn
+                 FROM tick_history WHERE pool_id = ?1
+             ) WHERE rn = 1 ORDER BY block_number DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![pool_id, n as i64], |r| {
+            Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i32>(1)?))
+        })?;
+        let mut desc: Vec<(u64, i32)> = Vec::new();
+        for r in rows {
+            desc.push(r?);
+        }
+        desc.reverse(); // oldest first
+
+        let mut out = Vec::with_capacity(desc.len());
+        for (i, &(block, tick)) in desc.iter().enumerate() {
+            // How long this sample stood: the gap to the next observation, or one
+            // block for the newest sample, which has not been superseded yet.
+            let span = desc
+                .get(i + 1)
+                .map(|&(nb, _)| nb.saturating_sub(block))
+                .unwrap_or(1)
+                .max(1);
+            out.push((tick, span));
+        }
         Ok(out)
     }
 
@@ -288,6 +371,52 @@ impl Tracker {
         Ok(n)
     }
 
+    /// Unix seconds when the position was first seen. Survives re-registration
+    /// (a reorg resync or a repeat `PositionOpened`) so fee APR keeps a stable
+    /// denominator instead of resetting the position's age to zero.
+    pub fn opened_at(&self, position_id: &str) -> Result<Option<i64>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT opened_at FROM positions WHERE position_id = ?1")?;
+        let mut rows = stmt.query_map(params![position_id], |r| r.get::<_, Option<i64>>(0))?;
+        match rows.next() {
+            Some(r) => Ok(r?),
+            None => Ok(None),
+        }
+    }
+
+    pub fn last_indexed_block(&self, chain_id: &str) -> Result<Option<u64>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT last_block FROM index_state WHERE chain_id = ?1")?;
+        let mut rows = stmt.query_map(params![chain_id], |r| r.get::<_, i64>(0))?;
+        match rows.next() {
+            Some(r) => Ok(Some(r? as u64)),
+            None => Ok(None),
+        }
+    }
+
+    /// Advances the indexing watermark, never rewinding it: a late log from an
+    /// earlier block must not make the daemon re-scan ground already covered.
+    pub fn set_last_indexed_block(&self, chain_id: &str, block: u64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO index_state (chain_id, last_block) VALUES (?1, ?2)
+             ON CONFLICT(chain_id) DO UPDATE SET last_block = max(last_block, excluded.last_block)",
+            params![chain_id, block as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn distinct_pool_ids(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT DISTINCT pool_id FROM positions")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     pub fn count_positions(&self) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM positions", [], |r| r.get(0))?;
@@ -300,6 +429,7 @@ fn migrate(conn: &Connection) {
         "ALTER TABLE positions ADD COLUMN entry_tick INTEGER",
         "ALTER TABLE positions ADD COLUMN fee INTEGER",
         "ALTER TABLE positions ADD COLUMN tick_spacing INTEGER",
+        "ALTER TABLE positions ADD COLUMN opened_at INTEGER",
     ] {
         let _ = conn.execute(stmt, []);
     }
@@ -348,6 +478,71 @@ pub fn compute_position_id(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn out_of_range_sweep_selects_only_known_out_of_range_positions() {
+        let t = Tracker::open_in_memory().unwrap();
+        let mk = |id: &str, lo: i32, hi: i32| PositionRow {
+            position_id: id.into(),
+            owner: "0x1111111111111111111111111111111111111111".into(),
+            pool_id: "0xpool".into(),
+            chain_id: "8453".into(),
+            tick_lower: lo,
+            tick_upper: hi,
+            current_tick: None,
+            in_range: false,
+            entry_tick: None,
+            fee: None,
+            tick_spacing: None,
+        };
+        t.register(&mk("0xin", -600, 600)).unwrap();
+        t.register(&mk("0xout", 600, 1200)).unwrap();
+        t.register(&mk("0xunseen", 600, 1200)).unwrap();
+        t.update_pool_tick("0xpool", 0).unwrap();
+
+        // Never observed a tick: nothing to decide on yet.
+        t.register(&mk("0xunseen", 600, 1200)).unwrap();
+
+        let ids: Vec<String> = t
+            .out_of_range_positions()
+            .unwrap()
+            .into_iter()
+            .map(|p| p.position_id)
+            .collect();
+        assert_eq!(ids, vec!["0xout".to_string()]);
+
+        let ids: Vec<String> = t
+            .in_range_positions()
+            .unwrap()
+            .into_iter()
+            .map(|p| p.position_id)
+            .collect();
+        assert_eq!(ids, vec!["0xin".to_string()]);
+    }
+
+    #[test]
+    fn recent_ticks_collapses_multiple_samples_in_one_block() {
+        let t = Tracker::open_in_memory().unwrap();
+        // Several swaps land in block 100; the in-memory dedup in the watch loop
+        // resets on reconnect, so the query must not depend on it.
+        t.record_tick("0xpool", 10, 100).unwrap();
+        t.record_tick("0xpool", 11, 100).unwrap();
+        t.record_tick("0xpool", 12, 100).unwrap();
+        t.record_tick("0xpool", 20, 101).unwrap();
+
+        let ticks = t.recent_ticks("0xpool", 10).unwrap();
+        assert_eq!(ticks.len(), 2, "one sample per block: {ticks:?}");
+        assert_eq!(ticks, vec![12, 20], "newest sample wins within a block");
+    }
+
+    #[test]
+    fn recent_ticks_returns_oldest_first() {
+        let t = Tracker::open_in_memory().unwrap();
+        for (i, b) in (200u64..205).enumerate() {
+            t.record_tick("0xp", i as i32, b).unwrap();
+        }
+        assert_eq!(t.recent_ticks("0xp", 10).unwrap(), vec![0, 1, 2, 3, 4]);
+    }
+
     use super::*;
 
     fn sample(id: &str, pool: &str, lower: i32, upper: i32) -> PositionRow {

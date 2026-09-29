@@ -6,6 +6,11 @@ libs = ["lib"]
 solc = "0.8.26"
 optimizer = true
 optimizer_runs = 200
+# The hook has hit "stack too deep" four times as guards accumulated in
+# rebalance()/_doRebalance(). Extracting a helper each time was contorting the
+# code to suit the legacy codegen's stack limit; the IR pipeline removes the
+# constraint and optimises better.
+via_ir = true
 evm_version = "cancun"
 ffi = false
 fs_permissions = [{ access = "read", path = "./out" }]

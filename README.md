@@ -6,8 +6,11 @@ a volatility-aware strategy with an EV gate, and executes the move on-chain
 through a custom v4 hook — with a spend cap, slippage floor, preflight
 simulation, and optional private-orderflow submission.
 
-> Status: research / pre-audit. The hook has not been professionally audited.
-> Do not use with real funds on mainnet. See [Security](#security).
+> Status: research. An internal multi-agent audit is in
+> [`audits/tend-2026-09-20/`](audits/tend-2026-09-20/AUDIT-REPORT.md); both
+> Criticals, all five Highs and most Mediums are fixed. The fixes have **not**
+> been re-audited, and the hook has never been professionally audited. Do not use
+> with real funds. See [Security](#security).
 
 ## Why
 
@@ -34,13 +37,26 @@ process, wired by in-process channels. The only network surface is `lpa serve`
 
 - **Monitor** — alloy WS subscription to the v4 `PoolManager` `Swap` event and
   the hook's position events; SQLite tracks positions and per-block tick history.
+  A per-chain watermark plus an `eth_getLogs` backfill closes the gap after a
+  restart; reorged position events resync from the hook's own storage. In
+  auto-execute mode a periodic sweep retries every out-of-range position, and a
+  rebalance refused because spot has run ahead of the hook's price reference
+  triggers a `pokePriceRef` to walk the reference back within tolerance.
+  Whatever a rebalance's bounded swap could not place stays with the position
+  as an idle balance in the hook; the sweep places it back with a same-range
+  rebalance once it is worth a transaction, and `withdraw` pays it out.
 - **Strategy** — concentrated-LP impermanent-loss, block-sampled Bollinger
-  bands, and an expected-value gate (`E[fee gain] − E[IL] − cost > 0`).
+  bands, and an expected-value gate
+  (`E[fee gain] + E[IL avoided] − gas − slippage − MEV > 0`). Expected IL is
+  integrated over the horizon's terminal tick distribution, not point-estimated,
+  because IL is convex in price.
 - **Executor** — alloy signer; preflight `eth_call`, hard gas estimate, USD
   spend cap, slippage floor, receipt timeout, optional private RPC.
 - **`AutopilotHook.sol`** — v4 hook that custodies liquidity and moves ranges
   via PoolManager flash accounting. Ownable2Step, ReentrancyGuard, pausable,
-  per-position tick envelope, rebalancer allowlist, cooldown.
+  per-position tick envelope, rebalancer allowlist with per-position scoping,
+  cooldown floor, protocol-enforced value floor, a truncated per-pool price
+  reference, an optional L2 sequencer check, and an optional pair allowlist.
 
 ## Layout
 
@@ -78,7 +94,7 @@ Global flags: `--config <path>` (TOML), `--log-format json|pretty`.
 
 | Command | Purpose |
 |---|---|
-| `lpa serve [--host --port --db]` | gRPC(-web) API for the SDK (bearer auth via `LPA_API_TOKEN`) |
+| `lpa serve [--host --port --db --chain --hook]` | gRPC(-web) API for the SDK (bearer auth via `LPA_API_TOKEN`); `--hook` enables on-chain position enrichment |
 | `lpa watch [--chain --hook --db --execute]` | monitor a chain; `--execute` sends real rebalance txs for indexed positions |
 | `lpa register --pool-id --owner --tick-lower --tick-upper [--fee --tick-spacing]` | track a position off-chain |
 | `lpa simulate --position-id` | dry-run the strategy on a stored position |
@@ -106,13 +122,47 @@ Put the deployed address in `AUTOPILOT_HOOK_ADDRESS`.
 - **Never commit secrets.** `.env` is gitignored; use `.env.example` as the
   template. `REBALANCER_PRIVATE_KEY` in `.env` is for testnet only — use a
   keystore or external signer in production.
-- **Trust model.** The rebalancer key is trusted but *bounded*: it can only
-  reposition a position within the owner-set tick envelope and cannot withdraw
-  funds. Cooldown, pause, and the slippage floor are the safety valves.
+- **Trust model.** The rebalancer key is trusted but only *partly* bounded. It
+  cannot withdraw funds and cannot move a position outside the owner-set tick
+  envelope. It can still churn a position inside that envelope, paying the pool
+  fee each cycle — an audit measured ~0.3%/cycle. The envelope bounds where a
+  position sits, not what a rebalance does to it. `minLiquidity` is **not** a
+  safety valve: it is supplied by the rebalancer itself and bounds a liquidity
+  number rather than value. Pause and the cooldown do work as described.
+  See [`audits/`](audits/) for the full picture before trusting a rebalancer key.
 - **serve** binds `127.0.0.1` by default and requires a bearer token
   (`LPA_API_TOKEN`) on every RPC when set.
-- The strategy's USD volume input is an operator assumption pending a price
-  oracle; the executor's spend cap uses a live gas price.
+- The executor's spend cap uses a live gas price **and** the chain's Chainlink
+  ETH/USD feed, verified by `description()` at connect and rejected when stale.
+  The cap requires a *fresh* read and refuses to send a transaction without one,
+  so a dead feed gates spending off rather than pricing it against a stale
+  constant. `ETH_PRICE_USD` is only a seed for the strategy's estimate.
+- Pool volume (`LPA_VOLUME_USD_PER_BLOCK`) and token1's USD price
+  (`LPA_TOKEN1_USD`) remain operator assumptions. Without the latter a position
+  cannot be valued, and the EV gate runs fee-and-gas only rather than guessing
+  at IL and friction.
+- Position liquidity, token amounts and uncollected fees are read from the v4
+  `StateView` lens. Without `--hook` (or an HTTP RPC) those fields stream empty
+  rather than guessed.
+
+## Range orders
+
+The daemon rebalances every out-of-range position toward spot, including one opened
+out of range on purpose. To keep a range order, open it with automation off:
+`deposit(key, lower, upper, liquidity, minBound, maxBound, AUTOMATION_OFF)`, or call
+`setPositionRebalancer(positionId, AUTOMATION_OFF)` afterwards.
+
+## End-to-end
+
+`scripts/e2e.sh` runs the whole loop against an anvil fork of Base: deploy the
+hook, start the daemon, open a position, swap the price out of range, and
+assert the daemon sends a real rebalance tx that moves the range on-chain. It
+also restarts the daemon across a deposit to prove the watermark and backfill
+recover it. Needs `RPC_BASE`; skips cleanly without one.
+
+```bash
+RPC_BASE=https://... ./scripts/e2e.sh
+```
 
 ## Development
 

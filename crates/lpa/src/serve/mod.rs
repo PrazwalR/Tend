@@ -6,6 +6,8 @@ use tonic::transport::Server;
 use tonic::{Request, Status};
 use tonic_web::GrpcWebLayer;
 
+use crate::chain::config::ChainConfig;
+use crate::chain::reader::ChainReader;
 use crate::position::tracker::Tracker;
 use crate::proto::autopilot_strategy_server::AutopilotStrategyServer;
 use strategy_service::StrategyService;
@@ -23,14 +25,45 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-pub async fn run(host: &str, port: u16, db: &str) -> anyhow::Result<()> {
+pub async fn run(
+    host: &str,
+    port: u16,
+    db: &str,
+    chain: &str,
+    hook: Option<alloy::primitives::Address>,
+) -> anyhow::Result<()> {
     let addr = format!("{host}:{port}").parse()?;
     if host == "0.0.0.0" {
         tracing::warn!("serve bound to 0.0.0.0 (all interfaces) — restrict before exposing");
     }
 
     let tracker = Arc::new(Tracker::open(db)?);
-    let service = StrategyService::new(tracker);
+
+    // Without a hook address and an HTTP RPC there is nothing to read
+    // positions from, so the stream serves indexed state only.
+    let reader = match hook {
+        Some(h) => {
+            let cfg = ChainConfig::from_name(chain)?;
+            match cfg.http_url() {
+                Ok(url) => match ChainReader::connect(&url, h, cfg.addrs.state_view).await {
+                    Ok(r) => Some(Arc::new(r)),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "chain reader unavailable; serving un-enriched positions");
+                        None
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(error = %e, "no HTTP RPC configured; serving un-enriched positions");
+                    None
+                }
+            }
+        }
+        None => {
+            tracing::warn!("no hook address; position liquidity/fees will be empty");
+            None
+        }
+    };
+    let service = StrategyService::new(tracker, reader);
 
     let expected = std::env::var("LPA_API_TOKEN")
         .ok()

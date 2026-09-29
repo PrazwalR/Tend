@@ -10,12 +10,14 @@ use alloy::sol_types::SolEvent;
 use anyhow::Result;
 use dashmap::DashMap;
 use futures_util::StreamExt;
-use tokio::time::{sleep, timeout};
+use tokio::time::{interval, sleep, timeout, MissedTickBehavior};
 use tracing::{debug, error, info, warn};
 
 use tokio::sync::mpsc;
 
 use crate::chain::config::ChainConfig;
+use crate::chain::oracle::EthPrice;
+use crate::chain::reader::ChainReader;
 use crate::exec::RebalanceIntent;
 use crate::position::tracker::{PositionRow, Tracker};
 use crate::proto::PositionConfig;
@@ -68,16 +70,47 @@ const PRUNE_EVERY: u32 = 500;
 const INITIAL_GAS_PRICE_WEI: u64 = 5_000_000_000;
 /// Default seconds of silence before the WS heartbeat health-check runs.
 const DEFAULT_HEARTBEAT_SECS: u64 = 30;
+/// Default seconds between sweeps for stuck or under-deployed positions.
+const DEFAULT_SWEEP_SECS: u64 = 30;
+/// Upper bound on one sweep pass; see the watch loop.
+const SWEEP_TIMEOUT: Duration = Duration::from_secs(20);
+/// Idle share of a position, in bps, worth a transaction to place. Below it the
+/// idle balance waits for the next rebalance, which folds it in for free.
+const DEFAULT_IDLE_REDEPLOY_BPS: f64 = 100.0;
 /// Timeout for the heartbeat block-number probe.
 const HEALTH_PROBE_TIMEOUT_SECS: u64 = 5;
 /// A connection alive this long resets the reconnect backoff.
 const CONNECTION_STABLE_SECS: u64 = 60;
 /// Tick-history lookback fed to the strategy on an OOR event.
 const STRATEGY_TICK_WINDOW: usize = 200;
+/// Blocks per `eth_getLogs` request while catching up; providers cap the span.
+const BACKFILL_CHUNK_BLOCKS: u64 = 500;
+/// Refuse to backfill further than this behind head — beyond it the tick
+/// history is stale anyway and a full scan would hammer the RPC.
+const BACKFILL_MAX_BLOCKS: u64 = 100_000;
 
 enum WatchEnd {
     Shutdown,
     StreamEnded,
+}
+
+/// Everything the log handlers need, so the hot path passes one reference
+/// instead of eight positional arguments.
+struct Ctx<'a> {
+    tracker: &'a Arc<Tracker>,
+    engine: &'a StrategyEngine,
+    cost: &'a dyn CostModel,
+    config: &'a PositionConfig,
+    chain_id: u64,
+    reader: Option<&'a ChainReader>,
+    intent_tx: Option<&'a mpsc::Sender<RebalanceIntent>>,
+    last_block: DashMap<B256, u64>,
+}
+
+impl<'a> Ctx<'a> {
+    fn chain_key(&self) -> String {
+        self.chain_id.to_string()
+    }
 }
 
 fn store_gas_price(slot: &AtomicU64, wei: u128) {
@@ -89,27 +122,45 @@ pub async fn run_watch(
     tracker: Arc<Tracker>,
     hook: Option<Address>,
     intent_tx: Option<mpsc::Sender<RebalanceIntent>>,
+    eth_price: EthPrice,
 ) -> Result<()> {
     let engine = StrategyEngine::default();
     let gas_price = Arc::new(AtomicU64::new(INITIAL_GAS_PRICE_WEI));
-    let cost = LiveCostModel::new(gas_price.clone());
-    let config = default_config();
-    let mut attempt = 0u32;
 
+    let cost = LiveCostModel::new(gas_price.clone(), eth_price);
+    let config = default_config();
+
+    let reader = match hook {
+        Some(h) => match cfg.http_url() {
+            Ok(url) => match ChainReader::connect(&url, h, cfg.addrs.state_view).await {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    warn!(error = %e, "HTTP reader unavailable; reorg resync disabled");
+                    None
+                }
+            },
+            Err(e) => {
+                warn!(error = %e, "no HTTP RPC configured; reorg resync disabled");
+                None
+            }
+        },
+        None => None,
+    };
+
+    let mut attempt = 0u32;
     loop {
         let started = Instant::now();
-        match watch_once(
-            &cfg,
-            &tracker,
-            &engine,
-            &cost,
-            &config,
-            hook,
-            &gas_price,
-            intent_tx.as_ref(),
-        )
-        .await
-        {
+        let ctx = Ctx {
+            tracker: &tracker,
+            engine: &engine,
+            cost: &cost,
+            config: &config,
+            chain_id: cfg.chain_id,
+            reader: reader.as_ref(),
+            intent_tx: intent_tx.as_ref(),
+            last_block: DashMap::new(),
+        };
+        match watch_once(&cfg, &ctx, hook, &gas_price).await {
             Ok(WatchEnd::Shutdown) => {
                 info!("shutdown signal received");
                 return Ok(());
@@ -134,16 +185,11 @@ pub async fn run_watch(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn watch_once(
     cfg: &ChainConfig,
-    tracker: &Arc<Tracker>,
-    engine: &StrategyEngine,
-    cost: &dyn CostModel,
-    config: &PositionConfig,
+    ctx: &Ctx<'_>,
     hook: Option<Address>,
     gas_price: &AtomicU64,
-    intent_tx: Option<&mpsc::Sender<RebalanceIntent>>,
 ) -> Result<WatchEnd> {
     let ws_url = cfg.ws_url()?;
     let provider = ProviderBuilder::new()
@@ -178,25 +224,60 @@ async fn watch_once(
         None => swap_stream.boxed(),
     };
 
+    // Subscriptions only deliver logs from now on. Anything that happened while
+    // the daemon was down is replayed here before the live stream is served.
+    if let Err(e) = backfill(&provider, cfg, ctx, hook).await {
+        warn!(error = %e, "backfill failed; continuing on live stream only");
+    }
+
     let heartbeat = Duration::from_secs(
         std::env::var("LPA_WS_HEARTBEAT_SECS")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(DEFAULT_HEARTBEAT_SECS),
     );
-    let last_block: DashMap<B256, u64> = DashMap::new();
+    // A fixed cadence, unlike the heartbeat: the heartbeat only fires after
+    // silence, so on a pool with a swap every few seconds it never fires at all
+    // and anything hung off it would never run where it matters most.
+    let mut sweep = interval(Duration::from_secs(
+        std::env::var("LPA_SWEEP_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&s: &u64| s > 0)
+            .unwrap_or(DEFAULT_SWEEP_SECS),
+    ));
+    sweep.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut since_prune = 0u32;
     loop {
         tokio::select! {
+            _ = sweep.tick() => {
+                // Inline in the watch loop, so a hung RPC here would also stop
+                // log processing; bound it and let the next tick try again.
+                let started = Instant::now();
+                let pass = async {
+                    sweep_out_of_range(ctx).await;
+                    sweep_idle(ctx).await;
+                };
+                match timeout(SWEEP_TIMEOUT, pass).await {
+                    Ok(()) => debug!(elapsed_ms = started.elapsed().as_millis() as u64, "sweep pass done"),
+                    Err(_) => warn!(timeout_secs = SWEEP_TIMEOUT.as_secs(), "sweep pass timed out; abandoned until next tick"),
+                }
+            }
             maybe_log = stream.next() => match maybe_log {
                 Some(log) => {
-                    if let Err(e) = handle(tracker, engine, cost, config, cfg.chain_id, &last_block, intent_tx, log) {
+                    let block = log.block_number;
+                    if let Err(e) = handle(ctx, log).await {
                         error!(error = %e, "log handling error");
+                    }
+                    if let Some(b) = block {
+                        if let Err(e) = ctx.tracker.set_last_indexed_block(&ctx.chain_key(), b) {
+                            warn!(error = %e, "watermark update failed");
+                        }
                     }
                     since_prune += 1;
                     if since_prune >= PRUNE_EVERY {
                         since_prune = 0;
-                        if let Err(e) = tracker.prune_all_ticks(TICK_RETENTION) {
+                        if let Err(e) = ctx.tracker.prune_all_ticks(TICK_RETENTION) {
                             warn!(error = %e, "tick prune failed");
                         }
                     }
@@ -205,9 +286,14 @@ async fn watch_once(
             },
             _ = sleep(heartbeat) => {
                 match timeout(Duration::from_secs(HEALTH_PROBE_TIMEOUT_SECS), provider.get_block_number()).await {
-                    Ok(Ok(_)) => {
+                    Ok(Ok(head)) => {
                         if let Ok(gp) = provider.get_gas_price().await {
                             store_gas_price(gas_price, gp);
+                        }
+                        // A quiet pool is still indexed ground; record it so a
+                        // restart does not re-scan blocks that held no logs.
+                        if let Err(e) = ctx.tracker.set_last_indexed_block(&ctx.chain_key(), head) {
+                            warn!(error = %e, "watermark update failed");
                         }
                     }
                     _ => {
@@ -221,47 +307,167 @@ async fn watch_once(
     }
 }
 
+/// Replays logs between the stored watermark and current head. Hook events are
+/// fetched across all pools; `Swap` events only for pools we actually track,
+/// because an unfiltered v4 `Swap` scan would return every swap on the chain.
+async fn backfill<P: Provider>(
+    provider: &P,
+    cfg: &ChainConfig,
+    ctx: &Ctx<'_>,
+    hook: Option<Address>,
+) -> Result<()> {
+    let head = provider.get_block_number().await?;
+    let Some(watermark) = ctx.tracker.last_indexed_block(&ctx.chain_key())? else {
+        ctx.tracker.set_last_indexed_block(&ctx.chain_key(), head)?;
+        info!(head, "no watermark stored; indexing from current head");
+        return Ok(());
+    };
+    if watermark >= head {
+        return Ok(());
+    }
+
+    let span = head - watermark;
+    let from = if span > BACKFILL_MAX_BLOCKS {
+        warn!(
+            span,
+            max = BACKFILL_MAX_BLOCKS,
+            "watermark too far behind; truncating backfill"
+        );
+        head - BACKFILL_MAX_BLOCKS
+    } else {
+        watermark + 1
+    };
+
+    let pools = ctx.tracker.distinct_pool_ids()?;
+    let pool_topics: Vec<B256> = pools
+        .iter()
+        .filter_map(|p| p.parse::<B256>().ok())
+        .collect();
+    info!(
+        from,
+        to = head,
+        pools = pool_topics.len(),
+        "backfilling missed logs"
+    );
+
+    let mut start = from;
+    let mut replayed = 0usize;
+    while start <= head {
+        let end = (start + BACKFILL_CHUNK_BLOCKS - 1).min(head);
+
+        if let Some(h) = hook {
+            let f = Filter::new()
+                .address(h)
+                .event_signature(vec![
+                    PositionOpened::SIGNATURE_HASH,
+                    PositionClosed::SIGNATURE_HASH,
+                    Rebalanced::SIGNATURE_HASH,
+                ])
+                .from_block(start)
+                .to_block(end);
+            for log in provider.get_logs(&f).await? {
+                handle(ctx, log).await?;
+                replayed += 1;
+            }
+        }
+
+        if !pool_topics.is_empty() {
+            let f = Filter::new()
+                .address(cfg.addrs.pool_manager)
+                .event_signature(Swap::SIGNATURE_HASH)
+                .topic1(pool_topics.clone())
+                .from_block(start)
+                .to_block(end);
+            for log in provider.get_logs(&f).await? {
+                handle(ctx, log).await?;
+                replayed += 1;
+            }
+        }
+
+        ctx.tracker.set_last_indexed_block(&ctx.chain_key(), end)?;
+        start = end + 1;
+    }
+    info!(replayed, "backfill complete");
+    Ok(())
+}
+
 fn next_backoff(attempt: u32) -> Duration {
     let secs = (1u64 << attempt.min(5)).min(30);
     Duration::from_secs(secs)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn handle(
-    tracker: &Arc<Tracker>,
-    engine: &StrategyEngine,
-    cost: &dyn CostModel,
-    config: &PositionConfig,
-    chain_id: u64,
-    last_block: &DashMap<B256, u64>,
-    intent_tx: Option<&mpsc::Sender<RebalanceIntent>>,
-    log: Log,
-) -> Result<()> {
+async fn handle(ctx: &Ctx<'_>, log: Log) -> Result<()> {
+    let topic = log.topic0().copied();
     if log.removed {
-        warn!(block = ?log.block_number, "reorg: removed log skipped");
-        return Ok(());
+        return handle_removed(ctx, topic, log).await;
     }
-    match log.topic0().copied() {
-        Some(t) if t == Swap::SIGNATURE_HASH => {
-            handle_swap(tracker, engine, cost, config, last_block, intent_tx, log)
-        }
-        Some(t) if t == PositionOpened::SIGNATURE_HASH => handle_opened(tracker, chain_id, log),
-        Some(t) if t == PositionClosed::SIGNATURE_HASH => handle_closed(tracker, log),
-        Some(t) if t == Rebalanced::SIGNATURE_HASH => handle_rebalanced(tracker, log),
+    match topic {
+        Some(t) if t == Swap::SIGNATURE_HASH => handle_swap(ctx, log).await,
+        Some(t) if t == PositionOpened::SIGNATURE_HASH => handle_opened(ctx, log),
+        Some(t) if t == PositionClosed::SIGNATURE_HASH => handle_closed(ctx, log),
+        Some(t) if t == Rebalanced::SIGNATURE_HASH => handle_rebalanced(ctx, log),
         _ => Ok(()),
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn handle_swap(
-    tracker: &Arc<Tracker>,
-    engine: &StrategyEngine,
-    cost: &dyn CostModel,
-    config: &PositionConfig,
-    last_block: &DashMap<B256, u64>,
-    intent_tx: Option<&mpsc::Sender<RebalanceIntent>>,
-    log: Log,
-) -> Result<()> {
+/// A reorg dropped a log we may already have acted on. Swap logs need no
+/// undo — the next swap overwrites the tick. Position lifecycle logs do, and
+/// rather than invert them (which cannot restore a deleted row) we re-read the
+/// hook's storage, which is authoritative for the canonical chain.
+async fn handle_removed(ctx: &Ctx<'_>, topic: Option<B256>, log: Log) -> Result<()> {
+    let is_position_event = matches!(topic,
+        Some(t) if t == PositionOpened::SIGNATURE_HASH
+            || t == PositionClosed::SIGNATURE_HASH
+            || t == Rebalanced::SIGNATURE_HASH
+    );
+    if !is_position_event {
+        warn!(block = ?log.block_number, "reorg: removed swap log skipped");
+        return Ok(());
+    }
+    let Some(position_id) = log.topics().get(1).copied() else {
+        return Ok(());
+    };
+    warn!(position_id = %format!("{:#x}", position_id), block = ?log.block_number, "reorg: resyncing position from chain");
+    resync_position(ctx, position_id).await
+}
+
+async fn resync_position(ctx: &Ctx<'_>, position_id: B256) -> Result<()> {
+    let id_hex = format!("{:#x}", position_id);
+    let Some(reader) = ctx.reader else {
+        warn!(position_id = %id_hex, "no HTTP reader; cannot resync after reorg");
+        return Ok(());
+    };
+    match reader.hook_position(position_id).await {
+        Ok(Some(p)) if p.active => {
+            let stored = ctx.tracker.get_position(&id_hex)?;
+            ctx.tracker.register(&PositionRow {
+                position_id: id_hex.clone(),
+                owner: format!("{:#x}", p.owner),
+                pool_id: format!("{:#x}", p.pool_id),
+                chain_id: ctx.chain_key(),
+                tick_lower: p.tick_lower,
+                tick_upper: p.tick_upper,
+                current_tick: stored.as_ref().and_then(|s| s.current_tick),
+                in_range: stored.as_ref().is_some_and(|s| s.in_range),
+                entry_tick: stored
+                    .as_ref()
+                    .and_then(|s| s.entry_tick)
+                    .or(Some((p.tick_lower + p.tick_upper) / 2)),
+                fee: Some(p.fee),
+                tick_spacing: Some(p.tick_spacing),
+            })?;
+            info!(position_id = %id_hex, tick_lower = p.tick_lower, tick_upper = p.tick_upper, "resynced position from hook storage");
+        }
+        Ok(_) => {
+            ctx.tracker.delete_position(&id_hex)?;
+            info!(position_id = %id_hex, "position absent on canonical chain; dropped");
+        }
+        Err(e) => warn!(error = %e, position_id = %id_hex, "resync read failed"),
+    }
+    Ok(())
+}
+
+async fn handle_swap(ctx: &Ctx<'_>, log: Log) -> Result<()> {
     let ev = match Swap::decode_log(&log.inner) {
         Ok(e) => e,
         Err(e) => {
@@ -274,33 +480,25 @@ fn handle_swap(
     let tick = ev.tick.as_i32();
     let block = log.block_number.unwrap_or(0);
 
-    let crosses = tracker.update_pool_tick(&pool_hex, tick)?;
+    let crosses = ctx.tracker.update_pool_tick(&pool_hex, tick)?;
     for cx in &crosses {
         if cx.was_in_range && !cx.now_in_range {
             warn!(position_id = %cx.position_id, tick, "position EXITED range");
-            propose_rebalance(
-                tracker,
-                engine,
-                cost,
-                config,
-                intent_tx,
-                &pool_hex,
-                tick,
-                &cx.position_id,
-            );
+            propose_rebalance(ctx, &pool_hex, tick, &cx.position_id).await;
         } else if !cx.was_in_range && cx.now_in_range {
             info!(position_id = %cx.position_id, tick, "position re-entered range");
         }
     }
 
     if !crosses.is_empty() {
-        let new_block = last_block
+        let new_block = ctx
+            .last_block
             .get(&pool_id)
             .map(|v| *v != block)
             .unwrap_or(true);
         if new_block {
-            last_block.insert(pool_id, block);
-            tracker.record_tick(&pool_hex, tick, block)?;
+            ctx.last_block.insert(pool_id, block);
+            ctx.tracker.record_tick(&pool_hex, tick, block)?;
         }
     }
 
@@ -308,7 +506,7 @@ fn handle_swap(
     Ok(())
 }
 
-fn handle_opened(tracker: &Arc<Tracker>, chain_id: u64, log: Log) -> Result<()> {
+fn handle_opened(ctx: &Ctx<'_>, log: Log) -> Result<()> {
     let ev = match PositionOpened::decode_log(&log.inner) {
         Ok(e) => e,
         Err(e) => {
@@ -319,11 +517,11 @@ fn handle_opened(tracker: &Arc<Tracker>, chain_id: u64, log: Log) -> Result<()> 
     let position_id = format!("{:#x}", ev.positionId);
     let tick_lower = ev.tickLower.as_i32();
     let tick_upper = ev.tickUpper.as_i32();
-    tracker.register(&PositionRow {
+    ctx.tracker.register(&PositionRow {
         position_id: position_id.clone(),
         owner: format!("{:#x}", ev.owner),
         pool_id: format!("{:#x}", ev.poolId),
-        chain_id: chain_id.to_string(),
+        chain_id: ctx.chain_key(),
         tick_lower,
         tick_upper,
         current_tick: None,
@@ -336,7 +534,7 @@ fn handle_opened(tracker: &Arc<Tracker>, chain_id: u64, log: Log) -> Result<()> 
     Ok(())
 }
 
-fn handle_closed(tracker: &Arc<Tracker>, log: Log) -> Result<()> {
+fn handle_closed(ctx: &Ctx<'_>, log: Log) -> Result<()> {
     let ev = match PositionClosed::decode_log(&log.inner) {
         Ok(e) => e,
         Err(e) => {
@@ -345,12 +543,12 @@ fn handle_closed(tracker: &Arc<Tracker>, log: Log) -> Result<()> {
         }
     };
     let position_id = format!("{:#x}", ev.positionId);
-    tracker.delete_position(&position_id)?;
+    ctx.tracker.delete_position(&position_id)?;
     info!(position_id = %position_id, "indexed PositionClosed");
     Ok(())
 }
 
-fn handle_rebalanced(tracker: &Arc<Tracker>, log: Log) -> Result<()> {
+fn handle_rebalanced(ctx: &Ctx<'_>, log: Log) -> Result<()> {
     let ev = match Rebalanced::decode_log(&log.inner) {
         Ok(e) => e,
         Err(e) => {
@@ -361,27 +559,229 @@ fn handle_rebalanced(tracker: &Arc<Tracker>, log: Log) -> Result<()> {
     let position_id = format!("{:#x}", ev.positionId);
     let lower = ev.newTickLower.as_i32();
     let upper = ev.newTickUpper.as_i32();
-    tracker.update_range(&position_id, lower, upper)?;
+    ctx.tracker.update_range(&position_id, lower, upper)?;
     info!(position_id = %position_id, new_lower = lower, new_upper = upper, "indexed Rebalanced");
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn propose_rebalance(
-    tracker: &Arc<Tracker>,
-    engine: &StrategyEngine,
-    cost: &dyn CostModel,
-    config: &PositionConfig,
-    intent_tx: Option<&mpsc::Sender<RebalanceIntent>>,
-    pool_hex: &str,
-    tick: i32,
-    position_id: &str,
-) {
-    let Ok(Some(pos)) = tracker.get_position(position_id) else {
+/// Values the position in USD so the EV gate can price IL and friction. Needs
+/// both a chain read and an operator-supplied USD price for token1 (there is no
+/// general way to price an arbitrary pair); returns 0 — meaning unknown — if
+/// either is missing, which leaves the gate fee-and-gas only.
+async fn position_value_usd(ctx: &Ctx<'_>, p: &PositionRow) -> f64 {
+    let Some(reader) = ctx.reader else { return 0.0 };
+    let token1_usd = std::env::var("LPA_TOKEN1_USD")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    if token1_usd <= 0.0 {
+        return 0.0;
+    }
+    let (Ok(pool_id), Ok(position_id)) = (p.pool_id.parse::<B256>(), p.position_id.parse::<B256>())
+    else {
+        return 0.0;
+    };
+    let Ok(snap) = reader
+        .position_snapshot(pool_id, position_id, p.tick_lower, p.tick_upper)
+        .await
+    else {
+        return 0.0;
+    };
+    let price = 1.0001f64.powi(snap.current_tick);
+    let to_f64 = |v: alloy::primitives::U256| -> f64 { format!("{v}").parse().unwrap_or(0.0) };
+    let value_token1 = to_f64(snap.amount0) * price + to_f64(snap.amount1);
+    if !value_token1.is_finite() {
+        return 0.0;
+    }
+    value_token1 * token1_usd
+}
+
+/// Re-proposes every position still out of range. Only in auto-execute mode:
+/// without an executor the proposal is just a log line, and repeating it every
+/// heartbeat would be noise. The strategy still gates each proposal, and the
+/// executor throttles sent transactions per position.
+async fn sweep_out_of_range(ctx: &Ctx<'_>) {
+    if ctx.intent_tx.is_none() {
+        return;
+    }
+    let positions = match ctx.tracker.out_of_range_positions() {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(error = %e, "out-of-range sweep query failed");
+            return;
+        }
+    };
+    for p in positions {
+        if let Some(tick) = p.current_tick {
+            propose_rebalance(ctx, &p.pool_id, tick, &p.position_id).await;
+        }
+    }
+}
+
+/// Queues a same-range rebalance for any in-range position holding a material
+/// idle balance: what an earlier rebalance's bounded swap could not place. The
+/// hook accepts an otherwise no-op range precisely when something is idle.
+async fn sweep_idle(ctx: &Ctx<'_>) {
+    let (Some(tx), Some(reader)) = (ctx.intent_tx, ctx.reader) else {
         return;
     };
-    let ticks = tracker
+    let threshold_bps = std::env::var("LPA_IDLE_REDEPLOY_BPS")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(DEFAULT_IDLE_REDEPLOY_BPS);
+    let positions = match ctx.tracker.in_range_positions() {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(error = %e, "idle sweep query failed");
+            return;
+        }
+    };
+    for p in positions {
+        let (Ok(pool_id), Ok(position_id)) =
+            (p.pool_id.parse::<B256>(), p.position_id.parse::<B256>())
+        else {
+            continue;
+        };
+        let (idle0, idle1) = match reader.idle_balance(position_id).await {
+            Ok(v) => v,
+            Err(e) => {
+                debug!(position_id = %p.position_id, error = %e, "idle balance read failed");
+                continue;
+            }
+        };
+        if idle0 == 0 && idle1 == 0 {
+            idle_gate().lock().unwrap().forget(&p.position_id);
+            continue;
+        }
+        let Ok(snap) = reader
+            .position_snapshot(pool_id, position_id, p.tick_lower, p.tick_upper)
+            .await
+        else {
+            continue;
+        };
+        let to_f64 = |v: alloy::primitives::U256| -> f64 { format!("{v}").parse().unwrap_or(0.0) };
+        let share = idle_share_bps(
+            (idle0 as f64, idle1 as f64),
+            (to_f64(snap.amount0), to_f64(snap.amount1)),
+            snap.current_tick,
+        );
+        if share < threshold_bps {
+            idle_gate().lock().unwrap().forget(&p.position_id);
+            continue;
+        }
+        let allowed = idle_gate().lock().unwrap().allow(
+            &p.position_id,
+            share,
+            Instant::now(),
+            redeploy_wait(),
+        );
+        if !allowed {
+            continue;
+        }
+        let intent = RebalanceIntent {
+            position_id: p.position_id.clone(),
+            new_lower: p.tick_lower,
+            new_upper: p.tick_upper,
+        };
+        match tx.try_send(intent) {
+            Ok(()) => {
+                info!(position_id = %p.position_id, idle_bps = share, "idle balance redeploy queued")
+            }
+            Err(_) => {
+                warn!(position_id = %p.position_id, "auto-execute queue full; dropped idle redeploy")
+            }
+        }
+    }
+}
+
+/// Wait after first seeing an idle balance, and after each redeploy that made
+/// progress. It must outlast the hook's cooldown: idle balances appear only as
+/// the result of a rebalance, so an immediate attempt would always be refused.
+const IDLE_REDEPLOY_BASE: Duration = Duration::from_secs(600);
+const IDLE_REDEPLOY_MAX: Duration = Duration::from_secs(86_400);
+
+fn redeploy_wait() -> Duration {
+    std::env::var("LPA_IDLE_REDEPLOY_WAIT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(IDLE_REDEPLOY_BASE)
+}
+
+fn idle_gate() -> &'static std::sync::Mutex<RedeployGate> {
+    static GATE: std::sync::OnceLock<std::sync::Mutex<RedeployGate>> = std::sync::OnceLock::new();
+    GATE.get_or_init(Default::default)
+}
+
+/// Rate-limits idle redeploys per position. In a pool with no other depth the
+/// bounded swap fills nothing, the idle share never falls, and an unconditional
+/// retry would pay for a no-progress rebalance on every sweep forever. So each
+/// retry that finds the share not at least 10% lower than at the previous
+/// attempt doubles the wait. The first sighting only starts the clock.
+#[derive(Default)]
+pub(crate) struct RedeployGate {
+    /// Share at the last attempt (`None` before any), earliest next attempt,
+    /// consecutive attempts without progress.
+    entries: std::collections::HashMap<String, (Option<f64>, Instant, u32)>,
+}
+
+impl RedeployGate {
+    pub(crate) fn allow(
+        &mut self,
+        position_id: &str,
+        share_bps: f64,
+        now: Instant,
+        base: Duration,
+    ) -> bool {
+        let strikes = match self.entries.get(position_id) {
+            None => {
+                self.entries
+                    .insert(position_id.to_string(), (None, now + base, 0));
+                return false;
+            }
+            Some(&(_, not_before, _)) if now < not_before => return false,
+            Some(&(Some(prev), _, strikes)) if share_bps > prev * 0.9 => strikes + 1,
+            Some(_) => 0,
+        };
+        let wait = base
+            .saturating_mul(1u32 << strikes.min(16))
+            .min(IDLE_REDEPLOY_MAX);
+        self.entries.insert(
+            position_id.to_string(),
+            (Some(share_bps), now + wait, strikes),
+        );
+        true
+    }
+
+    /// Nothing material is idle any more; a later balance starts a fresh clock.
+    pub(crate) fn forget(&mut self, position_id: &str) {
+        self.entries.remove(position_id);
+    }
+}
+
+/// Idle value as a share of everything the position owns, in bps, both sides
+/// valued in token1 at the current tick.
+pub(crate) fn idle_share_bps(idle: (f64, f64), deployed: (f64, f64), tick: i32) -> f64 {
+    let price = 1.0001f64.powi(tick);
+    let idle_value = idle.0 * price + idle.1;
+    let total = idle_value + deployed.0 * price + deployed.1;
+    if !(total.is_finite() && total > 0.0) {
+        return 0.0;
+    }
+    idle_value / total * 10_000.0
+}
+
+async fn propose_rebalance(ctx: &Ctx<'_>, pool_hex: &str, tick: i32, position_id: &str) {
+    let Ok(Some(pos)) = ctx.tracker.get_position(position_id) else {
+        return;
+    };
+    let ticks = ctx
+        .tracker
         .recent_ticks(pool_hex, STRATEGY_TICK_WINDOW)
+        .unwrap_or_default();
+    let weighted = ctx
+        .tracker
+        .recent_ticks_weighted(pool_hex, STRATEGY_TICK_WINDOW)
         .unwrap_or_default();
     let entry_tick = pos
         .entry_tick
@@ -396,12 +796,14 @@ fn propose_rebalance(
         tick_spacing: pos.tick_spacing.unwrap_or(DEFAULT_TICK_SPACING),
         fee_pips: pos.fee.unwrap_or(DEFAULT_FEE_PIPS),
         ticks: &ticks,
-        config,
+        weighted: &weighted,
+        config: ctx.config,
+        position_value_usd: position_value_usd(ctx, &pos).await,
     };
-    let Some(d) = engine.decide(&input, cost) else {
+    let Some(d) = ctx.engine.decide(&input, ctx.cost) else {
         return;
     };
-    match intent_tx {
+    match ctx.intent_tx {
         Some(tx) => {
             let intent = RebalanceIntent {
                 position_id: pos.position_id.clone(),
@@ -427,10 +829,74 @@ fn propose_rebalance(
         ),
     }
 }
-
 #[cfg(test)]
 mod tests {
-    use super::{handle, next_backoff, PositionClosed, PositionOpened, Rebalanced, Swap};
+    use super::{handle, next_backoff, Ctx, PositionClosed, PositionOpened, Rebalanced, Swap};
+    use super::{idle_share_bps, RedeployGate, IDLE_REDEPLOY_BASE, IDLE_REDEPLOY_MAX};
+    use std::time::Instant;
+
+    #[test]
+    fn idle_share_values_both_sides_at_the_current_tick() {
+        // tick 0: price 1, so the share is a plain ratio of token counts.
+        assert!((idle_share_bps((50.0, 50.0), (450.0, 450.0), 0) - 1000.0).abs() < 1e-6);
+        assert_eq!(idle_share_bps((0.0, 0.0), (1.0, 1.0), 0), 0.0);
+        assert_eq!(idle_share_bps((0.0, 0.0), (0.0, 0.0), 0), 0.0);
+        // At a higher price token0 is worth more, so idle token0 weighs more.
+        assert!(
+            idle_share_bps((10.0, 0.0), (0.0, 100.0), 6932)
+                > idle_share_bps((10.0, 0.0), (0.0, 100.0), 0)
+        );
+    }
+
+    #[test]
+    fn redeploy_gate_backs_off_while_no_progress_is_made() {
+        let base = IDLE_REDEPLOY_BASE;
+        let mut g = RedeployGate::default();
+        let t0 = Instant::now();
+        assert!(
+            !g.allow("p", 5000.0, t0, base),
+            "first sighting only starts the clock"
+        );
+        assert!(
+            !g.allow("p", 5000.0, t0 + base / 2, base),
+            "still inside the cooldown-covering wait"
+        );
+        let t1 = t0 + base;
+        assert!(
+            g.allow("p", 5000.0, t1, base),
+            "first attempt once the wait is over"
+        );
+
+        // No progress since that attempt: the next wait doubles.
+        let t2 = t1 + base;
+        assert!(g.allow("p", 5000.0, t2, base));
+        assert!(!g.allow(
+            "p",
+            5000.0,
+            t2 + base * 2 - std::time::Duration::from_secs(1),
+            base
+        ));
+        let t3 = t2 + base * 2;
+        assert!(g.allow("p", 5000.0, t3, base));
+
+        // Progress resets the wait to the base.
+        let t4 = t3 + base * 4;
+        assert!(g.allow("p", 1000.0, t4, base));
+        assert!(g.allow("p", 100.0, t4 + base, base));
+
+        // Forgetting restarts the clock rather than allowing at once.
+        g.forget("p");
+        assert!(!g.allow("p", 5000.0, t4 + base * 10, base));
+
+        // The wait is capped.
+        let mut g = RedeployGate::default();
+        let mut t = Instant::now();
+        assert!(!g.allow("q", 5000.0, t, base));
+        for _ in 0..40 {
+            t += IDLE_REDEPLOY_MAX;
+            assert!(g.allow("q", 5000.0, t, base));
+        }
+    }
     use crate::position::tracker::{PositionRow, Tracker};
     use crate::strategy::{default_config, EstimateCostModel, StrategyEngine};
     use alloy::primitives::aliases::{I24, U160, U24};
@@ -469,16 +935,31 @@ mod tests {
         assert_eq!(next_backoff(100).as_secs(), 30);
     }
 
-    fn engine_set() -> (
-        StrategyEngine,
-        EstimateCostModel,
-        crate::proto::PositionConfig,
-    ) {
-        (
-            StrategyEngine::default(),
-            EstimateCostModel,
-            default_config(),
-        )
+    struct Env {
+        engine: StrategyEngine,
+        cost: EstimateCostModel,
+        config: crate::proto::PositionConfig,
+    }
+
+    fn env() -> Env {
+        Env {
+            engine: StrategyEngine::default(),
+            cost: EstimateCostModel,
+            config: default_config(),
+        }
+    }
+
+    fn ctx<'a>(tracker: &'a Arc<Tracker>, e: &'a Env) -> Ctx<'a> {
+        Ctx {
+            tracker,
+            engine: &e.engine,
+            cost: &e.cost,
+            config: &e.config,
+            chain_id: 8453,
+            reader: None,
+            intent_tx: None,
+            last_block: DashMap::new(),
+        }
     }
 
     fn swap_log(pool: B256, tick: i32, removed: bool) -> RpcLog {
@@ -504,8 +985,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn removed_log_skipped_but_valid_recorded() {
+    #[tokio::test]
+    async fn removed_log_skipped_but_valid_recorded() {
         let tracker = Arc::new(Tracker::open_in_memory().unwrap());
         let pool = b256!("0x2222222222222222222222222222222222222222222222222222222222222222");
         let pool_hex = format!("{:#x}", pool);
@@ -524,33 +1005,13 @@ mod tests {
                 tick_spacing: None,
             })
             .unwrap();
-        let (engine, cost, config) = engine_set();
-        let last_block: DashMap<B256, u64> = DashMap::new();
+        let e = env();
+        let c = ctx(&tracker, &e);
 
-        handle(
-            &tracker,
-            &engine,
-            &cost,
-            &config,
-            8453,
-            &last_block,
-            None,
-            swap_log(pool, 150, false),
-        )
-        .unwrap();
+        handle(&c, swap_log(pool, 150, false)).await.unwrap();
         assert_eq!(tracker.recent_ticks(&pool_hex, 10).unwrap(), vec![150]);
 
-        handle(
-            &tracker,
-            &engine,
-            &cost,
-            &config,
-            8453,
-            &last_block,
-            None,
-            swap_log(pool, 160, true),
-        )
-        .unwrap();
+        handle(&c, swap_log(pool, 160, true)).await.unwrap();
         assert_eq!(
             tracker.recent_ticks(&pool_hex, 10).unwrap(),
             vec![150],
@@ -558,11 +1019,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn indexes_position_opened_and_closed() {
+    #[tokio::test]
+    async fn indexes_position_opened_and_closed() {
         let tracker = Arc::new(Tracker::open_in_memory().unwrap());
-        let (engine, cost, config) = engine_set();
-        let last_block: DashMap<B256, u64> = DashMap::new();
+        let e = env();
+        let c = ctx(&tracker, &e);
         let pos_id = b256!("0x00000000000000000000000000000000000000000000000000000000000000aa");
         let pool = b256!("0x00000000000000000000000000000000000000000000000000000000000000bb");
         let hook = address!("0x00000000000000000000000000000000000000ff");
@@ -586,17 +1047,7 @@ mod tests {
             removed: false,
             ..Default::default()
         };
-        handle(
-            &tracker,
-            &engine,
-            &cost,
-            &config,
-            8453,
-            &last_block,
-            None,
-            log,
-        )
-        .unwrap();
+        handle(&c, log).await.unwrap();
         let id_hex = format!("{:#x}", pos_id);
         let p = tracker.get_position(&id_hex).unwrap().expect("indexed");
         assert_eq!((p.tick_lower, p.tick_upper), (-600, 600));
@@ -618,20 +1069,106 @@ mod tests {
             removed: false,
             ..Default::default()
         };
-        handle(
-            &tracker,
-            &engine,
-            &cost,
-            &config,
-            8453,
-            &last_block,
-            None,
-            clog,
-        )
-        .unwrap();
+        handle(&c, clog).await.unwrap();
         assert!(
             tracker.get_position(&id_hex).unwrap().is_none(),
             "closed position removed"
         );
+    }
+
+    fn hook_log(topic0: B256, position_id: B256, removed: bool) -> RpcLog {
+        let inner = PrimLog {
+            address: address!("0x00000000000000000000000000000000000000ff"),
+            data: alloy::primitives::LogData::new_unchecked(
+                vec![topic0, position_id],
+                Default::default(),
+            ),
+        };
+        RpcLog {
+            inner,
+            block_number: Some(9),
+            removed,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn removed_position_log_without_reader_leaves_state_intact() {
+        let tracker = Arc::new(Tracker::open_in_memory().unwrap());
+        tracker
+            .register(&PositionRow {
+                position_id: "0x00000000000000000000000000000000000000000000000000000000000000aa"
+                    .into(),
+                owner: "0x1111111111111111111111111111111111111111".into(),
+                pool_id: "0xpool".into(),
+                chain_id: "8453".into(),
+                tick_lower: -600,
+                tick_upper: 600,
+                current_tick: Some(0),
+                in_range: true,
+                entry_tick: Some(0),
+                fee: Some(3000),
+                tick_spacing: Some(60),
+            })
+            .unwrap();
+        let e = env();
+        let c = ctx(&tracker, &e);
+        let pid = b256!("0x00000000000000000000000000000000000000000000000000000000000000aa");
+
+        handle(&c, hook_log(PositionOpened::SIGNATURE_HASH, pid, true))
+            .await
+            .unwrap();
+
+        let id_hex = format!("{:#x}", pid);
+        assert!(
+            tracker.get_position(&id_hex).unwrap().is_some(),
+            "no reader configured must not silently drop the position"
+        );
+    }
+
+    #[test]
+    fn watermark_advances_and_never_rewinds() {
+        let tracker = Tracker::open_in_memory().unwrap();
+        assert_eq!(tracker.last_indexed_block("8453").unwrap(), None);
+        tracker.set_last_indexed_block("8453", 100).unwrap();
+        assert_eq!(tracker.last_indexed_block("8453").unwrap(), Some(100));
+        tracker.set_last_indexed_block("8453", 50).unwrap();
+        assert_eq!(
+            tracker.last_indexed_block("8453").unwrap(),
+            Some(100),
+            "a late log must not rewind the watermark"
+        );
+        tracker.set_last_indexed_block("8453", 150).unwrap();
+        assert_eq!(tracker.last_indexed_block("8453").unwrap(), Some(150));
+        assert_eq!(
+            tracker.last_indexed_block("1").unwrap(),
+            None,
+            "watermark is per chain"
+        );
+    }
+
+    #[test]
+    fn distinct_pool_ids_dedupes() {
+        let tracker = Tracker::open_in_memory().unwrap();
+        for (i, pool) in ["0xaaa", "0xaaa", "0xbbb"].iter().enumerate() {
+            tracker
+                .register(&PositionRow {
+                    position_id: format!("0xpos{i}"),
+                    owner: "0x1111111111111111111111111111111111111111".into(),
+                    pool_id: (*pool).into(),
+                    chain_id: "8453".into(),
+                    tick_lower: -600,
+                    tick_upper: 600,
+                    current_tick: None,
+                    in_range: false,
+                    entry_tick: None,
+                    fee: None,
+                    tick_spacing: None,
+                })
+                .unwrap();
+        }
+        let mut pools = tracker.distinct_pool_ids().unwrap();
+        pools.sort();
+        assert_eq!(pools, vec!["0xaaa".to_string(), "0xbbb".to_string()]);
     }
 }
