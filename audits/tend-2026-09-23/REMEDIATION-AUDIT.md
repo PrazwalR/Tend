@@ -306,6 +306,16 @@ share not at least 10% lower doubles its wait (base 10 min, capped at a day).
 - The E2E now runs with the WS heartbeat disabled, so stage 7's recovery depends only on the
   sweep's own timer.
 
-**Not exercised end to end.** No E2E stage produces a material idle balance, so the
-redeploy sweep is covered only by unit tests of its threshold and backoff.
+**End to end (E2E stage 8).** The stage pulls the background book and caps swap impact at
+1 bps, then rebalances onto a reshaped range. That leaves 2.07e16 idle, against 9.4e13 of
+dust before. It then restores depth and the impact bound and leaves the rest to the
+daemon. The daemon queued 4 redeploys (the first ones are refused by the hook's cooldown,
+which the backoff absorbs). Idle fell to 9.3e12 with the range unchanged, so the balance
+was placed by a same-range redeploy, not a range change.
+
+**Two E2E false failures, recorded so they are not re-investigated.** macOS idle sleep froze
+anvil and the daemon mid-stage; the power log's sleep window matched the silent gap in the
+daemon log to the second. The script now holds a `caffeinate` assertion while it runs.
+Separately, stage 5 could pick up the sweep's rebalance of the offline-deposited position
+first; it now waits for the position stage 6 inspects.
 

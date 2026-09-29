@@ -66,5 +66,6 @@ contract E2ESetup is Script {
         console2.log("TOKEN0=%s", address(t0));
         console2.log("TOKEN1=%s", address(t1));
         console2.log("SWAPPER=%s", address(sw));
+        console2.log("LP_ROUTER=%s", address(lp));
     }
 }

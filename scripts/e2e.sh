@@ -30,6 +30,9 @@ RPC="http://127.0.0.1:$PORT"
 WS="ws://127.0.0.1:$PORT"
 WORK="$(mktemp -d)"
 DB="$WORK/e2e.sqlite"
+# The run takes ~15 minutes, long enough for macOS idle sleep, which freezes
+# anvil and the daemon mid-stage and fails whichever stage is waiting.
+command -v caffeinate >/dev/null && { caffeinate -i -w $$ & }
 ANVIL_LOG="$WORK/anvil.log"
 DAEMON_LOG="$WORK/daemon.log"
 
@@ -66,6 +69,7 @@ start_daemon() {
   LPA_AUTO_INTERVAL_SECS=1 \
   LPA_WS_HEARTBEAT_SECS=100000 \
   LPA_SWEEP_SECS=5 \
+  LPA_IDLE_REDEPLOY_WAIT_SECS=20 \
   LPA_VOLUME_USD_PER_BLOCK=5000000 \
   DEFAULT_MAX_GAS_USD=500 \
     ./target/debug/lpa --log-format json watch --chain base --execute >>"$DAEMON_LOG" 2>&1 &
@@ -89,6 +93,33 @@ swap() {
     fscript script/E2ESwap.s.sol:E2ESwap \
       --rpc-url "$RPC" --private-key "$DEPLOYER_KEY" --broadcast --slow >/dev/null 2>&1 \
     || fail "swap failed"
+}
+
+# Anvil only mines on a transaction, so with no swaps block.timestamp stands
+# still and a cooldown never elapses. A live chain keeps producing blocks.
+mine() { cast rpc evm_mine --rpc-url "$RPC" >/dev/null 2>&1 || true; }
+
+# Waits until the daemon stops queueing and sending rebalances.
+settle() {
+  local deadline=$((SECONDS + 180)) l0
+  while (( SECONDS < deadline )); do
+    l0=$(wc -l < "$DAEMON_LOG")
+    mine
+    sleep 15
+    tail -n +"$((l0 + 1))" "$DAEMON_LOG" | grep -qE "intent queued|redeploy queued|auto-rebalanced on-chain" || return 0
+  done
+  fail "daemon never settled after $1"
+}
+
+# Sum of a position's idle balance, both tokens, as a decimal integer.
+idle_sum() {
+  cast call "$HOOK" "idle(bytes32)(uint128,uint128)" "$1" --rpc-url "$RPC" 2>/dev/null \
+    | awk '{ print $1 }' | paste -sd+ - | bc
+}
+
+owner_send() {
+  cast send "$HOOK" "$@" --private-key "$DEPLOYER_KEY" --rpc-url "$RPC" >/dev/null 2>&1 \
+    || fail "owner call $1 failed"
 }
 
 kv() { grep -oE "^\s*$1=\S+" "$2" | tail -1 | cut -d= -f2; }
@@ -122,6 +153,7 @@ HOOK=$(kv HOOK "$SETUP_LOG")
 TOKEN0=$(kv TOKEN0 "$SETUP_LOG")
 TOKEN1=$(kv TOKEN1 "$SETUP_LOG")
 SWAPPER=$(kv SWAPPER "$SETUP_LOG")
+LP_ROUTER=$(kv LP_ROUTER "$SETUP_LOG")
 [[ -n "$HOOK" && -n "$TOKEN0" && -n "$SWAPPER" ]] || { tail -30 "$SETUP_LOG"; fail "could not parse setup output"; }
 echo "hook=$HOOK token0=$TOKEN0 token1=$TOKEN1"
 
@@ -181,7 +213,9 @@ step "stage 5 — wait for the daemon to rebalance on-chain"
 DEADLINE=$((SECONDS + 90))
 REBALANCED=0
 while (( SECONDS < DEADLINE )); do
-  if grep -q "auto-rebalanced on-chain" "$DAEMON_LOG"; then REBALANCED=1; break; fi
+  # This position specifically: the sweep may rebalance the offline-deposited
+  # one first, and stage 6 inspects this one.
+  if grep "auto-rebalanced on-chain" "$DAEMON_LOG" | grep -q "$POSITION"; then REBALANCED=1; break; fi
   sleep 3
 done
 
@@ -194,7 +228,7 @@ fi
 
 # Pull the first 32-byte word off the success line: the tx hash precedes the
 # position id. Tolerates any log format, and must not trip `set -e` on no match.
-TXH=$(grep "auto-rebalanced on-chain" "$DAEMON_LOG" | tail -1 | grep -oE '0x[0-9a-fA-F]{64}' | head -1 || true)
+TXH=$(grep "auto-rebalanced on-chain" "$DAEMON_LOG" | grep "$POSITION" | tail -1 | grep -oE '0x[0-9a-fA-F]{64}' | head -1 || true)
 echo "rebalance tx: $TXH"
 [[ -n "$TXH" ]] || fail "could not parse rebalance tx hash"
 STATUS=$(cast receipt "$TXH" --rpc-url "$RPC" --json | jq -r '.status')
@@ -227,16 +261,7 @@ step "stage 7 — a position stuck behind the price guard on a quiet pool recove
 # Let the daemon finish following stage 4's price walk first. Its sweep keeps
 # re-rebalancing positions that fell out of range again, and a rebalance landing
 # after the mark would both read as the recovery and restart the cooldown.
-SETTLE_DEADLINE=$((SECONDS + 180))
-while (( SECONDS < SETTLE_DEADLINE )); do
-  L0=$(wc -l < "$DAEMON_LOG")
-  # Anvil only mines on a transaction, so with no swaps block.timestamp stands
-  # still and a cooldown never elapses. A live chain keeps producing blocks.
-  cast rpc evm_mine --rpc-url "$RPC" >/dev/null 2>&1 || true
-  sleep 15
-  tail -n +"$((L0 + 1))" "$DAEMON_LOG" | grep -qE "intent queued|auto-rebalanced on-chain" || break
-done
-(( SECONDS < SETTLE_DEADLINE )) || fail "daemon never settled after stage 6"
+settle "stage 6"
 # Past the cooldown FIRST: the contract checks it before the price guard, and a
 # RebalanceTooSoon would otherwise mask the condition under test.
 cast rpc evm_increaseTime 120 --rpc-url "$RPC" >/dev/null 2>&1 || true
@@ -261,6 +286,69 @@ echo "pokes sent: $POKES"
 (( POKES > 0 )) || fail "daemon never poked the price reference"
 (( RECOVERED == 1 )) || fail "position stayed stuck behind the price guard"
 echo "OK: stuck position recovered via sweep + poke with no further swaps"
+
+step "stage 8 — a capped swap leaves an idle balance, and the daemon places it"
+# Starve the re-ratio swap. The background book (1e21) is ~1000x a position, so
+# even 1 bps of impact trades more than the position holds: pull the book first,
+# leaving only the other hook position as depth, then cap impact at 1 bps. A
+# rebalance onto a reshaped range then cannot convert what it needs, and part of
+# the position is left over. The rebalance is sent here directly, as the
+# rebalancer: this stage tests the daemon noticing and placing the balance, not
+# whether its strategy would pick this moment to rebalance.
+settle "stage 7"
+cast rpc evm_increaseTime 120 --rpc-url "$RPC" >/dev/null 2>&1 || true
+mine
+IDLE_POS=$POSITION
+BASE=$(idle_sum "$IDLE_POS"); BASE=${BASE:-0}
+SPOT=$(sqlite3 "$DB" "SELECT current_tick FROM positions WHERE position_id='$IDLE_POS'")
+C=$(( (SPOT / 60) * 60 ))
+# Asymmetric around spot, so the old holdings are the wrong mix for it, but not
+# near either edge, so the daemon's strategy has no reason to move it again.
+LO=$((C - 1800)); HI=$((C + 600))
+# Settling does not mean the price reference has caught up with spot, and a
+# direct rebalance gets no pokes from the daemon; walk it in, one block a step.
+for _ in $(seq 1 12); do
+  cast send "$HOOK" "pokePriceRef((address,address,uint24,int24,address))" \
+    "($TOKEN0,$TOKEN1,3000,60,$HOOK)" --private-key "$DEPLOYER_KEY" --rpc-url "$RPC" >/dev/null 2>&1 || true
+done
+background() {
+  cast send --private-key "$DEPLOYER_KEY" --rpc-url "$RPC" "$LP_ROUTER" \
+    "modifyLiquidity((address,address,uint24,int24,address),(int24,int24,int256,bytes32),bytes)" \
+    -- "($TOKEN0,$TOKEN1,3000,60,$HOOK)" "(-60000,60000,$1,0x0000000000000000000000000000000000000000000000000000000000000000)" 0x \
+    >/dev/null 2>&1 || fail "background liquidity change $1 failed"
+}
+background -1000000000000000000000
+owner_send "setMaxSwapImpactBps(uint16)" 1
+MARK=$(wc -l < "$DAEMON_LOG")
+# Options before `--`: everything after it is a positional argument, and the
+# negative ticks need it so they are not read as flags.
+if ! OUT=$(cast send --private-key "$REBALANCER_KEY" --rpc-url "$RPC" \
+  "$HOOK" "rebalance(bytes32,int24,int24,uint128)" -- "$IDLE_POS" "$LO" "$HI" 0 2>&1); then
+  echo "$OUT" | tail -3
+  fail "starved rebalance onto [$LO, $HI] reverted"
+fi
+IDLE_BEFORE=$(idle_sum "$IDLE_POS"); IDLE_BEFORE=${IDLE_BEFORE:-0}
+echo "starved rebalance onto [$LO, $HI]: idle $BASE -> $IDLE_BEFORE"
+[[ $(echo "$IDLE_BEFORE > $BASE * 100" | bc) == 1 ]] || fail "the starved swap did not leave an idle balance"
+
+# Depth is usable again. The daemon has to notice the idle balance on its own.
+background 1000000000000000000000
+owner_send "setMaxSwapImpactBps(uint16)" 1000
+PLACED=0
+DEADLINE=$((SECONDS + 300))
+while (( SECONDS < DEADLINE )); do
+  mine
+  sleep 5
+  v=$(idle_sum "$IDLE_POS"); v=${v:-0}
+  if [[ $(echo "$v * 10 < $IDLE_BEFORE" | bc) == 1 ]]; then PLACED=1; break; fi
+done
+QUEUED=$(since | grep -c "idle balance redeploy queued" || true)
+echo "idle redeploys queued: $QUEUED; idle now: $v"
+(( QUEUED > 0 )) || fail "daemon never queued an idle redeploy"
+(( PLACED == 1 )) || fail "idle balance was not placed (still $v of $IDLE_BEFORE)"
+RANGE_NOW=$(cast call "$HOOK" "positions(bytes32)(address,(address,address,uint24,int24,address),int24,int24,uint128,bool,uint64)" "$IDLE_POS" --rpc-url "$RPC" | sed -n '3,4p' | awk '{ print $1 }' | paste -sd, -)
+[[ "$RANGE_NOW" == "$LO,$HI" ]] || fail "placed by a range change ($RANGE_NOW), not a same-range redeploy"
+echo "OK: idle balance placed back into [$LO, $HI] by a same-range rebalance"
 
 echo
 echo "E2E PASSED — full loop verified against a real v4 PoolManager."
