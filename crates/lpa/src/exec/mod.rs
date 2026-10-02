@@ -58,6 +58,21 @@ pub fn classify_preflight(revert: &str) -> PreflightBlock {
     }
 }
 
+/// What makes two preflight refusals "the same" for logging: the custom-error
+/// selector when there is one. The full reason embeds the error's arguments —
+/// spot and reference ticks, a ready-at timestamp — which change on every retry,
+/// so keying on it logged every single refusal.
+pub fn refusal_key(revert: &str) -> String {
+    let lower = revert.to_lowercase();
+    if let Some(i) = lower.find("custom error 0x") {
+        let start = i + "custom error ".len();
+        if let Some(sel) = lower.get(start..start + 10) {
+            return sel.to_string();
+        }
+    }
+    revert.to_string()
+}
+
 /// Solidity `int24` bounds (Uniswap tick domain).
 const I24_MIN: i32 = -8_388_608;
 const I24_MAX: i32 = 8_388_607;
@@ -343,11 +358,14 @@ pub async fn run_executor_loop(
         if !sim.ok {
             let reason = sim.revert.unwrap_or_default();
             let block = classify_preflight(&reason);
-            // Warn once per distinct reason, then stay quiet: the sweep retries
-            // every heartbeat and would otherwise repeat the same line forever.
-            if last_block.get(&intent.position_id) != Some(&reason) {
+            // Warn once per kind of refusal, then stay quiet: the sweep retries
+            // every pass and would otherwise repeat the same line forever.
+            let key = refusal_key(&reason);
+            if last_block.get(&intent.position_id) != Some(&key) {
                 tracing::warn!(position = %intent.position_id, ?block, reason = %reason, "rebalance blocked at preflight");
-                last_block.insert(intent.position_id.clone(), reason);
+                last_block.insert(intent.position_id.clone(), key);
+            } else {
+                tracing::debug!(position = %intent.position_id, ?block, "rebalance still blocked at preflight");
             }
             if block == PreflightBlock::PriceDeviation {
                 poke_once(&executor, &cfg, pid, &intent.position_id, &mut last_poke).await;
@@ -466,5 +484,16 @@ mod tests {
         assert!(poke_due(None, now), "first poke of a pool is always due");
         assert!(!poke_due(Some(now), now), "not twice in one interval");
         assert!(poke_due(Some(now), now + POKE_MIN_INTERVAL));
+    }
+
+    #[test]
+    fn refusals_dedupe_on_selector_not_arguments() {
+        let a = "server returned an error response: error code 3: execution reverted: custom error 0x1782bd94: fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff9e4";
+        let b = "server returned an error response: error code 3: execution reverted: custom error 0x1782bd94: fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffbd8";
+        let c = "server returned an error response: error code 3: execution reverted: custom error 0x2ddcae9c: 000000000000000000000000000000000000000000000000000000006ab8a0df";
+        assert_eq!(refusal_key(a), "0x1782bd94");
+        assert_eq!(refusal_key(a), refusal_key(b));
+        assert_ne!(refusal_key(a), refusal_key(c));
+        assert_eq!(refusal_key("connection refused"), "connection refused");
     }
 }

@@ -333,7 +333,7 @@ echo "starved rebalance onto [$LO, $HI]: idle $BASE -> $IDLE_BEFORE"
 
 # Depth is usable again. The daemon has to notice the idle balance on its own.
 background 1000000000000000000000
-owner_send "setMaxSwapImpactBps(uint16)" 1000
+owner_send "setMaxSwapImpactBps(uint16)" 50
 PLACED=0
 DEADLINE=$((SECONDS + 300))
 while (( SECONDS < DEADLINE )); do

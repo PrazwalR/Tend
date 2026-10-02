@@ -461,6 +461,7 @@ contract AutopilotHookTest is Test, Deployers {
         assertLt(tick, int24(-600), "price should have exited the range below");
 
         vm.warp(block.timestamp + COOLDOWN);
+        _catchUpRef();
         vm.prank(rebalancer);
         uint128 newLiq = hook.rebalance(pid, -1800, -600, 0);
 
@@ -491,6 +492,7 @@ contract AutopilotHookTest is Test, Deployers {
         int24 upper = ((tick + 600) / 60) * 60;
 
         vm.warp(block.timestamp + COOLDOWN);
+        _catchUpRef();
         vm.prank(rebalancer);
         uint128 newLiq = hook.rebalance(pid, lower, upper, 0);
         assertGt(newLiq, 0, "straddling range must be funded from one-sided holdings");
@@ -511,6 +513,7 @@ contract AutopilotHookTest is Test, Deployers {
             ""
         );
         vm.warp(block.timestamp + COOLDOWN);
+        _catchUpRef();
         vm.prank(rebalancer);
         vm.expectPartialRevert(AutopilotHook.SlippageExceeded.selector);
         hook.rebalance(pid, -1800, -600, type(uint128).max);
@@ -667,6 +670,7 @@ contract AutopilotHookTest is Test, Deployers {
         assertLt(drifted, int24(-600), "position should be out of range");
 
         vm.warp(block.timestamp + COOLDOWN);
+        _catchUpRef(); // the daemon pokes before it retries
 
         // The grief: withdraw the dominant depth in the same block as the rebalance.
         modifyLiquidityRouter.modifyLiquidity(
@@ -831,18 +835,18 @@ contract AutopilotHookTest is Test, Deployers {
     function test_price_guard_is_owner_only_and_bounded() public {
         vm.prank(attacker);
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, attacker));
-        hook.setPriceGuard(100, 500);
+        hook.setPriceGuard(100, 150);
 
         int24 maxMove = hook.MAX_TICK_MOVE_PER_BLOCK();
         vm.expectRevert(AutopilotHook.DeviationBoundTooHigh.selector);
-        hook.setPriceGuard(maxMove + 1, 500);
+        hook.setPriceGuard(maxMove + 1, 150);
 
         vm.expectRevert(AutopilotHook.DeviationBoundTooHigh.selector);
-        hook.setPriceGuard(0, 500);
+        hook.setPriceGuard(0, 150);
 
-        hook.setPriceGuard(100, 500);
+        hook.setPriceGuard(100, 150);
         assertEq(hook.maxTickMovePerBlock(), int24(100));
-        assertEq(hook.maxDeviationTicks(), int24(500));
+        assertEq(hook.maxDeviationTicks(), int24(150));
     }
 
     // --- O-4 regression: an L2 restart must not execute queued rebalances ---
@@ -1113,6 +1117,132 @@ contract AutopilotHookTest is Test, Deployers {
 
     // --- Re-audit R-2 / R-3: price-reference lifecycle ---
 
+    // R-6. Spot exactly on the target's lower edge: the straddle branch must not
+    // treat the whole range as room to travel. Measured on a deep pool (where an
+    // overshooting fill is cheap to execute) and as sole LP (where it is not).
+    function test_r6_spot_on_lower_edge_deep_pool() public {
+        _deepPool();
+        _r6(0, 600);
+    }
+
+    function test_r6_spot_on_upper_edge_deep_pool() public {
+        _deepPool();
+        _r6(-600, 0);
+    }
+
+    function test_r6_spot_on_lower_edge_sole_lp() public {
+        _r6(0, 600);
+    }
+
+    function test_r6_spot_on_upper_edge_sole_lp() public {
+        _r6(-600, 0);
+    }
+
+    // The cost of an empty-book walk is not paid in the rebalance, where the value
+    // guard looks, but afterwards: arbitrage pulls price back to fair through the
+    // freshly placed position. Measured end to end, at the fair price.
+    function test_r6_empty_book_walk_cost_is_bounded() public {
+        MockERC20 t0 = MockERC20(Currency.unwrap(currency0));
+        MockERC20 t1 = MockERC20(Currency.unwrap(currency1));
+        uint256 a0 = t0.balanceOf(address(this));
+        uint256 a1 = t1.balanceOf(address(this));
+        bytes32 pid = _deposit(-600, 600, 1e18);
+        uint256 valueIn = (a0 - t0.balanceOf(address(this))) + (a1 - t1.balanceOf(address(this)));
+
+        vm.warp(block.timestamp + COOLDOWN);
+        vm.prank(rebalancer);
+        hook.rebalance(pid, 0, 600, 0);
+        _nextBlock();
+        _swapTo(0); // arbitrage restores the fair price of 1
+
+        // Only the withdrawal is counted: this contract is also the arbitrageur,
+        // so its total balance would net the arbitrage gain against the loss.
+        a0 = t0.balanceOf(address(this));
+        a1 = t1.balanceOf(address(this));
+        hook.withdraw(pid);
+        uint256 valueOut = (t0.balanceOf(address(this)) - a0) + (t1.balanceOf(address(this)) - a1);
+
+        uint256 lost = valueIn > valueOut ? valueIn - valueOut : 0;
+        emit log_named_uint("position value in", valueIn);
+        emit log_named_uint("lost to the walk (bps)", lost * 10_000 / valueIn);
+        assertLe(lost * 10_000, valueIn * hook.maxRebalanceLossBps(), "within the rebalance loss tolerance");
+    }
+
+    // A-9. An attacker pushes spot just inside the deviation bound, the rebalance
+    // lands at that price (the daemon centres its new range on the tick it sees),
+    // and the attacker swaps back. The value guard measures both sides at the
+    // manipulated price, so it sees a fair trade. Measured against a control that
+    // takes the same push and swap-back without the rebalance.
+    function test_a9_rebalance_at_manipulated_price() public {
+        _deepPool();
+        bytes32 pid = _deposit(-600, 600, 1e18);
+        vm.warp(block.timestamp + COOLDOWN);
+        _nextBlock();
+
+        // The push the old 2000-tick bound admitted, at a 1428 bps loss, is refused.
+        _swapTo(1990);
+        vm.prank(rebalancer);
+        vm.expectPartialRevert(AutopilotHook.PriceDeviation.selector);
+        hook.rebalance(pid, 780, 3180, 0);
+        _swapTo(0);
+        _nextBlock();
+
+        // The largest push the bound admits stays inside the loss tolerance. The
+        // default is also the cap, so this covers anything the owner can set.
+        uint256 lost = _a9Loss(pid, hook.MAX_DEVIATION_TICKS() - 10);
+        emit log_named_uint("loss at the bound (bps)", lost);
+        assertLe(lost, hook.maxRebalanceLossBps(), "within the rebalance loss tolerance");
+    }
+
+    function _a9Loss(bytes32 pid, int24 push) internal returns (uint256) {
+        uint256 snap = vm.snapshotState();
+        uint256 control = _a9Run(pid, push, false);
+        vm.revertToState(snap);
+        uint256 attacked = _a9Run(pid, push, true);
+        vm.revertToState(snap);
+        return control > attacked ? (control - attacked) * 10_000 / control : 0;
+    }
+
+    function _a9Run(bytes32 pid, int24 push, bool rebalance) internal returns (uint256 valueOut) {
+        _swapTo(push);
+        if (rebalance) {
+            // The daemon centres the new range on the tick it observes. One tick
+            // spacing either side is the narrowest it picks, and the worst case.
+            int24 c = (push / 60) * 60;
+            vm.prank(rebalancer);
+            hook.rebalance(pid, c - 60, c + 60, 0);
+        }
+        _swapTo(0);
+        MockERC20 t0 = MockERC20(Currency.unwrap(currency0));
+        MockERC20 t1 = MockERC20(Currency.unwrap(currency1));
+        uint256 a0 = t0.balanceOf(address(this));
+        uint256 a1 = t1.balanceOf(address(this));
+        hook.withdraw(pid);
+        valueOut = (t0.balanceOf(address(this)) - a0) + (t1.balanceOf(address(this)) - a1);
+    }
+
+    function _r6(int24 lo, int24 hi) internal {
+        bytes32 pid = _deposit(-600, 600, 1e18);
+        (uint160 sqrt0, int24 t0,,) = manager.getSlot0(id);
+        assertEq(t0, int24(0));
+        assertEq(sqrt0, TickMath.getSqrtPriceAtTick(0), "spot sits exactly on the edge");
+        vm.warp(block.timestamp + COOLDOWN);
+        vm.prank(rebalancer);
+        hook.rebalance(pid, lo, hi, 0);
+
+        (, int24 t1,,) = manager.getSlot0(id);
+        (uint128 h0, uint128 h1) = hook.idle(pid);
+        (,,,, uint128 liq,,) = hook.positions(pid);
+        emit log_named_int("tick after", t1);
+        emit log_named_uint("idle0", h0);
+        emit log_named_uint("idle1", h1);
+        emit log_named_uint("liquidity", liq);
+        assertGt(liq, 0);
+        // The swap may enter the range it is funding but must not cross it.
+        assertGe(t1, lo, "price left the target range below");
+        assertLe(t1, hi, "price left the target range above");
+    }
+
     function _deepPool() internal {
         modifyLiquidityRouter.modifyLiquidity(
             key, ModifyLiquidityParams({tickLower: -60000, tickUpper: 60000, liquidityDelta: 1e21, salt: 0}), ""
@@ -1139,6 +1269,16 @@ contract AutopilotHookTest is Test, Deployers {
     /// the same block. Read the real value from the cheatcode instead.
     function _nextBlock() internal {
         vm.roll(vm.getBlockNumber() + 1);
+    }
+
+    /// What the daemon does after a fast move: poke once a block until the price
+    /// reference has caught up with spot (500 ticks a block, so 10 covers 5000).
+    function _catchUpRef() internal {
+        for (uint256 i; i < 10; i++) {
+            _nextBlock();
+            hook.pokePriceRef(key);
+        }
+        _nextBlock();
     }
 
     function _ref() internal view returns (int24 tick, int24 anchor) {
@@ -1239,8 +1379,8 @@ contract AutopilotHookTest is Test, Deployers {
         vm.expectPartialRevert(AutopilotHook.PriceDeviation.selector);
         hook.rebalance(pid, -3600, -2400, 0);
 
-        // No swaps from here on. Poke once per block.
-        for (uint256 i = 0; i < 3; i++) {
+        // No swaps from here on. Poke once per block: (3000 - 500) / 500 = 5.
+        for (uint256 i = 0; i < 5; i++) {
             hook.pokePriceRef(key);
             _nextBlock();
         }

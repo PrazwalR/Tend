@@ -104,7 +104,16 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
     /// @dev Ceiling on how far the reference tick may be dragged in one block,
     ///      and on the spot-vs-reference gap a rebalance will tolerate.
     int24 public constant MAX_TICK_MOVE_PER_BLOCK = 500;
-    int24 public constant MAX_DEVIATION_TICKS = 2000;
+    /// @dev A rebalance landing on a pushed price buys at that price, and the value
+    ///      guard cannot see it: it measures both sides at the same pushed price.
+    ///      So this bound, not the value guard, is the real limit on manipulation
+    ///      loss. Measured worst case, onto the narrowest range the daemon picks
+    ///      (one tick spacing either side of spot): 78 bps at 200 ticks, over the 1%
+    ///      tolerance at anything looser (113-159 bps at 250-350); 1428 bps at the
+    ///      2000 this used to be. Hence it is both the default and the cap — the owner
+    ///      may only tighten it. Honest rebalances pay only a delay: after a fast move
+    ///      the daemon pokes the reference up to spot, 500 ticks a block.
+    int24 public constant MAX_DEVIATION_TICKS = 200;
     /// @dev Ceiling on how far the re-ratio swap may move sqrtPrice from spot.
     uint16 public constant MAX_SWAP_IMPACT_BPS = 2000;
     /// @dev Time an L2 must have been back up before rebalancing resumes. On
@@ -254,7 +263,7 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
         maxRebalanceLossBps = 100; // 1%
         emit MaxRebalanceLossBpsSet(100);
 
-        maxSwapImpactBps = 1000; // 10% of sqrtPrice
+        maxSwapImpactBps = 50; // 0.5% of sqrtPrice, ~1% of price
         maxTickMovePerBlock = MAX_TICK_MOVE_PER_BLOCK;
         maxDeviationTicks = MAX_DEVIATION_TICKS;
         emit PriceGuardSet(MAX_TICK_MOVE_PER_BLOCK, MAX_DEVIATION_TICKS);
