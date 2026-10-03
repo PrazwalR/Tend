@@ -32,7 +32,8 @@ WORK="$(mktemp -d)"
 DB="$WORK/e2e.sqlite"
 # The run takes ~15 minutes, long enough for macOS idle sleep, which freezes
 # anvil and the daemon mid-stage and fails whichever stage is waiting.
-command -v caffeinate >/dev/null && { caffeinate -i -w $$ & }
+CAFFEINATE_PID=""
+command -v caffeinate >/dev/null && { caffeinate -i -w $$ & CAFFEINATE_PID=$!; }
 ANVIL_LOG="$WORK/anvil.log"
 DAEMON_LOG="$WORK/daemon.log"
 
@@ -48,7 +49,10 @@ ANVIL_PID=""; DAEMON_PID=""
 cleanup() {
   [[ -n "$DAEMON_PID" ]] && kill "$DAEMON_PID" 2>/dev/null || true
   [[ -n "$ANVIL_PID" ]] && kill "$ANVIL_PID" 2>/dev/null || true
-  wait 2>/dev/null || true
+  # caffeinate is waiting for this script to exit, so a bare `wait` here would
+  # wait on it forever. Stop it, and wait only on what was killed above.
+  [[ -n "$CAFFEINATE_PID" ]] && kill "$CAFFEINATE_PID" 2>/dev/null || true
+  wait $DAEMON_PID $ANVIL_PID $CAFFEINATE_PID 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -72,6 +76,7 @@ start_daemon() {
   LPA_IDLE_REDEPLOY_WAIT_SECS=20 \
   LPA_VOLUME_USD_PER_BLOCK=5000000 \
   DEFAULT_MAX_GAS_USD=500 \
+  LPA_MAX_SPEND_USD_PER_HOUR=1000000 \
     ./target/debug/lpa --log-format json watch --chain base --execute >>"$DAEMON_LOG" 2>&1 &
   DAEMON_PID=$!
   sleep 3
@@ -117,18 +122,16 @@ idle_sum() {
     | awk '{ print $1 }' | paste -sd+ - | bc
 }
 
-owner_send() {
-  cast send "$HOOK" "$@" --private-key "$DEPLOYER_KEY" --rpc-url "$RPC" >/dev/null 2>&1 \
-    || fail "owner call $1 failed"
-}
-
 kv() { grep -oE "^\s*$1=\S+" "$2" | tail -1 | cut -d= -f2; }
 
 # forge resolves script paths against its project root, not the shell's cwd.
 fscript() { (cd "$ROOT/contracts" && forge script "$@"); }
 
 step "booting anvil fork of Base"
-anvil --fork-url "$RPC_BASE" --port "$PORT" --silent >"$ANVIL_LOG" 2>&1 &
+# A block every 2 s, like Base. The hook needs the price reference to have sat
+# on spot for several block ends before it rebalances, and an anvil that only
+# mines on a transaction never produces the quiet blocks a real chain does.
+anvil --fork-url "$RPC_BASE" --port "$PORT" --block-time 2 --silent >"$ANVIL_LOG" 2>&1 &
 ANVIL_PID=$!
 for _ in $(seq 1 60); do
   cast block-number --rpc-url "$RPC" >/dev/null 2>&1 && break
@@ -210,7 +213,9 @@ TICK=$(cast call "$HOOK" "positions(bytes32)(address,(address,address,uint24,int
 echo "post-swap stored range lower=$TICK"
 
 step "stage 5 — wait for the daemon to rebalance on-chain"
-DEADLINE=$((SECONDS + 90))
+# After a jump the hook waits for its price reference to catch up with spot and
+# then sit there for MIN_STABLE_BLOCKS block ends; the daemon pokes it along.
+DEADLINE=$((SECONDS + 240))
 REBALANCED=0
 while (( SECONDS < DEADLINE )); do
   # This position specifically: the sweep may rebalance the offline-deposited
@@ -278,21 +283,23 @@ while (( SECONDS < DEADLINE )); do
   sleep 5
 done
 
-BLOCKED=$(since | grep -c "PriceDeviation" || true)
+# The executor logs a reference-lag refusal (PriceDeviation or PriceUnsettled)
+# as action "Poke".
+BLOCKED=$(since | grep "blocked at preflight" | grep -c '"action":"Poke"' || true)
 POKES=$(since | grep -c "poked price reference toward spot" || true)
-echo "preflight refusals citing PriceDeviation: $BLOCKED"
+echo "preflight refusals on a lagging price reference: $BLOCKED"
 echo "pokes sent: $POKES"
-(( BLOCKED > 0 )) || fail "stage 7 never reproduced the stuck condition (no PriceDeviation refusal)"
+(( BLOCKED > 0 )) || fail "stage 7 never reproduced the stuck condition (no reference-lag refusal)"
 (( POKES > 0 )) || fail "daemon never poked the price reference"
 (( RECOVERED == 1 )) || fail "position stayed stuck behind the price guard"
 echo "OK: stuck position recovered via sweep + poke with no further swaps"
 
 step "stage 8 — a capped swap leaves an idle balance, and the daemon places it"
-# Starve the re-ratio swap. The background book (1e21) is ~1000x a position, so
-# even 1 bps of impact trades more than the position holds: pull the book first,
-# leaving only the other hook position as depth, then cap impact at 1 bps. A
-# rebalance onto a reshaped range then cannot convert what it needs, and part of
-# the position is left over. The rebalance is sent here directly, as the
+# Starve the re-ratio swap: pull the background book (1e21, ~1000x a position),
+# leaving only the other hook position as depth. Under the default 50 bps impact
+# bound a rebalance onto a reshaped range then cannot convert what it needs, and
+# part of the position is left over. (Loosening the bound afterwards would be a
+# timelocked change, and jumping anvil two days would stale the ETH price feed.) The rebalance is sent here directly, as the
 # rebalancer: this stage tests the daemon noticing and placing the balance, not
 # whether its strategy would pick this moment to rebalance.
 settle "stage 7"
@@ -318,7 +325,6 @@ background() {
     >/dev/null 2>&1 || fail "background liquidity change $1 failed"
 }
 background -1000000000000000000000
-owner_send "setMaxSwapImpactBps(uint16)" 1
 MARK=$(wc -l < "$DAEMON_LOG")
 # Options before `--`: everything after it is a positional argument, and the
 # negative ticks need it so they are not read as flags.
@@ -333,7 +339,6 @@ echo "starved rebalance onto [$LO, $HI]: idle $BASE -> $IDLE_BEFORE"
 
 # Depth is usable again. The daemon has to notice the idle balance on its own.
 background 1000000000000000000000
-owner_send "setMaxSwapImpactBps(uint16)" 50
 PLACED=0
 DEADLINE=$((SECONDS + 300))
 while (( SECONDS < DEADLINE )); do

@@ -18,6 +18,7 @@ use tokio::sync::mpsc;
 use crate::chain::config::ChainConfig;
 use crate::chain::oracle::EthPrice;
 use crate::chain::reader::ChainReader;
+use crate::exec::automation::automation;
 use crate::exec::RebalanceIntent;
 use crate::position::tracker::{PositionRow, Tracker};
 use crate::proto::PositionConfig;
@@ -72,6 +73,8 @@ const INITIAL_GAS_PRICE_WEI: u64 = 5_000_000_000;
 const DEFAULT_HEARTBEAT_SECS: u64 = 30;
 /// Default seconds between sweeps for stuck or under-deployed positions.
 const DEFAULT_SWEEP_SECS: u64 = 30;
+/// Items buffered per log subscription before alloy starts skipping them.
+const SUBSCRIPTION_BUFFER: usize = 4096;
 /// Upper bound on one sweep pass; see the watch loop.
 const SWEEP_TIMEOUT: Duration = Duration::from_secs(20);
 /// Idle share of a position, in bps, worth a transaction to place. Below it the
@@ -207,7 +210,14 @@ async fn watch_once(
     let swap_filter = Filter::new()
         .address(cfg.addrs.pool_manager)
         .event_signature(Swap::SIGNATURE_HASH);
-    let swap_stream = provider.subscribe_logs(&swap_filter).await?.into_stream();
+    // alloy buffers 16 items per subscription by default and silently skips what
+    // overflows. A larger buffer makes that rarer; the per-sweep backfill below
+    // is what makes it harmless.
+    let swap_stream = provider
+        .subscribe_logs(&swap_filter)
+        .channel_size(SUBSCRIPTION_BUFFER)
+        .await?
+        .into_stream();
     info!(pool_manager = %cfg.addrs.pool_manager, "subscribed to v4 Swap events");
 
     let mut stream = match hook {
@@ -217,7 +227,11 @@ async fn watch_once(
                 PositionClosed::SIGNATURE_HASH,
                 Rebalanced::SIGNATURE_HASH,
             ]);
-            let hook_stream = provider.subscribe_logs(&hook_filter).await?.into_stream();
+            let hook_stream = provider
+                .subscribe_logs(&hook_filter)
+                .channel_size(SUBSCRIPTION_BUFFER)
+                .await?
+                .into_stream();
             info!(hook = %h, "indexing AutopilotHook position events");
             futures_util::stream::select(swap_stream, hook_stream).boxed()
         }
@@ -226,7 +240,7 @@ async fn watch_once(
 
     // Subscriptions only deliver logs from now on. Anything that happened while
     // the daemon was down is replayed here before the live stream is served.
-    if let Err(e) = backfill(&provider, cfg, ctx, hook).await {
+    if let Err(e) = backfill(&provider, cfg, ctx, hook, true).await {
         warn!(error = %e, "backfill failed; continuing on live stream only");
     }
 
@@ -248,31 +262,40 @@ async fn watch_once(
     ));
     sweep.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut since_prune = 0u32;
+    // The sweep runs beside the log stream, not instead of it: while a sweep
+    // awaited its RPCs the stream went unread, its buffer overflowed, and logs
+    // were silently lost (re-audit DS-5).
+    let mut sweeping: Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + '_>>> = None;
     loop {
         tokio::select! {
-            _ = sweep.tick() => {
-                // Inline in the watch loop, so a hung RPC here would also stop
-                // log processing; bound it and let the next tick try again.
-                let started = Instant::now();
-                let pass = async {
-                    sweep_out_of_range(ctx).await;
-                    sweep_idle(ctx).await;
-                };
-                match timeout(SWEEP_TIMEOUT, pass).await {
-                    Ok(()) => debug!(elapsed_ms = started.elapsed().as_millis() as u64, "sweep pass done"),
-                    Err(_) => warn!(timeout_secs = SWEEP_TIMEOUT.as_secs(), "sweep pass timed out; abandoned until next tick"),
-                }
+            _ = sweep.tick(), if sweeping.is_none() => {
+                let provider = &provider;
+                sweeping = Some(Box::pin(async move {
+                    let started = Instant::now();
+                    let pass = async {
+                        // Catch up from the watermark first. The live stream is
+                        // a latency optimisation; this is what guarantees that a
+                        // log the stream dropped is still processed, and it is
+                        // the only thing that advances the watermark.
+                        if let Err(e) = backfill(provider, cfg, ctx, hook, false).await {
+                            warn!(error = %e, "catch-up backfill failed");
+                        }
+                        sweep_out_of_range(ctx).await;
+                        sweep_idle(ctx).await;
+                    };
+                    match timeout(SWEEP_TIMEOUT, pass).await {
+                        Ok(()) => debug!(elapsed_ms = started.elapsed().as_millis() as u64, "sweep pass done"),
+                        Err(_) => warn!(timeout_secs = SWEEP_TIMEOUT.as_secs(), "sweep pass timed out; resumes next tick"),
+                    }
+                }));
+            }
+            _ = async { sweeping.as_mut().expect("guarded").await }, if sweeping.is_some() => {
+                sweeping = None;
             }
             maybe_log = stream.next() => match maybe_log {
                 Some(log) => {
-                    let block = log.block_number;
                     if let Err(e) = handle(ctx, log).await {
                         error!(error = %e, "log handling error");
-                    }
-                    if let Some(b) = block {
-                        if let Err(e) = ctx.tracker.set_last_indexed_block(&ctx.chain_key(), b) {
-                            warn!(error = %e, "watermark update failed");
-                        }
                     }
                     since_prune += 1;
                     if since_prune >= PRUNE_EVERY {
@@ -290,11 +313,7 @@ async fn watch_once(
                         if let Ok(gp) = provider.get_gas_price().await {
                             store_gas_price(gas_price, gp);
                         }
-                        // A quiet pool is still indexed ground; record it so a
-                        // restart does not re-scan blocks that held no logs.
-                        if let Err(e) = ctx.tracker.set_last_indexed_block(&ctx.chain_key(), head) {
-                            warn!(error = %e, "watermark update failed");
-                        }
+                        debug!(head, "WS heartbeat ok");
                     }
                     _ => {
                         warn!("WS heartbeat health-check failed; forcing reconnect");
@@ -315,6 +334,7 @@ async fn backfill<P: Provider>(
     cfg: &ChainConfig,
     ctx: &Ctx<'_>,
     hook: Option<Address>,
+    on_connect: bool,
 ) -> Result<()> {
     let head = provider.get_block_number().await?;
     let Some(watermark) = ctx.tracker.last_indexed_block(&ctx.chain_key())? else {
@@ -343,12 +363,18 @@ async fn backfill<P: Provider>(
         .iter()
         .filter_map(|p| p.parse::<B256>().ok())
         .collect();
-    info!(
-        from,
-        to = head,
-        pools = pool_topics.len(),
-        "backfilling missed logs"
-    );
+    // Every sweep catches up a few blocks; only the catch-up on (re)connect, or a
+    // real gap, is worth an info line.
+    if on_connect || head - from > 50 {
+        info!(
+            from,
+            to = head,
+            pools = pool_topics.len(),
+            "backfilling missed logs"
+        );
+    } else {
+        debug!(from, to = head, "catching up from watermark");
+    }
 
     let mut start = from;
     let mut replayed = 0usize;
@@ -387,7 +413,7 @@ async fn backfill<P: Provider>(
         ctx.tracker.set_last_indexed_block(&ctx.chain_key(), end)?;
         start = end + 1;
     }
-    info!(replayed, "backfill complete");
+    debug!(replayed, "backfill complete");
     Ok(())
 }
 
@@ -544,6 +570,8 @@ fn handle_closed(ctx: &Ctx<'_>, log: Log) -> Result<()> {
     };
     let position_id = format!("{:#x}", ev.positionId);
     ctx.tracker.delete_position(&position_id)?;
+    automation().forget(&position_id);
+    idle_gate().lock().unwrap().forget(&position_id);
     info!(position_id = %position_id, "indexed PositionClosed");
     Ok(())
 }
@@ -587,9 +615,15 @@ async fn position_value_usd(ctx: &Ctx<'_>, p: &PositionRow) -> f64 {
     else {
         return 0.0;
     };
+    // Everything the position owns: deployed liquidity, uncollected fees, and
+    // whatever a bounded swap left idle — which can be most of the position
+    // after a thin-pool rebalance (re-audit TK-2).
+    let (idle0, idle1) = reader.idle_balance(position_id).await.unwrap_or((0, 0));
     let price = 1.0001f64.powi(snap.current_tick);
     let to_f64 = |v: alloy::primitives::U256| -> f64 { format!("{v}").parse().unwrap_or(0.0) };
-    let value_token1 = to_f64(snap.amount0) * price + to_f64(snap.amount1);
+    let amount0 = to_f64(snap.amount0) + to_f64(snap.fees0) + idle0 as f64;
+    let amount1 = to_f64(snap.amount1) + to_f64(snap.fees1) + idle1 as f64;
+    let value_token1 = amount0 * price + amount1;
     if !value_token1.is_finite() {
         return 0.0;
     }
@@ -611,12 +645,32 @@ async fn sweep_out_of_range(ctx: &Ctx<'_>) {
             return;
         }
     };
-    for p in positions {
+    // Start each pass somewhere else, so that when the queue is full it is not
+    // always the same positions, the first by insertion order, that get in.
+    let start = rotation_start(&OOR_CURSOR, positions.len());
+    for p in positions.iter().cycle().skip(start).take(positions.len()) {
         if let Some(tick) = p.current_tick {
             propose_rebalance(ctx, &p.pool_id, tick, &p.position_id).await;
         }
     }
 }
+
+static OOR_CURSOR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static IDLE_CURSOR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Where this pass starts in a list of `len`, advancing the cursor for the next.
+fn rotation_start(cursor: &std::sync::atomic::AtomicUsize, len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    cursor.fetch_add(1, Ordering::Relaxed) % len
+}
+
+/// Positions examined per idle-sweep pass. Each costs up to two RPCs, so an
+/// uncapped pass over a few hundred positions ran into the sweep timeout and the
+/// next pass started from the top again: the tail was never examined (re-audit
+/// DS-5). The cursor carries on where the last pass stopped.
+const IDLE_SWEEP_BATCH: usize = 40;
 
 /// Queues a same-range rebalance for any in-range position holding a material
 /// idle balance: what an earlier rebalance's bounded swap could not place. The
@@ -636,7 +690,21 @@ async fn sweep_idle(ctx: &Ctx<'_>) {
             return;
         }
     };
-    for p in positions {
+    let n = positions.len();
+    let start = if n == 0 {
+        0
+    } else {
+        IDLE_CURSOR.fetch_add(IDLE_SWEEP_BATCH, Ordering::Relaxed) % n
+    };
+    for p in positions
+        .iter()
+        .cycle()
+        .skip(start)
+        .take(n.min(IDLE_SWEEP_BATCH))
+    {
+        if automation().is_blocked(&p.position_id, Instant::now()) {
+            continue;
+        }
         let (Ok(pool_id), Ok(position_id)) =
             (p.pool_id.parse::<B256>(), p.position_id.parse::<B256>())
         else {
@@ -669,6 +737,12 @@ async fn sweep_idle(ctx: &Ctx<'_>) {
             idle_gate().lock().unwrap().forget(&p.position_id);
             continue;
         }
+        // Check for room first: an intent dropped on a full queue would still
+        // have counted as a no-progress attempt in the gate (re-audit DS-4).
+        if tx.capacity() == 0 {
+            debug!("auto-execute queue full; idle sweep stops for this pass");
+            break;
+        }
         let allowed = idle_gate().lock().unwrap().allow(
             &p.position_id,
             share,
@@ -685,6 +759,7 @@ async fn sweep_idle(ctx: &Ctx<'_>) {
         };
         match tx.try_send(intent) {
             Ok(()) => {
+                automation().mark_queued(&p.position_id);
                 info!(position_id = %p.position_id, idle_bps = share, "idle balance redeploy queued")
             }
             Err(_) => {
@@ -772,6 +847,12 @@ pub(crate) fn idle_share_bps(idle: (f64, f64), deployed: (f64, f64), tick: i32) 
 }
 
 async fn propose_rebalance(ctx: &Ctx<'_>, pool_hex: &str, tick: i32, position_id: &str) {
+    // Queued already, or refused recently in a way that will not change by
+    // itself: proposing again would only take a queue slot from a position the
+    // executor can act on (re-audit DS-4).
+    if ctx.intent_tx.is_some() && automation().is_blocked(position_id, Instant::now()) {
+        return;
+    }
     let Ok(Some(pos)) = ctx.tracker.get_position(position_id) else {
         return;
     };
@@ -812,6 +893,7 @@ async fn propose_rebalance(ctx: &Ctx<'_>, pool_hex: &str, tick: i32, position_id
             };
             match tx.try_send(intent) {
                 Ok(()) => {
+                    automation().mark_queued(&pos.position_id);
                     info!(position_id = %pos.position_id, new_lower = d.new_lower, new_upper = d.new_upper, "auto-execute intent queued")
                 }
                 Err(_) => {
@@ -1170,5 +1252,283 @@ mod tests {
         let mut pools = tracker.distinct_pool_ids().unwrap();
         pools.sort();
         assert_eq!(pools, vec!["0xaaa".to_string(), "0xbbb".to_string()]);
+    }
+}
+
+/// Audit 2026-10-03 DoS PoCs (audits/tend-2026-10-03/findings-dos.md). Test-only.
+#[cfg(test)]
+mod dos_poc {
+    use super::*;
+    use crate::position::tracker::{PositionRow, Tracker};
+    use crate::strategy::{default_config, EstimateCostModel, StrategyEngine};
+    use std::sync::Mutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn row(id: &str, pool: &str, lower: i32, upper: i32, tick: i32) -> PositionRow {
+        PositionRow {
+            position_id: id.into(),
+            owner: "0x1111111111111111111111111111111111111111".into(),
+            pool_id: pool.into(),
+            chain_id: "8453".into(),
+            tick_lower: lower,
+            tick_upper: upper,
+            current_tick: Some(tick),
+            in_range: tick >= lower && tick <= upper,
+            entry_tick: Some((lower + upper) / 2),
+            fee: Some(3000),
+            tick_spacing: Some(60),
+        }
+    }
+
+    fn feed(t: &Tracker, pool: &str) {
+        for block in 1000u64..1200 {
+            let tick = ((block as i32 * 7) % 11) - 5;
+            t.update_pool_tick(pool, tick).unwrap();
+            t.record_tick(pool, tick, block).unwrap();
+        }
+    }
+
+    fn hex_id(i: usize) -> String {
+        format!("{:#066x}", i)
+    }
+
+    /// DS-4: dust positions opened by anyone fill the 64-slot intent queue on
+    /// every sweep; `try_send` then drops the intents of every position indexed
+    /// after them.
+    #[tokio::test]
+    async fn ds4_attacker_positions_starve_later_honest_positions() {
+        let tracker = Arc::new(Tracker::open_in_memory().unwrap());
+        let attacker_pool = "0xa77ac4e7";
+        let honest_pool = "0x40e57";
+        for i in 0..crate::exec::AUTO_INTENT_CHANNEL_CAP {
+            tracker
+                .register(&row(&format!("0xa{i:04}"), attacker_pool, 5000, 6000, 0))
+                .unwrap();
+        }
+        tracker
+            .register(&row("0xhonest", honest_pool, 5000, 6000, 0))
+            .unwrap();
+        feed(&tracker, attacker_pool);
+        feed(&tracker, honest_pool);
+
+        let (tx, mut rx) = mpsc::channel(crate::exec::AUTO_INTENT_CHANNEL_CAP);
+        let engine = StrategyEngine::default();
+        let cfg = default_config();
+        let ctx = Ctx {
+            tracker: &tracker,
+            engine: &engine,
+            cost: &EstimateCostModel,
+            config: &cfg,
+            chain_id: 8453,
+            reader: None,
+            intent_tx: Some(&tx),
+            last_block: DashMap::new(),
+        };
+
+        // The executor, as it now behaves: take each intent off the queue, and for
+        // the attacker's positions record the hook's terminal refusal (they opted
+        // out of automation, so the hook answers AutomationDisabled).
+        let mut honest_served_on = None;
+        for pass in 0..3 {
+            sweep_out_of_range(&ctx).await;
+            let mut queued = Vec::new();
+            while let Ok(i) = rx.try_recv() {
+                automation().mark_dequeued(&i.position_id);
+                if i.position_id.starts_with("0xa") {
+                    automation().on_refusal(
+                        &i.position_id,
+                        crate::exec::automation::RefusalAction::Terminal,
+                        Instant::now(),
+                    );
+                }
+                queued.push(i.position_id);
+            }
+            let honest = queued.iter().any(|p| p == "0xhonest");
+            println!(
+                "pass {pass}: executor saw {} intents, honest among them: {honest}",
+                queued.len()
+            );
+            if honest && honest_served_on.is_none() {
+                honest_served_on = Some(pass);
+            }
+            if pass > 0 {
+                assert!(
+                    queued.iter().all(|p| !p.starts_with("0xa")),
+                    "terminally refused positions are not re-proposed"
+                );
+            }
+        }
+        assert_eq!(
+            honest_served_on,
+            Some(1),
+            "honest position served on the pass after the spam is refused"
+        );
+        automation().forget("0xhonest");
+    }
+
+    /// Minimal JSON-RPC over HTTP: answers every request with 64 zero bytes
+    /// after `delay`, and records each request body.
+    async fn mock_rpc(delay: Duration, seen: Arc<Mutex<Vec<String>>>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 8192];
+                    loop {
+                        let (head_end, len) = loop {
+                            if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                let head = String::from_utf8_lossy(&buf[..p]).to_lowercase();
+                                let len = head
+                                    .lines()
+                                    .find_map(|l| l.strip_prefix("content-length:"))
+                                    .and_then(|v| v.trim().parse::<usize>().ok())
+                                    .unwrap_or(0);
+                                break (p + 4, len);
+                            }
+                            match sock.read(&mut tmp).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                            }
+                        };
+                        while buf.len() < head_end + len {
+                            match sock.read(&mut tmp).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                            }
+                        }
+                        let body =
+                            String::from_utf8_lossy(&buf[head_end..head_end + len]).to_string();
+                        buf.drain(..head_end + len);
+                        let id = body
+                            .split("\"id\":")
+                            .nth(1)
+                            .map(|s| {
+                                s.chars()
+                                    .take_while(|c| c.is_ascii_digit())
+                                    .collect::<String>()
+                            })
+                            .unwrap_or_else(|| "0".into());
+                        seen.lock().unwrap().push(body);
+                        tokio::time::sleep(delay).await;
+                        let resp = format!(
+                            "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":\"0x{}\"}}",
+                            "0".repeat(128)
+                        );
+                        let out = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                            resp.len(),
+                            resp
+                        );
+                        if sock.write_all(out.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// DS-5: `sweep_idle` makes one-to-two sequential RPCs per in-range
+    /// position. With enough (dust) positions ahead of it, every pass hits
+    /// SWEEP_TIMEOUT and restarts from the top, so a position later in the
+    /// table is never examined — and for those 20 s the watch loop reads no logs.
+    #[tokio::test]
+    async fn ds5_sweep_timeout_never_reaches_tail_positions() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let url = mock_rpc(Duration::from_millis(20), seen.clone()).await;
+        let reader =
+            ChainReader::connect(&url, Address::repeat_byte(0x11), Address::repeat_byte(0x22))
+                .await
+                .unwrap();
+
+        let tracker = Arc::new(Tracker::open_in_memory().unwrap());
+        let n_attacker = 250;
+        for i in 1..=n_attacker {
+            tracker
+                .register(&row(&hex_id(i), &hex_id(0xa77ac4e7), -600, 600, 0))
+                .unwrap();
+        }
+        let honest = hex_id(0xdead_beef);
+        tracker
+            .register(&row(&honest, &hex_id(0x40e57), -600, 600, 0))
+            .unwrap();
+
+        let (tx, _rx) = mpsc::channel(crate::exec::AUTO_INTENT_CHANNEL_CAP);
+        let engine = StrategyEngine::default();
+        let cfg = default_config();
+        let ctx = Ctx {
+            tracker: &tracker,
+            engine: &engine,
+            cost: &EstimateCostModel,
+            config: &cfg,
+            chain_id: 8453,
+            reader: Some(&reader),
+            intent_tx: Some(&tx),
+            last_block: DashMap::new(),
+        };
+
+        // Each pass examines a bounded batch and the cursor carries on, so every
+        // position is reached within ceil(n / batch) passes and no pass needs
+        // anywhere near the sweep timeout.
+        let needle = honest.trim_start_matches("0x").to_string();
+        let passes = (n_attacker + 1).div_ceil(IDLE_SWEEP_BATCH);
+        let mut reached = None;
+        for pass in 0..passes {
+            let before = seen.lock().unwrap().len();
+            let r = timeout(SWEEP_TIMEOUT, sweep_idle(&ctx)).await;
+            let calls = seen.lock().unwrap().clone();
+            assert!(r.is_ok(), "pass {pass} hit the sweep timeout");
+            assert!(
+                calls.len() - before <= 2 * IDLE_SWEEP_BATCH,
+                "a pass is bounded"
+            );
+            if reached.is_none() && calls[before..].iter().any(|b| b.contains(&needle)) {
+                reached = Some(pass);
+            }
+        }
+        println!("honest position examined on pass {reached:?} of {passes}");
+        assert!(
+            reached.is_some(),
+            "the honest position at the tail is examined"
+        );
+    }
+
+    /// DS-5 (second half), kept as a record of the library behaviour the fix works
+    /// around: alloy skips lagged items silently, so the live stream can lose
+    /// logs. The daemon no longer relies on it: every sweep backfills from the
+    /// watermark, and only the backfill advances it.
+    /// alloy-pubsub 1.8.3 delivers subscription items through a tokio broadcast
+    /// channel of 16, and `SubAnyStream::poll_next` skips `Lagged` with only a
+    /// debug log (sub.rs:348). Modelled here with the same primitives.
+    #[tokio::test]
+    async fn ds5_logs_arriving_during_a_sweep_beyond_16_are_lost() {
+        use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
+        let (txb, rxb) = tokio::sync::broadcast::channel::<u64>(16);
+        let mut stream = BroadcastStream::new(rxb);
+        for i in 0..40u64 {
+            txb.send(i).unwrap();
+        }
+        drop(txb);
+        let mut got = Vec::new();
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(v) => got.push(v),
+                Err(BroadcastStreamRecvError::Lagged(_)) => continue,
+            }
+        }
+        println!(
+            "delivered {} of 40; first delivered = {:?}",
+            got.len(),
+            got.first()
+        );
+        assert_eq!(got.len(), 16);
+        assert_eq!(got[0], 24, "the 24 oldest logs are gone");
     }
 }

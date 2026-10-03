@@ -207,7 +207,6 @@ async fn main() -> anyhow::Result<()> {
                     .filter(|s| !s.trim().is_empty());
                 let executor = exec::Executor::connect(&rpc, &pk, hook_addr, private).await?;
                 let auto = exec::AutoExec {
-                    slippage_bps: file.slippage_bps.unwrap_or(exec::DEFAULT_SLIPPAGE_BPS),
                     max_gas_usd: file
                         .max_gas_usd
                         .or_else(|| {
@@ -342,7 +341,8 @@ async fn main() -> anyhow::Result<()> {
                         pid,
                         new_lower,
                         new_upper,
-                        slippage_bps,
+                        // A human running `lpa rebalance` asked for a floor; keep it.
+                        Some(slippage_bps),
                         max_gas_usd,
                         &eth_price,
                     )

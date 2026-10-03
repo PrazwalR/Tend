@@ -110,7 +110,7 @@ contract AutopilotHookTest is Test, Deployers {
 
     function test_rebalance_moves_range() public {
         bytes32 pid = _deposit(-600, 600, 1e18);
-        vm.warp(block.timestamp + COOLDOWN);
+        _afterCooldown();
 
         vm.prank(rebalancer);
         hook.rebalance(pid, -1200, 1200, 0);
@@ -124,7 +124,7 @@ contract AutopilotHookTest is Test, Deployers {
 
     function test_rebalance_only_rebalancer() public {
         bytes32 pid = _deposit(-600, 600, 1e18);
-        vm.warp(block.timestamp + COOLDOWN);
+        _afterCooldown();
         vm.prank(attacker);
         vm.expectRevert(AutopilotHook.NotRebalancer.selector);
         hook.rebalance(pid, -1200, 1200, 0);
@@ -139,14 +139,14 @@ contract AutopilotHookTest is Test, Deployers {
         );
         hook.rebalance(pid, -1200, 1200, 0);
 
-        vm.warp(block.timestamp + COOLDOWN);
+        _afterCooldown();
         vm.prank(rebalancer);
         hook.rebalance(pid, -1200, 1200, 0);
     }
 
     function test_rebalance_rejects_unaligned_ticks() public {
         bytes32 pid = _deposit(-600, 600, 1e18);
-        vm.warp(block.timestamp + COOLDOWN);
+        _afterCooldown();
         vm.prank(rebalancer);
         vm.expectRevert(AutopilotHook.TicksNotAligned.selector);
         hook.rebalance(pid, -601, 1200, 0);
@@ -154,7 +154,7 @@ contract AutopilotHookTest is Test, Deployers {
 
     function test_rebalance_rejects_inverted_range() public {
         bytes32 pid = _deposit(-600, 600, 1e18);
-        vm.warp(block.timestamp + COOLDOWN);
+        _afterCooldown();
         vm.prank(rebalancer);
         vm.expectRevert(AutopilotHook.InvalidTickRange.selector);
         hook.rebalance(pid, 1200, -1200, 0);
@@ -181,7 +181,7 @@ contract AutopilotHookTest is Test, Deployers {
 
     function test_rebalance_blocked_while_paused() public {
         bytes32 pid = _deposit(-600, 600, 1e18);
-        vm.warp(block.timestamp + COOLDOWN);
+        _afterCooldown();
         hook.pause();
         vm.prank(rebalancer);
         vm.expectRevert(Pausable.EnforcedPause.selector);
@@ -205,7 +205,7 @@ contract AutopilotHookTest is Test, Deployers {
 
     function test_owner_can_manage_rebalancers() public {
         assertFalse(hook.isRebalancer(attacker));
-        hook.setRebalancer(attacker, true);
+        _queued(abi.encodeCall(hook.setRebalancer, (attacker, true)));
         assertTrue(hook.isRebalancer(attacker));
         hook.setRebalancer(rebalancer, false);
         assertFalse(hook.isRebalancer(rebalancer));
@@ -231,7 +231,7 @@ contract AutopilotHookTest is Test, Deployers {
     function test_cannot_rebalance_inactive_position() public {
         bytes32 pid = _deposit(-600, 600, 1e18);
         hook.withdraw(pid);
-        vm.warp(block.timestamp + COOLDOWN);
+        _afterCooldown();
         vm.prank(rebalancer);
         vm.expectRevert(AutopilotHook.PositionNotActive.selector);
         hook.rebalance(pid, -1200, 1200, 0);
@@ -251,7 +251,7 @@ contract AutopilotHookTest is Test, Deployers {
 
     function test_rebalance_to_one_sided_range() public {
         bytes32 pid = _deposit(-600, 600, 1e18);
-        vm.warp(block.timestamp + COOLDOWN);
+        _afterCooldown();
         vm.prank(rebalancer);
         hook.rebalance(pid, 600, 1200, 0);
         (,, int24 lo, int24 hi, uint128 liq,,) = hook.positions(pid);
@@ -270,7 +270,7 @@ contract AutopilotHookTest is Test, Deployers {
         uint256 b0 = t0.balanceOf(address(this));
         uint256 b1 = t1.balanceOf(address(this));
 
-        vm.warp(block.timestamp + COOLDOWN);
+        _afterCooldown();
         vm.prank(rebalancer);
         hook.rebalance(pid, 600, 1200, 0);
 
@@ -287,7 +287,7 @@ contract AutopilotHookTest is Test, Deployers {
         MockERC20 t0 = MockERC20(Currency.unwrap(currency0));
         MockERC20 t1 = MockERC20(Currency.unwrap(currency1));
         bytes32 pid = _deposit(-600, 600, 1e18);
-        vm.warp(block.timestamp + COOLDOWN);
+        _afterCooldown();
         vm.prank(rebalancer);
         hook.rebalance(pid, 600, 1200, 0);
         (uint128 held0, uint128 held1) = hook.idle(pid);
@@ -308,7 +308,7 @@ contract AutopilotHookTest is Test, Deployers {
 
     function test_idle_balance_redeployed_when_depth_returns() public {
         bytes32 pid = _deposit(-600, 600, 1e18);
-        vm.warp(block.timestamp + COOLDOWN);
+        _afterCooldown();
         vm.prank(rebalancer);
         hook.rebalance(pid, 600, 1200, 0);
         (uint128 h0, uint128 h1) = hook.idle(pid);
@@ -322,7 +322,7 @@ contract AutopilotHookTest is Test, Deployers {
             key, ModifyLiquidityParams({tickLower: -60000, tickUpper: 60000, liquidityDelta: 1e20, salt: 0}), ""
         );
         _nextBlock();
-        vm.warp(block.timestamp + COOLDOWN);
+        _afterCooldown();
         vm.prank(rebalancer);
         hook.rebalance(pid, 600, 1200, 0);
 
@@ -335,7 +335,7 @@ contract AutopilotHookTest is Test, Deployers {
 
     function test_same_range_rebalance_is_still_a_noop_without_idle() public {
         bytes32 pid = _deposit(-600, 600, 1e18);
-        vm.warp(block.timestamp + COOLDOWN);
+        _afterCooldown();
         vm.prank(rebalancer);
         vm.expectRevert(AutopilotHook.NoOpRebalance.selector);
         hook.rebalance(pid, -600, 600, 0);
@@ -354,7 +354,7 @@ contract AutopilotHookTest is Test, Deployers {
 
     function test_rebalance_slippage_floor_reverts() public {
         bytes32 pid = _deposit(-600, 600, 1e18);
-        vm.warp(block.timestamp + COOLDOWN);
+        _afterCooldown();
         vm.prank(rebalancer);
         vm.expectPartialRevert(AutopilotHook.SlippageExceeded.selector);
         hook.rebalance(pid, -1200, 1200, type(uint128).max);
@@ -362,7 +362,7 @@ contract AutopilotHookTest is Test, Deployers {
 
     function test_rebalance_returns_liquidity() public {
         bytes32 pid = _deposit(-600, 600, 1e18);
-        vm.warp(block.timestamp + COOLDOWN);
+        _afterCooldown();
         vm.prank(rebalancer);
         uint128 newLiq = hook.rebalance(pid, -1200, 1200, 1);
         assertGt(newLiq, 0);
@@ -427,7 +427,7 @@ contract AutopilotHookTest is Test, Deployers {
 
     function test_rebalance_respects_owner_bounds() public {
         bytes32 pid = hook.deposit(key, -600, 600, 1e18, -600, 600);
-        vm.warp(block.timestamp + COOLDOWN);
+        _afterCooldown();
 
         vm.prank(rebalancer);
         vm.expectRevert(AutopilotHook.OutOfBounds.selector);
@@ -460,7 +460,7 @@ contract AutopilotHookTest is Test, Deployers {
         (, int24 tick,,) = manager.getSlot0(id);
         assertLt(tick, int24(-600), "price should have exited the range below");
 
-        vm.warp(block.timestamp + COOLDOWN);
+        _afterCooldown();
         _catchUpRef();
         vm.prank(rebalancer);
         uint128 newLiq = hook.rebalance(pid, -1800, -600, 0);
@@ -491,7 +491,7 @@ contract AutopilotHookTest is Test, Deployers {
         int24 lower = ((tick - 600) / 60) * 60;
         int24 upper = ((tick + 600) / 60) * 60;
 
-        vm.warp(block.timestamp + COOLDOWN);
+        _afterCooldown();
         _catchUpRef();
         vm.prank(rebalancer);
         uint128 newLiq = hook.rebalance(pid, lower, upper, 0);
@@ -512,7 +512,7 @@ contract AutopilotHookTest is Test, Deployers {
             ts,
             ""
         );
-        vm.warp(block.timestamp + COOLDOWN);
+        _afterCooldown();
         _catchUpRef();
         vm.prank(rebalancer);
         vm.expectPartialRevert(AutopilotHook.SlippageExceeded.selector);
@@ -526,7 +526,7 @@ contract AutopilotHookTest is Test, Deployers {
     function test_rebalance_does_not_destroy_pool_price() public {
         bytes32 pid = _deposit(-600, 600, 1e18);
         (uint160 beforePrice,,,) = manager.getSlot0(id);
-        vm.warp(block.timestamp + COOLDOWN);
+        _afterCooldown();
 
         vm.prank(rebalancer);
         hook.rebalance(pid, 600, 1200, 0);
@@ -541,7 +541,7 @@ contract AutopilotHookTest is Test, Deployers {
     /// Same guarantee on the opposite side.
     function test_rebalance_below_spot_does_not_destroy_pool_price() public {
         bytes32 pid = _deposit(-600, 600, 1e18);
-        vm.warp(block.timestamp + COOLDOWN);
+        _afterCooldown();
 
         vm.prank(rebalancer);
         hook.rebalance(pid, -1200, -600, 0);
@@ -555,7 +555,7 @@ contract AutopilotHookTest is Test, Deployers {
     /// nothing to trade against and runs to the sentinel.
     function test_rebalance_with_no_external_liquidity_keeps_price_sane() public {
         bytes32 pid = _deposit(-600, 600, 1e18);
-        vm.warp(block.timestamp + COOLDOWN);
+        _afterCooldown();
 
         vm.prank(rebalancer);
         hook.rebalance(pid, 600, 1200, 0);
@@ -598,7 +598,7 @@ contract AutopilotHookTest is Test, Deployers {
 
         bytes32 pid = hook.deposit(fat, -600, 600, 1e18, TickMath.minUsableTick(200), TickMath.maxUsableTick(200));
         hook.setMaxRebalanceLossBps(hook.MIN_LOSS_TOLERANCE_BPS()); // 25 bps, tightest permitted
-        vm.warp(block.timestamp + COOLDOWN);
+        _afterCooldown();
 
         // minLiquidity = 0 waives the rebalancer-side guard entirely; the
         // protocol-side floor must still bind.
@@ -617,8 +617,8 @@ contract AutopilotHookTest is Test, Deployers {
         );
 
         bytes32 pid = hook.deposit(fat, -600, 600, 1e18, TickMath.minUsableTick(200), TickMath.maxUsableTick(200));
-        hook.setMaxRebalanceLossBps(hook.MAX_LOSS_TOLERANCE_BPS());
-        vm.warp(block.timestamp + COOLDOWN);
+        _queued(abi.encodeCall(hook.setMaxRebalanceLossBps, (hook.MAX_LOSS_TOLERANCE_BPS())));
+        _afterCooldown();
 
         vm.prank(rebalancer);
         uint128 newLiq = hook.rebalance(pid, 600, 1200, 0);
@@ -630,7 +630,7 @@ contract AutopilotHookTest is Test, Deployers {
             key, ModifyLiquidityParams({tickLower: -60000, tickUpper: 60000, liquidityDelta: 1e21, salt: 0}), ""
         );
         bytes32 pid = _deposit(-600, 600, 1e18);
-        vm.warp(block.timestamp + COOLDOWN);
+        _afterCooldown();
         vm.prank(rebalancer);
         uint128 newLiq = hook.rebalance(pid, -1200, 1200, 0);
         assertGt(newLiq, 0);
@@ -669,7 +669,7 @@ contract AutopilotHookTest is Test, Deployers {
         (, int24 drifted,,) = manager.getSlot0(id);
         assertLt(drifted, int24(-600), "position should be out of range");
 
-        vm.warp(block.timestamp + COOLDOWN);
+        _afterCooldown();
         _catchUpRef(); // the daemon pokes before it retries
 
         // The grief: withdraw the dominant depth in the same block as the rebalance.
@@ -698,7 +698,7 @@ contract AutopilotHookTest is Test, Deployers {
         vm.expectRevert(AutopilotHook.SwapImpactTooHigh.selector);
         hook.setMaxSwapImpactBps(0);
 
-        hook.setMaxSwapImpactBps(250);
+        _queued(abi.encodeCall(hook.setMaxSwapImpactBps, (250)));
         assertEq(hook.maxSwapImpactBps(), 250);
     }
 
@@ -735,7 +735,7 @@ contract AutopilotHookTest is Test, Deployers {
     /// was a pure value leak the tick envelope could not prevent.
     function test_no_op_rebalance_reverts() public {
         bytes32 pid = _deposit(-600, 600, 1e18);
-        vm.warp(block.timestamp + COOLDOWN);
+        _afterCooldown();
         vm.prank(rebalancer);
         vm.expectRevert(AutopilotHook.NoOpRebalance.selector);
         hook.rebalance(pid, -600, 600, 0);
@@ -750,7 +750,7 @@ contract AutopilotHookTest is Test, Deployers {
         vm.expectRevert(AutopilotHook.IntervalTooShort.selector);
         hook.setMinRebalanceInterval(floorSecs - 1);
 
-        hook.setMinRebalanceInterval(floorSecs);
+        _queued(abi.encodeCall(hook.setMinRebalanceInterval, (floorSecs)));
         assertEq(hook.minRebalanceInterval(), floorSecs);
     }
 
@@ -826,9 +826,11 @@ contract AutopilotHookTest is Test, Deployers {
             ""
         );
 
-        vm.warp(block.timestamp + COOLDOWN);
+        // However many quiet blocks pass, a reference left clamped short of spot
+        // is not settled: only a write that reaches spot can settle it.
+        _afterCooldown();
         vm.prank(rebalancer);
-        vm.expectPartialRevert(AutopilotHook.PriceDeviation.selector);
+        vm.expectPartialRevert(AutopilotHook.PriceUnsettled.selector);
         hook.rebalance(pid, -3000, -1800, 0);
     }
 
@@ -844,9 +846,16 @@ contract AutopilotHookTest is Test, Deployers {
         vm.expectRevert(AutopilotHook.DeviationBoundTooHigh.selector);
         hook.setPriceGuard(0, 150);
 
-        hook.setPriceGuard(100, 150);
-        assertEq(hook.maxTickMovePerBlock(), int24(100));
+        // Narrowing the deviation window is instant.
+        hook.setPriceGuard(maxMove, 150);
         assertEq(hook.maxDeviationTicks(), int24(150));
+
+        // The per-block cap is two-sided (TL-1): lowering it freezes the
+        // reference, so it waits like a loosening does.
+        vm.expectRevert(AutopilotHook.ChangeMustBeQueued.selector);
+        hook.setPriceGuard(100, 150);
+        _queued(abi.encodeCall(hook.setPriceGuard, (int24(100), int24(150))));
+        assertEq(hook.maxTickMovePerBlock(), int24(100));
     }
 
     // --- O-4 regression: an L2 restart must not execute queued rebalances ---
@@ -855,7 +864,7 @@ contract AutopilotHookTest is Test, Deployers {
         bytes32 pid = _deposit(-600, 600, 1e18);
         MockSequencerFeed feed = new MockSequencerFeed(1, block.timestamp - 10_000); // 1 == down
         hook.setSequencerUptimeFeed(address(feed));
-        vm.warp(block.timestamp + COOLDOWN);
+        _afterCooldown();
 
         vm.prank(rebalancer);
         vm.expectRevert(AutopilotHook.SequencerDown.selector);
@@ -864,7 +873,7 @@ contract AutopilotHookTest is Test, Deployers {
 
     function test_rebalance_blocked_during_grace_period_after_restart() public {
         bytes32 pid = _deposit(-600, 600, 1e18);
-        vm.warp(block.timestamp + COOLDOWN);
+        _afterCooldown();
         // Up, but only just: the backlog is still draining and spot is gapping.
         MockSequencerFeed feed = new MockSequencerFeed(0, block.timestamp);
         hook.setSequencerUptimeFeed(address(feed));
@@ -879,6 +888,7 @@ contract AutopilotHookTest is Test, Deployers {
         MockSequencerFeed feed = new MockSequencerFeed(0, block.timestamp);
         hook.setSequencerUptimeFeed(address(feed));
         vm.warp(block.timestamp + hook.SEQUENCER_GRACE_PERIOD() + 1);
+        vm.roll(vm.getBlockNumber() + hook.MIN_STABLE_BLOCKS());
 
         vm.prank(rebalancer);
         hook.rebalance(pid, -1200, 1200, 0);
@@ -890,7 +900,7 @@ contract AutopilotHookTest is Test, Deployers {
     function test_zero_sequencer_feed_disables_the_check() public {
         bytes32 pid = _deposit(-600, 600, 1e18);
         assertEq(hook.sequencerUptimeFeed(), address(0));
-        vm.warp(block.timestamp + COOLDOWN);
+        _afterCooldown();
         vm.prank(rebalancer);
         hook.rebalance(pid, -1200, 1200, 0);
     }
@@ -910,10 +920,10 @@ contract AutopilotHookTest is Test, Deployers {
 
     function test_allowlist_blocks_unlisted_pair_when_enforced() public {
         hook.setAllowlistEnforced(true);
-        vm.expectRevert(AutopilotHook.PairNotAllowed.selector);
+        vm.expectRevert(AutopilotHook.PoolNotAllowed.selector);
         hook.deposit(key, -600, 600, 1e18, -1200, 1200);
 
-        hook.setAllowedPair(currency0, currency1, true);
+        hook.setAllowedPool(key, true);
         bytes32 pid = hook.deposit(key, -600, 600, 1e18, -1200, 1200);
         (,,,,, bool active,) = hook.positions(pid);
         assertTrue(active);
@@ -921,14 +931,14 @@ contract AutopilotHookTest is Test, Deployers {
 
     /// De-listing must never strand an open position, so the check is on the way
     /// in only.
-    function test_delisting_a_pair_still_allows_exit_and_rebalance() public {
+    function test_delisting_a_pool_still_allows_exit_and_rebalance() public {
         hook.setAllowlistEnforced(true);
-        hook.setAllowedPair(currency0, currency1, true);
+        hook.setAllowedPool(key, true);
         bytes32 pid = hook.deposit(key, -600, 600, 1e18, -1800, 1800);
 
-        hook.setAllowedPair(currency0, currency1, false); // de-list
+        hook.setAllowedPool(key, false); // de-list
 
-        vm.warp(block.timestamp + COOLDOWN);
+        _afterCooldown();
         vm.prank(rebalancer);
         hook.rebalance(pid, -1200, 1200, 0); // still rebalanceable
 
@@ -944,16 +954,16 @@ contract AutopilotHookTest is Test, Deployers {
 
         vm.prank(attacker);
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, attacker));
-        hook.setAllowedPair(currency0, currency1, true);
+        hook.setAllowedPool(key, true);
     }
 
     // --- C-5 regression: owners can scope or revoke their rebalancer ---
 
     function test_owner_can_scope_rebalancer_to_one_address() public {
         bytes32 pid = _deposit(-600, 600, 1e18);
-        hook.setRebalancer(attacker, true);
+        _queued(abi.encodeCall(hook.setRebalancer, (attacker, true)));
         hook.setPositionRebalancer(pid, rebalancer);
-        vm.warp(block.timestamp + COOLDOWN);
+        _afterCooldown();
 
         vm.prank(attacker);
         vm.expectRevert(AutopilotHook.NotRebalancer.selector);
@@ -966,7 +976,7 @@ contract AutopilotHookTest is Test, Deployers {
     function test_owner_can_disable_automation_entirely() public {
         bytes32 pid = _deposit(-600, 600, 1e18);
         hook.setPositionRebalancer(pid, hook.AUTOMATION_OFF());
-        vm.warp(block.timestamp + COOLDOWN);
+        _afterCooldown();
 
         vm.prank(rebalancer);
         vm.expectRevert(AutopilotHook.AutomationDisabled.selector);
@@ -978,7 +988,7 @@ contract AutopilotHookTest is Test, Deployers {
     function test_unscoped_position_accepts_any_allowlisted_rebalancer() public {
         bytes32 pid = _deposit(-600, 600, 1e18);
         assertEq(hook.positionRebalancer(pid), address(0));
-        vm.warp(block.timestamp + COOLDOWN);
+        _afterCooldown();
         vm.prank(rebalancer);
         hook.rebalance(pid, -1200, 1200, 0);
     }
@@ -1035,7 +1045,7 @@ contract AutopilotHookTest is Test, Deployers {
             key, ModifyLiquidityParams({tickLower: -60000, tickUpper: 60000, liquidityDelta: 1e22, salt: 0}), ""
         );
         bytes32 pid = hook.deposit(key, -600, 600, liq, TickMath.minUsableTick(60), TickMath.maxUsableTick(60));
-        vm.warp(block.timestamp + COOLDOWN);
+        _afterCooldown();
 
         vm.prank(rebalancer);
         // Any revert here should be a named hook error, never a settlement
@@ -1071,7 +1081,7 @@ contract AutopilotHookTest is Test, Deployers {
         int24 hi = TickMath.maxUsableTick(1);
 
         bytes32 pid = hook.deposit(k1, 100, 200, 1e18, lo, hi);
-        vm.warp(block.timestamp + COOLDOWN);
+        _afterCooldown();
 
         vm.prank(rebalancer);
         uint128 newLiq = hook.rebalance(pid, lo, hi, 0);
@@ -1087,8 +1097,8 @@ contract AutopilotHookTest is Test, Deployers {
             hook.deposit(key, -600, 600, 1e18, TickMath.minUsableTick(60), TickMath.maxUsableTick(60), rebalancer);
         assertEq(hook.positionRebalancer(pid), rebalancer);
 
-        hook.setRebalancer(attacker, true); // added AFTER the position existed
-        vm.warp(block.timestamp + COOLDOWN);
+        _queued(abi.encodeCall(hook.setRebalancer, (attacker, true))); // added AFTER the position existed
+        _afterCooldown();
 
         vm.prank(attacker);
         vm.expectRevert(AutopilotHook.NotRebalancer.selector);
@@ -1099,7 +1109,7 @@ contract AutopilotHookTest is Test, Deployers {
         bytes32 pid = hook.deposit(
             key, -600, 600, 1e18, TickMath.minUsableTick(60), TickMath.maxUsableTick(60), hook.AUTOMATION_OFF()
         );
-        vm.warp(block.timestamp + COOLDOWN);
+        _afterCooldown();
         vm.prank(rebalancer);
         vm.expectRevert(AutopilotHook.AutomationDisabled.selector);
         hook.rebalance(pid, -1200, 1200, 0);
@@ -1110,7 +1120,7 @@ contract AutopilotHookTest is Test, Deployers {
     function test_deposit_without_scope_accepts_any_allowlisted_rebalancer() public {
         bytes32 pid = _deposit(-600, 600, 1e18);
         assertEq(hook.positionRebalancer(pid), address(0));
-        vm.warp(block.timestamp + COOLDOWN);
+        _afterCooldown();
         vm.prank(rebalancer);
         hook.rebalance(pid, -1200, 1200, 0);
     }
@@ -1149,7 +1159,7 @@ contract AutopilotHookTest is Test, Deployers {
         bytes32 pid = _deposit(-600, 600, 1e18);
         uint256 valueIn = (a0 - t0.balanceOf(address(this))) + (a1 - t1.balanceOf(address(this)));
 
-        vm.warp(block.timestamp + COOLDOWN);
+        _afterCooldown();
         vm.prank(rebalancer);
         hook.rebalance(pid, 0, 600, 0);
         _nextBlock();
@@ -1176,7 +1186,7 @@ contract AutopilotHookTest is Test, Deployers {
     function test_a9_rebalance_at_manipulated_price() public {
         _deepPool();
         bytes32 pid = _deposit(-600, 600, 1e18);
-        vm.warp(block.timestamp + COOLDOWN);
+        _afterCooldown();
         _nextBlock();
 
         // The push the old 2000-tick bound admitted, at a 1428 bps loss, is refused.
@@ -1226,7 +1236,7 @@ contract AutopilotHookTest is Test, Deployers {
         (uint160 sqrt0, int24 t0,,) = manager.getSlot0(id);
         assertEq(t0, int24(0));
         assertEq(sqrt0, TickMath.getSqrtPriceAtTick(0), "spot sits exactly on the edge");
-        vm.warp(block.timestamp + COOLDOWN);
+        _afterCooldown();
         vm.prank(rebalancer);
         hook.rebalance(pid, lo, hi, 0);
 
@@ -1264,6 +1274,14 @@ contract AutopilotHookTest is Test, Deployers {
         );
     }
 
+    /// Past the rebalance cooldown, as a chain would get there: time AND blocks.
+    /// An hour-long cooldown spans hundreds of blocks, and with no swaps in them
+    /// they are stable block ends for the price reference.
+    function _afterCooldown() internal {
+        vm.warp(vm.getBlockTimestamp() + COOLDOWN);
+        vm.roll(vm.getBlockNumber() + COOLDOWN / 12);
+    }
+
     /// `vm.roll(block.number + 1)` is unsafe under via_ir: repeated reads of
     /// `block.number` in one test function get folded, so a loop keeps rolling to
     /// the same block. Read the real value from the cheatcode instead.
@@ -1281,8 +1299,158 @@ contract AutopilotHookTest is Test, Deployers {
         _nextBlock();
     }
 
+    // --- re-audit 2026-10-03: small contract fixes ---
+
+    /// TK-3: paying a withdrawal to the hook or the PoolManager strands it.
+    function test_withdraw_rejects_hook_and_pool_manager_as_recipient() public {
+        bytes32 pid = _deposit(-600, 600, 1e18);
+        vm.expectRevert(AutopilotHook.InvalidRecipient.selector);
+        hook.withdraw(pid, address(hook), true);
+        vm.expectRevert(AutopilotHook.InvalidRecipient.selector);
+        hook.withdraw(pid, address(manager), false);
+        hook.withdraw(pid, address(this), false);
+    }
+
+    /// TK-5: an event-following indexer can track the idle balance to zero.
+    function test_idle_release_and_zero_residual_are_evented() public {
+        bytes32 pid = _deposit(-600, 600, 1e18);
+        _afterCooldown();
+        vm.prank(rebalancer);
+        hook.rebalance(pid, 600, 1200, 0); // sole LP: leaves an idle balance
+        (uint128 h0, uint128 h1) = hook.idle(pid);
+        assertGt(uint256(h0) + h1, 0);
+
+        vm.expectEmit(true, false, false, true, address(hook));
+        emit AutopilotHook.IdleReleased(pid, h0, h1);
+        hook.withdraw(pid);
+    }
+
+    function test_deep_rebalance_reports_zero_residual() public {
+        _deepPool();
+        bytes32 pid = _deposit(-600, 600, 1e18);
+        _afterCooldown();
+        vm.recordLogs();
+        vm.prank(rebalancer);
+        hook.rebalance(pid, -1200, 1200, 0);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bool seen;
+        for (uint256 i; i < logs.length; i++) {
+            if (logs[i].topics[0] == AutopilotHook.RebalanceResidual.selector) seen = true;
+        }
+        assertTrue(seen, "RebalanceResidual is emitted on every rebalance, zeros included");
+    }
+
+    /// DS-3: the allowlist is keyed by full pool key, and only for this hook.
+    function test_pool_allowlist_is_per_pool_key() public {
+        PoolKey memory foreign = PoolKey(currency0, currency1, 3000, 60, IHooks(address(0xDEAD)));
+        vm.expectRevert(AutopilotHook.HookMismatch.selector);
+        hook.setAllowedPool(foreign, true);
+
+        hook.setAllowedPool(key, true);
+        hook.setAllowlistEnforced(true);
+        (PoolKey memory other,) = initPool(currency0, currency1, IHooks(hook), 500, SQRT_PRICE_1_1);
+        vm.expectRevert(AutopilotHook.PoolNotAllowed.selector);
+        hook.deposit(other, -600, 600, 1e18, TickMath.minUsableTick(10), TickMath.maxUsableTick(10));
+        hook.deposit(key, -600, 600, 1e18, -1200, 1200);
+    }
+
+    /// An owner change that loosens a protection: queue, wait out the delay, run.
+    function _queued(bytes memory call) internal {
+        hook.queueChange(call);
+        vm.warp(vm.getBlockTimestamp() + hook.TIMELOCK_DELAY());
+        hook.executeChange(call);
+    }
+
+    // --- A-1 / A-5: loosening owner changes wait out a timelock ---
+
+    function test_loosening_change_must_be_queued() public {
+        vm.expectRevert(AutopilotHook.ChangeMustBeQueued.selector);
+        hook.setMaxRebalanceLossBps(500);
+        vm.expectRevert(AutopilotHook.ChangeMustBeQueued.selector);
+        hook.setRebalancer(attacker, true);
+        vm.expectRevert(AutopilotHook.ChangeMustBeQueued.selector);
+        hook.setMaxSwapImpactBps(1000);
+        vm.expectRevert(AutopilotHook.ChangeMustBeQueued.selector);
+        hook.setMinRebalanceInterval(60);
+    }
+
+    function test_tightening_change_is_instant() public {
+        hook.setMaxRebalanceLossBps(50);
+        hook.setMaxSwapImpactBps(10);
+        hook.setPriceGuard(hook.maxTickMovePerBlock(), 100);
+        hook.setMinRebalanceInterval(2 * COOLDOWN);
+        hook.setRebalancer(rebalancer, false);
+        assertEq(hook.maxRebalanceLossBps(), 50);
+        assertFalse(hook.isRebalancer(rebalancer));
+    }
+
+    function test_queued_change_runs_only_inside_its_window() public {
+        bytes memory call = abi.encodeCall(hook.setMaxRebalanceLossBps, (500));
+        hook.queueChange(call);
+        (, uint64 eta,) = hook.pendingChange(hook.setMaxRebalanceLossBps.selector);
+        assertEq(eta, vm.getBlockTimestamp() + hook.TIMELOCK_DELAY());
+
+        vm.expectRevert(abi.encodeWithSelector(AutopilotHook.ChangeNotReady.selector, eta));
+        hook.executeChange(call);
+
+        vm.warp(uint256(eta) + hook.TIMELOCK_GRACE() + 1);
+        vm.expectRevert(abi.encodeWithSelector(AutopilotHook.ChangeExpired.selector, eta + hook.TIMELOCK_GRACE()));
+        hook.executeChange(call);
+
+        hook.queueChange(call);
+        vm.warp(vm.getBlockTimestamp() + hook.TIMELOCK_DELAY());
+        hook.executeChange(call);
+        assertEq(hook.maxRebalanceLossBps(), 500);
+
+        vm.expectRevert(AutopilotHook.ChangeNotQueued.selector);
+        hook.executeChange(call);
+    }
+
+    function test_cancelled_change_cannot_run() public {
+        bytes memory call = abi.encodeCall(hook.setRebalancer, (attacker, true));
+        hook.queueChange(call);
+        hook.cancelChange(hook.setRebalancer.selector);
+        vm.warp(vm.getBlockTimestamp() + hook.TIMELOCK_DELAY());
+        vm.expectRevert(AutopilotHook.ChangeNotQueued.selector);
+        hook.executeChange(call);
+        assertFalse(hook.isRebalancer(attacker));
+    }
+
+    function test_queue_is_owner_only_and_setter_only() public {
+        bytes memory call = abi.encodeCall(hook.setRebalancer, (attacker, true));
+        vm.startPrank(attacker);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, attacker));
+        hook.queueChange(call);
+        vm.stopPrank();
+
+        // The self-call runs as the hook; nothing that moves funds may be queued.
+        bytes memory drain = abi.encodeWithSignature("withdraw(bytes32)", bytes32(0));
+        vm.expectRevert(abi.encodeWithSelector(AutopilotHook.NotTimelockable.selector, bytes4(drain)));
+        hook.queueChange(drain);
+    }
+
+    function test_queued_call_still_validates_its_arguments() public {
+        bytes memory call = abi.encodeCall(hook.setMaxRebalanceLossBps, (5000));
+        hook.queueChange(call);
+        vm.warp(vm.getBlockTimestamp() + hook.TIMELOCK_DELAY());
+        vm.expectRevert(AutopilotHook.LossToleranceTooHigh.selector);
+        hook.executeChange(call);
+    }
+
+    function test_sequencer_feed_add_is_instant_but_replace_is_queued() public {
+        MockSequencerFeed a = new MockSequencerFeed(0, 1);
+        MockSequencerFeed b = new MockSequencerFeed(0, 1);
+        hook.setSequencerUptimeFeed(address(a));
+        vm.expectRevert(AutopilotHook.ChangeMustBeQueued.selector);
+        hook.setSequencerUptimeFeed(address(b));
+        vm.expectRevert(AutopilotHook.ChangeMustBeQueued.selector);
+        hook.setSequencerUptimeFeed(address(0));
+        _queued(abi.encodeCall(hook.setSequencerUptimeFeed, (address(b))));
+        assertEq(hook.sequencerUptimeFeed(), address(b));
+    }
+
     function _ref() internal view returns (int24 tick, int24 anchor) {
-        (tick, anchor,,) = hook.priceRef(id);
+        (tick, anchor,,,,) = hook.priceRef(id);
     }
 
     /// R-2(a): the anchor must come from the depositor's own transaction, not
@@ -1328,7 +1496,7 @@ contract AutopilotHookTest is Test, Deployers {
     function test_rebalance_measures_against_block_start_anchor() public {
         _deepPool();
         bytes32 pid = _deposit(-600, 600, 1e18);
-        vm.warp(block.timestamp + COOLDOWN);
+        _afterCooldown();
         _nextBlock();
 
         // 2400 ticks: past the 2000 bound from the anchor, but only 1900 from the
@@ -1357,7 +1525,7 @@ contract AutopilotHookTest is Test, Deployers {
         (int24 t,) = _ref();
         assertEq(t, spot, "reseeded at current spot");
 
-        vm.warp(block.timestamp + COOLDOWN);
+        _afterCooldown();
         _nextBlock();
         vm.prank(rebalancer);
         hook.rebalance(second, -6000, -4800, 0); // a fossil would revert PriceDeviation here
@@ -1369,21 +1537,25 @@ contract AutopilotHookTest is Test, Deployers {
     function test_quiet_pool_unblocked_by_poke() public {
         _deepPool();
         bytes32 pid = _deposit(-600, 600, 1e18);
-        vm.warp(block.timestamp + COOLDOWN);
+        _afterCooldown();
 
         _nextBlock();
         _swapTo(-3000); // reference follows only to -500
         _nextBlock();
 
+        // The reference was clamped short of spot, so it is not settled.
         vm.prank(rebalancer);
-        vm.expectPartialRevert(AutopilotHook.PriceDeviation.selector);
+        vm.expectPartialRevert(AutopilotHook.PriceUnsettled.selector);
         hook.rebalance(pid, -3600, -2400, 0);
 
-        // No swaps from here on. Poke once per block: (3000 - 500) / 500 = 5.
+        // No swaps from here on. Poke once per block until the reference reaches
+        // spot: (3000 - 500) / 500 = 5. Quiet blocks after that count as stable
+        // on their own; no more pokes are needed.
         for (uint256 i = 0; i < 5; i++) {
             hook.pokePriceRef(key);
             _nextBlock();
         }
+        vm.roll(vm.getBlockNumber() + hook.MIN_STABLE_BLOCKS());
 
         vm.prank(rebalancer);
         hook.rebalance(pid, -3600, -2400, 0);
@@ -1406,7 +1578,7 @@ contract AutopilotHookTest is Test, Deployers {
 
     function test_poke_is_a_noop_on_a_pool_without_positions() public {
         hook.pokePriceRef(key);
-        (,,, bool seeded) = hook.priceRef(id);
+        (,,, bool seeded,,) = hook.priceRef(id);
         assertFalse(seeded);
     }
 
