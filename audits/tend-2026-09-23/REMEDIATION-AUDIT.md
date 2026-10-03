@@ -147,21 +147,9 @@ Recorded rather than fixed, with the reason.
 - **REG-2 (residual strand)** — fixed in a follow-up; see §8.
 - **R-2 / R-3 / A-4 — fixed in a follow-up redesign; see §7.** One gap remains, and it
   is in the daemon, not the contract — described there.
-- **R-6 (boundary equality)** — LOW. At `spot == sqrtA` / `spot == sqrtB` the limit selects
-  the *far* edge, letting the swap traverse the whole range. Absorbed by the value guard in
-  every configuration tested, so it manifests as an unnecessary revert rather than a bad fill.
-- **A-1 / A-5 (owner powers, no timelock)** — MEDIUM. Six instant-effect setters, each an
-  independent `rebalance()` kill switch. Raising `maxRebalanceLossBps` from 100 to 500 was
-  measured to multiply extractable value ~26× (0.44% → 11.4% of a position over 40 minutes),
-  and the owner can appoint themselves rebalancer, so no collusion is needed. Still strictly
-  better than pre-fix, which was unbounded in a single transaction. A timelock is the answer
-  and is a governance change, not a contract patch.
-- **A-9** — the value guard bounds the swap's own cost, not pre-existing manipulation, since
-  both measurements use the same pre-swap price. The effective bound on manipulation loss is
-  `maxDeviationTicks` (2000 ticks ≈ **22%**), not the 1% value floor. Measured: a 1990-tick
-  push, inside the deviation bound, produced a **137 bps** real loss against a 100 bps
-  configured tolerance. Measuring against `priceRef` instead would make the two guards
-  multiply rather than compose.
+- **R-6 (boundary equality)** — fixed; see §9.
+- **A-1 / A-5 (owner powers, no timelock)** — fixed; see §10.
+- **A-9** — fixed; see §9. The figure recorded here (137 bps) understated it ten-fold.
 
 ## 6. What the reviewers could not measure
 
@@ -318,4 +306,108 @@ anvil and the daemon mid-stage; the power log's sleep window matched the silent 
 daemon log to the second. The script now holds a `caffeinate` assertion while it runs.
 Separately, stage 5 could pick up the sweep's rebalance of the offline-deposited position
 first; it now waits for the position stage 6 inspects.
+
+## 9. R-6 and A-9: two losses the value guard cannot see
+
+> **Superseded by the 2026-10-03 re-audit (`audits/tend-2026-10-03/AUDIT-REPORT.md`).** The 78 bps
+> "worst case" below measured only centred ranges. Out-of-range and one-sided positions lose 117–195
+> bps at the same bound (PR-2, X-1). A held block boundary admits pushes of 700 ticks (PR-1, High).
+> The 50 bps impact default causes DS-1. A-9 and R-6 are **not** closed.
+
+Both findings share a cause. The value guard measures a rebalance at the price it sees
+during the rebalance. These two losses happen at a price the guard never measures:
+afterwards, or a price an attacker set before it.
+
+### R-6 — the empty-book walk
+
+Re-measured before any change (`test_r6_*`, spot placed exactly on a target edge):
+
+- **Deep pool.** The equality case reverted with `ZeroLiquidity`, reproduced against the
+  pre-§8 contract. This was the "unnecessary revert" recorded above. The §8 corrective leg
+  had already fixed it: price now moves at most one tick.
+- **Hook as sole LP.** The swap walks price through an empty book to the far edge of the
+  target. **This is not specific to equality**: any straddle rebalance in an empty book does
+  it, limited only by the range width and `maxSwapImpactBps`. The rebalance itself looks
+  free, because nothing fills. The cost comes afterwards, when arbitrage pulls price back
+  to fair through the newly placed position.
+  `test_r6_empty_book_walk_cost_is_bounded` measures it end to end: **133 bps** at the
+  old 1000 bps impact default, above the 1% tolerance.
+
+**Fix:** the default `maxSwapImpactBps` is now 50, which is about 1% of price. That
+default was set loose for REG-1, when a bounded swap meant a revert. Since §8 the unfilled
+part is held as idle funds, so a tight bound now costs only some temporary idle capital.
+Walk loss: **2 bps**. All 94 other tests pass unchanged.
+
+### A-9 — rebalancing onto a pushed price
+
+`test_a9_rebalance_at_manipulated_price`: an attacker pushes spot just inside the
+deviation bound. The rebalance lands at that price with the new range centred on it, as
+the daemon would. The attacker swaps back. The loss is measured against a control that
+takes the same push and swap-back without the rebalance.
+
+| push (ticks) | 90 | 190 | 490 | 990 | 1990 |
+|---|---|---|---|---|---|
+| loss (bps), ±1200 range | 6 | 28 | 162 | 533 | **1428** |
+
+The old 2000-tick bound admitted a **14%** loss. The value guard measures both sides at the
+pushed price, so it saw a fair trade. The loss also depends on range width. At the narrowest
+range the daemon picks (one tick spacing either side) it is 78 bps at 200 ticks, and over
+1% at every looser bound tried (113–159 bps at 250–350 ticks).
+
+**Fix:** `MAX_DEVIATION_TICKS` is now 200, as both the default and the cap, so the owner can
+only tighten it. The worst measured case is 78 bps, inside the 1% tolerance. Measuring the
+value guard at the reference price instead was rejected: most of the loss is the range
+placement, not the swap, and the guard only sees the swap.
+
+**Cost to honest rebalances:** after a fast move, a rebalance is refused until the
+reference catches up. The daemon pokes it toward spot at 500 ticks a block, so the cost is a
+delay of a few blocks. Six tests that rebalanced straight after a large one-block move now
+take that catch-up first (`_catchUpRef`). The daemon's refusal log now dedupes on the
+error selector. Keying on the full reason, which contains the changing ticks, had logged
+every retry.
+
+## 10. A-1 / A-5: loosening owner changes wait out a timelock
+
+Every setter that **loosens** a protection now needs `queueChange(call)`, then a 2-day wait
+(`TIMELOCK_DELAY`), then `executeChange(call)` within the next 14 days (`TIMELOCK_GRACE`).
+After that the queued change lapses. Calling one of these setters directly reverts with
+`ChangeMustBeQueued`. A depositor who disagrees with a queued change sees `ChangeQueued` two
+days ahead and can withdraw, which is never gated.
+
+| Setter | Waits when |
+|---|---|
+| `setRebalancer` | adding an address (the owner appointing themselves was the A-5 path) |
+| `setMaxRebalanceLossBps` | raising it (the 100 → 500 bps change measured ~26× extractable value) |
+| `setMaxSwapImpactBps` | raising it |
+| `setPriceGuard` | raising either bound |
+| `setMinRebalanceInterval` | shortening it |
+| `setSequencerUptimeFeed` | replacing or removing an existing feed (adding one where there was none only adds a check) |
+
+**Still instant:**
+- **Tightening, and removing a rebalancer.** The worst a tightening can do is stop
+  rebalancing, and positions can always be withdrawn. It is also the emergency lever.
+- **`pause` / `unpause`**, for the same reason.
+- **The pair allowlist.** It gates `deposit` only, so an existing position is never affected.
+
+**The self-call is restricted.** `executeChange` calls the hook as itself, so `queueChange`
+accepts only those six selectors. A queued `withdraw` or anything else that moves funds is
+rejected with `NotTimelockable`. The self-call still runs the setter's own argument
+validation, so an out-of-bounds queued value reverts when executed.
+
+**Verified:** 8 new tests cover direct loosening reverting, tightening staying instant, the
+execution window (early, inside, expired), cancel, owner-only queueing, the selector
+restriction, argument validation at execution, and the feed add-vs-replace rule. The 6
+existing tests that loosened a parameter directly now go through `_queued`.
+
+**What a timelock does not do:** an owner who waits out the delay still gets the change.
+The protection is warning time for depositors, not a veto. Ownership should sit with a
+multisig. That is an operational choice, and the contract cannot enforce it.
+
+## 11. T-3: rebasing tokens
+
+This is unchanged and cannot be fixed in the hook. v4's PoolManager does not track rebases,
+so rebasing balances desync its reserves for every pool, not just this hook's. The
+mitigation is the pair allowlist, which ships disabled. The deploy script now enables it and
+allowlists the deployment's intended pair, so a production deployment refuses unlisted
+tokens from its first block.
 

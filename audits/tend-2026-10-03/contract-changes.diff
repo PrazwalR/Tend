@@ -1,0 +1,501 @@
+diff --git a/contracts/src/AutopilotHook.sol b/contracts/src/AutopilotHook.sol
+index a52bc71..c17d691 100644
+--- a/contracts/src/AutopilotHook.sol
++++ b/contracts/src/AutopilotHook.sol
+@@ -25,6 +25,7 @@ import {IAggregatorV3} from "./interfaces/IAggregatorV3.sol";
+ 
+ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
++import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
+ 
+ import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+ import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
+@@ -48,9 +49,24 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
+         uint64 lastRebalanceAt;
+     }
+ 
++    /// @dev Tokens a rebalance freed but could not redeploy, held for the
++    ///      position as ERC-6909 claims on the PoolManager. They are folded into
++    ///      the next rebalance and paid out on withdraw.
++    struct Idle {
++        uint128 amount0;
++        uint128 amount1;
++    }
++
++    /// @dev `tick` follows spot but is clamped to `anchor ± maxTickMovePerBlock`,
++    ///      where `anchor` is the reference as it stood when the block began. The
++    ///      LAST write in a block wins: a same-block displace-and-restore ends the
++    ///      block with the reference back where it started, so dragging it takes a
++    ///      price held across block boundaries against arbitrage, not a free
++    ///      round trip. One slot: 3 + 3 + 8 + 1 bytes.
+     struct PriceRef {
+         int24 tick;
+-        uint40 updatedAt;
++        int24 anchor;
++        uint64 atBlock;
+         bool seeded;
+     }
+ 
+@@ -76,6 +92,12 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
+     }
+ 
+     uint64 public constant MAX_REBALANCE_INTERVAL = 365 days;
++    /// @dev An owner change that loosens a protection waits this long, so a
++    ///      depositor who disagrees with it can see it coming and withdraw first.
++    uint64 public constant TIMELOCK_DELAY = 2 days;
++    /// @dev A queued change not executed within this window after it matures
++    ///      lapses, so nobody has to watch an old queue entry forever.
++    uint64 public constant TIMELOCK_GRACE = 14 days;
+     /// @dev A cooldown of 0 let a rebalancer loop `rebalance()` within one
+     ///      transaction; an audit measured 59% of a position destroyed that way.
+     uint64 public constant MIN_REBALANCE_INTERVAL = 60;
+@@ -88,7 +110,16 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
+     /// @dev Ceiling on how far the reference tick may be dragged in one block,
+     ///      and on the spot-vs-reference gap a rebalance will tolerate.
+     int24 public constant MAX_TICK_MOVE_PER_BLOCK = 500;
+-    int24 public constant MAX_DEVIATION_TICKS = 2000;
++    /// @dev A rebalance landing on a pushed price buys at that price, and the value
++    ///      guard cannot see it: it measures both sides at the same pushed price.
++    ///      So this bound, not the value guard, is the real limit on manipulation
++    ///      loss. Measured worst case, onto the narrowest range the daemon picks
++    ///      (one tick spacing either side of spot): 78 bps at 200 ticks, over the 1%
++    ///      tolerance at anything looser (113-159 bps at 250-350); 1428 bps at the
++    ///      2000 this used to be. Hence it is both the default and the cap — the owner
++    ///      may only tighten it. Honest rebalances pay only a delay: after a fast move
++    ///      the daemon pokes the reference up to spot, 500 ticks a block.
++    int24 public constant MAX_DEVIATION_TICKS = 200;
+     /// @dev Ceiling on how far the re-ratio swap may move sqrtPrice from spot.
+     uint16 public constant MAX_SWAP_IMPACT_BPS = 2000;
+     /// @dev Time an L2 must have been back up before rebalancing resumes. On
+@@ -112,6 +143,17 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
+     mapping(bytes32 => int24) public boundLower;
+     mapping(bytes32 => int24) public boundUpper;
+     mapping(PoolId => uint256) public poolPositionCount;
++    /// @dev The swap inside a rebalance is bounded, so it can stop short and
++    ///      leave part of the position undeployable at the new range. Paying that
++    ///      part out to the owner rebuilt the position with a fraction of its
++    ///      capital while every guard passed. Reverting instead would hand any LP
++    ///      able to thin the pool a free way to block rebalances. So the remainder
++    ///      stays with the position here until a later rebalance can place it.
++    mapping(bytes32 => Idle) public idle;
++    /// @dev keccak256 of a queued setter call => earliest execution time.
++    mapping(bytes32 => uint64) public queuedChangeEta;
++    /// @dev Set only while `executeChange` is making its self-call.
++    bool private _executingQueued;
+     mapping(address => bool) public isRebalancer;
+     /// @dev Manipulation-resistant price reference, one per pool. v4 ships no
+     ///      oracle, so the hook keeps its own: the tick follows spot but may only
+@@ -169,10 +211,15 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
+     event MaxRebalanceLossBpsSet(uint16 bps);
+     event PriceGuardSet(int24 maxTickMovePerBlock, int24 maxDeviationTicks);
+     event MaxSwapImpactBpsSet(uint16 bps);
++    event ChangeQueued(bytes32 indexed id, bytes call, uint64 eta);
++    event ChangeCancelled(bytes32 indexed id);
++    event ChangeExecuted(bytes32 indexed id);
+     /// @dev Freed value the re-ratio swap could not deploy, returned to the owner
+     ///      as loose tokens. A bounded swap makes a partial fill the normal
+     ///      outcome in a thin pool, and silence about it is how half a position
+     ///      ends up sitting outside the position.
++    /// @dev The position's idle balance after a rebalance: what could not be
++    ///      redeployed at the new range and is held for the next one.
+     event RebalanceResidual(bytes32 indexed positionId, uint256 amount0, uint256 amount1);
+     event SequencerUptimeFeedSet(address feed);
+     event PairAllowed(Currency indexed currency0, Currency indexed currency1, bool allowed);
+@@ -199,6 +246,7 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
+     error ValueLossExceeded(uint256 valueAfter, uint256 valueBefore);
+     error ZeroRecipient();
+     error PriceDeviation(int24 spotTick, int24 referenceTick);
++    error PriceReferenceUnseeded();
+     error DeviationBoundTooHigh();
+     error SequencerDown();
+     error SequencerGracePeriod(uint256 readyAt);
+@@ -207,6 +255,11 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
+     error FeeOnTransferNotSupported(Currency currency, uint256 expected, uint256 received);
+     error FeedHasNoCode();
+     error SwapImpactTooHigh();
++    error ChangeMustBeQueued();
++    error ChangeNotQueued();
++    error ChangeNotReady(uint64 eta);
++    error ChangeExpired(uint64 deadline);
++    error NotTimelockable(bytes4 selector);
+ 
+     /// @dev `initialOwner` is explicit rather than `msg.sender`: the hook must be
+     ///      deployed through the CREATE2 factory for its address to carry the
+@@ -228,7 +281,7 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
+         maxRebalanceLossBps = 100; // 1%
+         emit MaxRebalanceLossBpsSet(100);
+ 
+-        maxSwapImpactBps = 1000; // 10% of sqrtPrice
++        maxSwapImpactBps = 50; // 0.5% of sqrtPrice, ~1% of price
+         maxTickMovePerBlock = MAX_TICK_MOVE_PER_BLOCK;
+         maxDeviationTicks = MAX_DEVIATION_TICKS;
+         emit PriceGuardSet(MAX_TICK_MOVE_PER_BLOCK, MAX_DEVIATION_TICKS);
+@@ -345,6 +398,10 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
+             // every position would bypass the cooldown entirely.
+             lastRebalanceAt: uint64(block.timestamp)
+         });
++        if (poolPositionCount[id] == 0) {
++            (, int24 spot,,) = poolManager.getSlot0(id);
++            _seedPriceRef(id, spot);
++        }
+         poolPositionCount[id] += 1;
+         emit PositionOpened(positionId, msg.sender, id, tickLower, tickUpper, liquidity, key.fee, key.tickSpacing);
+     }
+@@ -413,7 +470,12 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
+         uint64 readyAt = pos.lastRebalanceAt + minRebalanceInterval;
+         if (block.timestamp < readyAt) revert RebalanceTooSoon(readyAt);
+ 
+-        if (newTickLower == pos.tickLower && newTickUpper == pos.tickUpper) revert NoOpRebalance();
++        // Rebalancing onto the current range is how an idle balance gets placed,
++        // so it is only a no-op when there is nothing idle to place.
++        if (newTickLower == pos.tickLower && newTickUpper == pos.tickUpper) {
++            Idle memory held = idle[positionId];
++            if (held.amount0 == 0 && held.amount1 == 0) revert NoOpRebalance();
++        }
+ 
+         _requireSequencerUp();
+ 
+@@ -512,12 +574,23 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
+             }),
+             ""
+         );
+-        if (delta.amount0() > 0) {
+-            cb.key.currency0.take(poolManager, cb.recipient, uint256(uint128(delta.amount0())), cb.asClaims);
+-        }
+-        if (delta.amount1() > 0) {
+-            cb.key.currency1.take(poolManager, cb.recipient, uint256(uint128(delta.amount1())), cb.asClaims);
+-        }
++        (uint256 held0, uint256 held1) = _releaseIdle(cb);
++        uint256 out0 = (delta.amount0() > 0 ? uint256(uint128(delta.amount0())) : 0) + held0;
++        uint256 out1 = (delta.amount1() > 0 ? uint256(uint128(delta.amount1())) : 0) + held1;
++        if (out0 > 0) cb.key.currency0.take(poolManager, cb.recipient, out0, cb.asClaims);
++        if (out1 > 0) cb.key.currency1.take(poolManager, cb.recipient, out1, cb.asClaims);
++    }
++
++    /// @dev Burns the position's held claims, crediting this unlock with them,
++    ///      and clears the record. The caller must spend or re-hold the credit.
++    function _releaseIdle(Callback memory cb) private returns (uint256 held0, uint256 held1) {
++        Idle memory held = idle[cb.positionId];
++        held0 = held.amount0;
++        held1 = held.amount1;
++        if (held0 == 0 && held1 == 0) return (0, 0);
++        delete idle[cb.positionId];
++        if (held0 > 0) poolManager.burn(address(this), cb.key.currency0.toId(), held0);
++        if (held1 > 0) poolManager.burn(address(this), cb.key.currency1.toId(), held1);
+     }
+ 
+     function _doRebalance(Callback memory cb) internal returns (uint128 newLiquidity) {
+@@ -531,8 +604,9 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
+             }),
+             ""
+         );
+-        uint256 freed0 = removed.amount0() > 0 ? uint256(uint128(removed.amount0())) : 0;
+-        uint256 freed1 = removed.amount1() > 0 ? uint256(uint128(removed.amount1())) : 0;
++        (uint256 held0, uint256 held1) = _releaseIdle(cb);
++        uint256 freed0 = (removed.amount0() > 0 ? uint256(uint128(removed.amount0())) : 0) + held0;
++        uint256 freed1 = (removed.amount1() > 0 ? uint256(uint128(removed.amount1())) : 0) + held1;
+         if (freed0 == 0 && freed1 == 0) revert NothingFreed();
+ 
+         // Value the holdings BEFORE the swap, at the price before the swap moves
+@@ -579,24 +653,27 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
+             ""
+         );
+ 
+-        // Whatever the ratio maths left over is dust; it goes back to the owner
+-        // rather than accumulating in the hook.
+-        BalanceDelta net = removed + swapped + added;
+-        if (net.amount0() > 0 || net.amount1() > 0) {
+-            emit RebalanceResidual(
+-                cb.positionId,
+-                net.amount0() > 0 ? uint256(uint128(net.amount0())) : 0,
+-                net.amount1() > 0 ? uint256(uint128(net.amount1())) : 0
+-            );
+-        }
+-        if (net.amount0() > 0) {
+-            cb.key.currency0.take(poolManager, cb.owner, uint256(uint128(net.amount0())), false);
+-        }
+-        if (net.amount1() > 0) {
+-            cb.key.currency1.take(poolManager, cb.owner, uint256(uint128(net.amount1())), false);
++        // Whatever could not be placed stays with the position as claims. `freed`
++        // already counts the released idle balance and the swap, so subtracting
++        // what the new range consumed is the whole remainder.
++        _holdIdle(cb, _sub(freed0, added.amount0()), _sub(freed1, added.amount1()));
++    }
++
++    function _holdIdle(Callback memory cb, uint256 left0, uint256 left1) private {
++        if (left0 > 0) poolManager.mint(address(this), cb.key.currency0.toId(), left0);
++        if (left1 > 0) poolManager.mint(address(this), cb.key.currency1.toId(), left1);
++        if (left0 > 0 || left1 > 0) {
++            idle[cb.positionId] = Idle(SafeCast.toUint128(left0), SafeCast.toUint128(left1));
++            emit RebalanceResidual(cb.positionId, left0, left1);
+         }
+     }
+ 
++    /// @dev `base` less what an add-liquidity delta consumed (a negative delta).
++    function _sub(uint256 base, int128 consumed) private pure returns (uint256) {
++        if (consumed >= 0) return base + uint256(uint128(consumed));
++        return base - uint256(uint128(-consumed));
++    }
++
+     /// @dev Swaps the surplus side so the freed tokens roughly match the ratio
+     ///      the new range wants. Sizing is a first-order estimate at the
+     ///      current price: exactness is not required because any residual is
+@@ -640,6 +717,46 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
+         uint160 limit = _swapPriceLimit(sqrtPriceX96, sqrtA, sqrtB, zeroForOne);
+         if (limit == 0) return BalanceDeltaLibrary.ZERO_DELTA;
+ 
++        BalanceDelta first = poolManager.swap(
++            cb.key,
++            SwapParams({zeroForOne: zeroForOne, amountSpecified: -int256(amountIn), sqrtPriceLimitX96: limit}),
++            ""
++        );
++        return first
++            + _correctOvershoot(
++            cb, [sqrtPriceX96, sqrtA, sqrtB], _add(have0, first.amount0()), _add(have1, first.amount1()), zeroForOne
++        );
++    }
++
++    /// @dev The first leg is sized at the pre-swap price, and its own impact moves
++    ///      price the way that makes the range want more of what was just sold, so
++    ///      it tends to overshoot (the fee pulls the other way). From a range edge
++    ///      it sells everything and leaves nothing for the side the range needs
++    ///      once price is inside, which computes to zero liquidity. One corrective
++    ///      leg, re-sized at the post-swap price, fixes an overshoot. It only runs
++    ///      in the reverse direction: it moves price back toward where it started,
++    ///      so it cannot widen the impact the first leg was bounded to. An
++    ///      undershoot is left alone and ends up in the idle balance.
++    /// @param prices [spot before the first leg, range lower, range upper].
++    function _correctOvershoot(
++        Callback memory cb,
++        uint160[3] memory prices,
++        uint256 have0,
++        uint256 have1,
++        bool firstZeroForOne
++    ) private returns (BalanceDelta) {
++        (uint160 origin, uint160 sqrtA, uint160 sqrtB) = (prices[0], prices[1], prices[2]);
++        (uint160 sqrtNow,,,) = poolManager.getSlot0(cb.key.toId());
++        if (sqrtNow <= sqrtA || sqrtNow >= sqrtB) return BalanceDeltaLibrary.ZERO_DELTA;
++
++        (bool zeroForOne, uint256 amountIn) = _straddleSwap(sqrtNow, sqrtA, sqrtB, cb.liquidity, have0, have1);
++        if (amountIn == 0 || zeroForOne == firstZeroForOne) return BalanceDeltaLibrary.ZERO_DELTA;
++
++        uint160 limit = _swapPriceLimit(sqrtNow, sqrtA, sqrtB, zeroForOne);
++        if (limit == 0) return BalanceDeltaLibrary.ZERO_DELTA;
++        // Never back past where the rebalance started.
++        if (zeroForOne ? limit < origin : limit > origin) limit = origin;
++        if (zeroForOne ? limit >= sqrtNow : limit <= sqrtNow) return BalanceDeltaLibrary.ZERO_DELTA;
+         return poolManager.swap(
+             cb.key,
+             SwapParams({zeroForOne: zeroForOne, amountSpecified: -int256(amountIn), sqrtPriceLimitX96: limit}),
+@@ -739,20 +856,48 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
+     ///      and by at most `maxTickMovePerBlock`. Clamping is the whole point: an
+     ///      attacker who moves spot arbitrarily far in one transaction moves the
+     ///      reference by one capped step, so the deviation guard still fires.
+-    function _updatePriceRef(PoolId id, int24 tick) internal {
++    function _updatePriceRef(PoolId id, int24 spot) internal {
+         PriceRef memory ref = priceRef[id];
+         if (!ref.seeded) {
+-            priceRef[id] = PriceRef({tick: tick, updatedAt: uint40(block.timestamp), seeded: true});
++            _seedPriceRef(id, spot);
+             return;
+         }
+-        if (uint40(block.timestamp) == ref.updatedAt) return;
+-
++        bool newBlock = ref.atBlock != block.number;
++        if (newBlock) {
++            // Last block's final value becomes this block's anchor.
++            ref.anchor = ref.tick;
++            ref.atBlock = uint64(block.number);
++        }
+         int24 cap = maxTickMovePerBlock;
+-        int24 next = tick;
+-        if (next > ref.tick + cap) next = ref.tick + cap;
+-        else if (next < ref.tick - cap) next = ref.tick - cap;
++        int24 next = spot;
++        if (next > ref.anchor + cap) next = ref.anchor + cap;
++        else if (next < ref.anchor - cap) next = ref.anchor - cap;
++        // Every swapper in the pool pays for this write, so skip it when it would
++        // change nothing — common once spot sits beyond the cap for the block.
++        if (!newBlock && next == ref.tick) return;
++        ref.tick = next;
++        priceRef[id] = ref;
++    }
+ 
+-        priceRef[id] = PriceRef({tick: next, updatedAt: uint40(block.timestamp), seeded: true});
++    /// @dev Called when a pool gains its first position. Reseeding here — not on
++    ///      the first swap — means no third party chooses the anchor, and a
++    ///      reference left frozen while the pool had no positions is replaced
++    ///      rather than trusted.
++    function _seedPriceRef(PoolId id, int24 spot) internal {
++        priceRef[id] = PriceRef({tick: spot, anchor: spot, atBlock: uint64(block.number), seeded: true});
++    }
++
++    /// @notice Advance a pool's reference one capped step toward spot. Anyone may
++    ///         call it; it is rate-limited to one step per block, so it gives an
++    ///         attacker nothing a dust swap would not. Its purpose is liveness: on
++    ///         a pool that went quiet after a large move, nothing else would ever
++    ///         pull the reference back toward spot, and every rebalance there would
++    ///         stay blocked with no deadline.
++    function pokePriceRef(PoolKey calldata key) external {
++        PoolId id = key.toId();
++        if (poolPositionCount[id] == 0) return;
++        (, int24 spot,,) = poolManager.getSlot0(id);
++        _updatePriceRef(id, spot);
+     }
+ 
+     /// @dev On an L2, refuses to act while the sequencer is down or has only just
+@@ -786,10 +931,15 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
+     ///      corroborate is a reason to wait, not to trade.
+     function _requirePriceNotManipulated(PoolId id) internal view {
+         PriceRef memory ref = priceRef[id];
+-        if (!ref.seeded) return; // no history yet; nothing to compare against
++        // Seeding at the first deposit makes this unreachable for any pool with a
++        // position, so reaching it means an invariant broke: fail closed.
++        if (!ref.seeded) revert PriceReferenceUnseeded();
++        // Compare against where the reference stood when this block began, not
++        // its intra-block value, which a swap earlier in this block may have moved.
++        int24 anchor = ref.atBlock == block.number ? ref.anchor : ref.tick;
+         (, int24 spotTick,,) = poolManager.getSlot0(id);
+-        int24 diff = spotTick > ref.tick ? spotTick - ref.tick : ref.tick - spotTick;
+-        if (diff > maxDeviationTicks) revert PriceDeviation(spotTick, ref.tick);
++        int24 diff = spotTick > anchor ? spotTick - anchor : anchor - spotTick;
++        if (diff > maxDeviationTicks) revert PriceDeviation(spotTick, anchor);
+     }
+ 
+     function _validateTicks(PoolKey memory key, int24 tickLower, int24 tickUpper) internal pure {
+@@ -820,22 +970,28 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
+         emit PositionRebalancerSet(positionId, rebalancer);
+     }
+ 
+-    function setRebalancer(address rebalancer, bool allowed) external onlyOwner {
++    function setRebalancer(address rebalancer, bool allowed) external {
++        _requireOwnerOrQueued();
++        _requireQueuedIf(allowed && !isRebalancer[rebalancer]);
+         isRebalancer[rebalancer] = allowed;
+         emit RebalancerSet(rebalancer, allowed);
+     }
+ 
+-    function setMaxSwapImpactBps(uint16 bps) external onlyOwner {
++    function setMaxSwapImpactBps(uint16 bps) external {
++        _requireOwnerOrQueued();
+         if (bps == 0 || bps > MAX_SWAP_IMPACT_BPS) revert SwapImpactTooHigh();
++        _requireQueuedIf(bps > maxSwapImpactBps);
+         maxSwapImpactBps = bps;
+         emit MaxSwapImpactBpsSet(bps);
+     }
+ 
+-    function setMaxRebalanceLossBps(uint16 bps) external onlyOwner {
++    function setMaxRebalanceLossBps(uint16 bps) external {
++        _requireOwnerOrQueued();
+         // Floored as well as capped: a tolerance below the pool fee makes every
+         // rebalance revert, which is a protocol-wide off-switch wearing the
+         // costume of a safety parameter.
+         if (bps < MIN_LOSS_TOLERANCE_BPS || bps > MAX_LOSS_TOLERANCE_BPS) revert LossToleranceTooHigh();
++        _requireQueuedIf(bps > maxRebalanceLossBps);
+         maxRebalanceLossBps = bps;
+         emit MaxRebalanceLossBpsSet(bps);
+     }
+@@ -860,29 +1016,100 @@ contract AutopilotHook is BaseHook, Ownable2Step, Pausable, ReentrancyGuard, IUn
+         return keccak256(abi.encode(a, b));
+     }
+ 
+-    function setSequencerUptimeFeed(address feed) external onlyOwner {
++    /// @dev Adding a feed where there was none only adds a check. Replacing or
++    ///      removing one can swap an honest feed for one that always reports up,
++    ///      so that waits.
++    function setSequencerUptimeFeed(address feed) external {
++        _requireOwnerOrQueued();
+         if (feed != address(0) && feed.code.length == 0) revert FeedHasNoCode();
++        _requireQueuedIf(sequencerUptimeFeed != address(0) && feed != sequencerUptimeFeed);
+         sequencerUptimeFeed = feed;
+         emit SequencerUptimeFeedSet(feed);
+     }
+ 
+-    function setPriceGuard(int24 movePerBlock, int24 deviation) external onlyOwner {
++    function setPriceGuard(int24 movePerBlock, int24 deviation) external {
++        _requireOwnerOrQueued();
+         if (movePerBlock <= 0 || deviation <= 0) revert DeviationBoundTooHigh();
+         if (movePerBlock > MAX_TICK_MOVE_PER_BLOCK || deviation > MAX_DEVIATION_TICKS) {
+             revert DeviationBoundTooHigh();
+         }
++        _requireQueuedIf(movePerBlock > maxTickMovePerBlock || deviation > maxDeviationTicks);
+         maxTickMovePerBlock = movePerBlock;
+         maxDeviationTicks = deviation;
+         emit PriceGuardSet(movePerBlock, deviation);
+     }
+ 
+-    function setMinRebalanceInterval(uint64 interval) external onlyOwner {
++    function setMinRebalanceInterval(uint64 interval) external {
++        _requireOwnerOrQueued();
+         if (interval > MAX_REBALANCE_INTERVAL) revert IntervalTooLong();
+         if (interval < MIN_REBALANCE_INTERVAL) revert IntervalTooShort();
++        _requireQueuedIf(interval < minRebalanceInterval);
+         minRebalanceInterval = interval;
+         emit MinRebalanceIntervalSet(interval);
+     }
+ 
++    /// @notice Queue an owner change that loosens a protection. It becomes
++    ///         executable after `TIMELOCK_DELAY` and lapses `TIMELOCK_GRACE` later.
++    /// @param call ABI-encoded call to one of the timelocked setters.
++    function queueChange(bytes calldata call) external onlyOwner {
++        _requireTimelockable(call);
++        bytes32 changeId = keccak256(call);
++        uint64 eta = uint64(block.timestamp) + TIMELOCK_DELAY;
++        queuedChangeEta[changeId] = eta;
++        emit ChangeQueued(changeId, call, eta);
++    }
++
++    function cancelChange(bytes calldata call) external onlyOwner {
++        bytes32 changeId = keccak256(call);
++        if (queuedChangeEta[changeId] == 0) revert ChangeNotQueued();
++        delete queuedChangeEta[changeId];
++        emit ChangeCancelled(changeId);
++    }
++
++    function executeChange(bytes calldata call) external onlyOwner {
++        bytes32 changeId = keccak256(call);
++        uint64 eta = queuedChangeEta[changeId];
++        if (eta == 0) revert ChangeNotQueued();
++        if (block.timestamp < eta) revert ChangeNotReady(eta);
++        if (block.timestamp > eta + TIMELOCK_GRACE) revert ChangeExpired(eta + TIMELOCK_GRACE);
++        delete queuedChangeEta[changeId];
++
++        _executingQueued = true;
++        (bool ok, bytes memory ret) = address(this).call(call);
++        _executingQueued = false;
++        if (!ok) {
++            assembly ("memory-safe") {
++                revert(add(ret, 0x20), mload(ret))
++            }
++        }
++        emit ChangeExecuted(changeId);
++    }
++
++    /// @dev The owner, or a matured queued change making its self-call.
++    function _requireOwnerOrQueued() private view {
++        if (msg.sender == address(this) && _executingQueued) return;
++        _checkOwner();
++    }
++
++    /// @dev A change that tightens a protection, or leaves it as it is, is the
++    ///      owner's to make instantly: the worst a tightening does is pause
++    ///      rebalancing, and withdraw is never gated. A loosening must arrive
++    ///      through `executeChange`.
++    function _requireQueuedIf(bool loosens) private view {
++        if (loosens && !_executingQueued) revert ChangeMustBeQueued();
++    }
++
++    /// @dev The self-call runs with the hook as `msg.sender`, so it is limited to
++    ///      the setters that expect it — never anything that moves funds.
++    function _requireTimelockable(bytes calldata call) private pure {
++        bytes4 sel = call.length >= 4 ? bytes4(call[:4]) : bytes4(0);
++        if (
++            sel != this.setRebalancer.selector && sel != this.setMaxSwapImpactBps.selector
++                && sel != this.setMaxRebalanceLossBps.selector && sel != this.setSequencerUptimeFeed.selector
++                && sel != this.setPriceGuard.selector && sel != this.setMinRebalanceInterval.selector
++        ) revert NotTimelockable(sel);
++    }
++
+     function renounceOwnership() public view override onlyOwner {
+         revert RenounceDisabled();
+     }

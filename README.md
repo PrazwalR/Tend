@@ -50,13 +50,17 @@ process, wired by in-process channels. The only network surface is `lpa serve`
   (`E[fee gain] + E[IL avoided] − gas − slippage − MEV > 0`). Expected IL is
   integrated over the horizon's terminal tick distribution, not point-estimated,
   because IL is convex in price.
-- **Executor** — alloy signer; preflight `eth_call`, hard gas estimate, USD
-  spend cap, slippage floor, receipt timeout, optional private RPC.
+- **Executor** — alloy signer; preflight `eth_call` against the pending block,
+  hard gas estimate, per-transaction USD cap and a rolling hourly budget,
+  receipt timeout, optional private RPC. Refusals are classified by the hook's
+  error: a lagging price reference is poked, a terminal refusal suppresses the
+  position for hours, anything else backs off exponentially.
 - **`AutopilotHook.sol`** — v4 hook that custodies liquidity and moves ranges
   via PoolManager flash accounting. Ownable2Step, ReentrancyGuard, pausable,
   per-position tick envelope, rebalancer allowlist with per-position scoping,
   cooldown floor, protocol-enforced value floor, a truncated per-pool price
-  reference, an optional L2 sequencer check, and an optional pair allowlist.
+  reference, an optional L2 sequencer check, and a pool allowlist (full pool
+  keys; the deploy script enforces it).
 
 ## Layout
 
@@ -144,6 +148,32 @@ Put the deployed address in `AUTOPILOT_HOOK_ADDRESS`.
 - Position liquidity, token amounts and uncollected fees are read from the v4
   `StateView` lens. Without `--hook` (or an HTTP RPC) those fields stream empty
   rather than guessed.
+
+## Owner powers
+
+Owner changes that **loosen** a protection wait out a 2-day timelock: adding a
+rebalancer, raising the loss tolerance or swap-impact bound, widening the
+deviation window, changing the price reference's per-block step **in either
+direction** (slowing it freezes the reference), shortening the cooldown, and
+replacing the sequencer feed. Queue the change with
+`queueChange(abi.encodeCall(...))` and run it with `executeChange` between 2 and 16
+days later. One change can be pending per setter; queuing again replaces it, an
+instant change to the same setter cancels it, and an ownership transfer voids the
+whole queue. Tightening, pausing and the pool allowlist take effect at once.
+Withdraw is never gated, so a depositor who disagrees with a queued change can leave
+before it applies. Undoing a tightening is itself a loosening and waits too — in an
+emergency, `pause` is the lever that can be reversed at once.
+
+## Manipulation guards
+
+A rebalance runs only when the hook's price reference has sat on spot for five
+consecutive block ends (`MIN_STABLE_BLOCKS`) and spot is within 200 ticks of it.
+Its cost — swap fee, price impact and where the new range is placed — is measured
+as the position's value at the reference price before versus after, and must stay
+within `maxRebalanceLossBps`. What remains is an attacker able to hold a pushed
+price against arbitrage across more than five block ends: the reference then
+moves with it, and so do the guards measured from it. See
+`audits/tend-2026-10-03/AUDIT-REPORT.md`.
 
 ## Range orders
 

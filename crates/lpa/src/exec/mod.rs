@@ -1,3 +1,4 @@
+pub mod automation;
 pub mod cost;
 
 use alloy::network::EthereumWallet;
@@ -8,6 +9,8 @@ use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
 use anyhow::{anyhow, bail, Context, Result};
 use std::time::Duration;
+
+use automation::{automation, RefusalAction, SpendBudget};
 
 sol! {
     struct HookPoolKey {
@@ -34,28 +37,51 @@ sol! {
         );
 
         error PriceDeviation(int24 spotTick, int24 referenceTick);
+        error PriceUnsettled(uint8 stableBlocks);
+        error AutomationDisabled();
+        error NotRebalancer();
+        error OutOfBounds();
+        error PositionNotActive();
+        error RebalanceTooSoon(uint64 readyAt);
     }
 }
 
-/// Why a rebalance preflight was refused. Only one of these has a remedy the
-/// daemon can apply itself; the rest resolve with time or not at all.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PreflightBlock {
-    /// Spot is further from the hook's price reference than it tolerates. On a
-    /// pool with no further swaps the reference never catches up on its own, so
-    /// the daemon pokes it one step per block.
-    PriceDeviation,
-    Other,
-}
-
-pub fn classify_preflight(revert: &str) -> PreflightBlock {
+/// What the daemon does about a refused preflight, from the hook's error.
+pub fn classify_preflight(revert: &str) -> RefusalAction {
     use alloy::sol_types::SolError;
-    let selector = alloy::primitives::hex::encode(IAutopilotHook::PriceDeviation::SELECTOR);
-    if revert.to_lowercase().contains(&selector) {
-        PreflightBlock::PriceDeviation
+    use IAutopilotHook as H;
+    let r = revert.to_lowercase();
+    let has = |sel: [u8; 4]| r.contains(&alloy::primitives::hex::encode(sel));
+    // The reference lags spot, or has not yet sat on spot for long enough: a
+    // poke is the only thing that moves it on a pool nobody else is trading.
+    if has(H::PriceDeviation::SELECTOR) || has(H::PriceUnsettled::SELECTOR) {
+        RefusalAction::Poke
+    } else if has(H::AutomationDisabled::SELECTOR)
+        || has(H::NotRebalancer::SELECTOR)
+        || has(H::OutOfBounds::SELECTOR)
+        || has(H::PositionNotActive::SELECTOR)
+    {
+        RefusalAction::Terminal
+    } else if has(H::RebalanceTooSoon::SELECTOR) {
+        RefusalAction::Cooldown
     } else {
-        PreflightBlock::Other
+        RefusalAction::Retry
     }
+}
+
+/// What makes two preflight refusals "the same" for logging: the custom-error
+/// selector when there is one. The full reason embeds the error's arguments —
+/// spot and reference ticks, a ready-at timestamp — which change on every retry,
+/// so keying on it logged every single refusal.
+pub fn refusal_key(revert: &str) -> String {
+    let lower = revert.to_lowercase();
+    if let Some(i) = lower.find("custom error 0x") {
+        let start = i + "custom error ".len();
+        if let Some(sel) = lower.get(start..start + 10) {
+            return sel.to_string();
+        }
+    }
+    revert.to_string()
 }
 
 /// Solidity `int24` bounds (Uniswap tick domain).
@@ -93,7 +119,29 @@ pub struct Executor {
     signer: Address,
     hook: Address,
     tx_timeout: Duration,
+    budget: SpendBudget,
 }
+
+/// Why `execute` did not produce a receipt. The split matters to the caller:
+/// only a transaction that was actually sent starts the per-position interval.
+#[derive(Debug)]
+pub enum ExecFailure {
+    NotSent(anyhow::Error),
+    Unconfirmed { tx_hash: String, error: String },
+}
+
+impl std::fmt::Display for ExecFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExecFailure::NotSent(e) => write!(f, "not sent: {e:#}"),
+            ExecFailure::Unconfirmed { tx_hash, error } => {
+                write!(f, "tx {tx_hash} unconfirmed: {error}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ExecFailure {}
 
 impl Executor {
     pub async fn connect(
@@ -132,6 +180,7 @@ impl Executor {
             signer: addr,
             hook,
             tx_timeout,
+            budget: SpendBudget::from_env(),
         })
     }
 
@@ -142,16 +191,22 @@ impl Executor {
     pub async fn simulate(&self, position_id: B256, lower: i32, upper: i32) -> Result<SimOutcome> {
         let (l, u) = (to_i24(lower)?, to_i24(upper)?);
         let hook = IAutopilotHook::new(self.hook, &self.provider);
+        // At `pending`, not `latest`: the transaction lands in the next block,
+        // where the hook compares against the reference as it stands then. At
+        // `latest` the preflight saw the current block's anchor and refused
+        // rebalances that would have passed (re-audit DS-9).
         match hook
             .rebalance(position_id, l, u, 0)
             .from(self.signer)
             .call()
+            .block(alloy::eips::BlockId::pending())
             .await
         {
             Ok(quoted) => {
                 let gas = hook
                     .rebalance(position_id, l, u, 0)
                     .from(self.signer)
+                    .block(alloy::eips::BlockId::pending())
                     .estimate_gas()
                     .await
                     .unwrap_or(0);
@@ -176,10 +231,68 @@ impl Executor {
         position_id: B256,
         lower: i32,
         upper: i32,
-        slippage_bps: u32,
+        slippage_bps: Option<u32>,
         max_gas_usd: f64,
         eth_price: &crate::chain::oracle::EthPrice,
-    ) -> Result<ExecReport> {
+    ) -> std::result::Result<ExecReport, ExecFailure> {
+        let floor = self
+            .prepare(position_id, lower, upper, slippage_bps)
+            .await
+            .map_err(ExecFailure::NotSent)?;
+        let (l, u) = (
+            to_i24(lower).map_err(ExecFailure::NotSent)?,
+            to_i24(upper).map_err(ExecFailure::NotSent)?,
+        );
+        self.check_spend(
+            IAutopilotHook::new(self.hook, &self.provider)
+                .rebalance(position_id, l, u, floor)
+                .from(self.signer)
+                .block(alloy::eips::BlockId::pending())
+                .estimate_gas()
+                .await
+                .context("gas estimation failed")
+                .map_err(ExecFailure::NotSent)?,
+            max_gas_usd,
+            eth_price,
+        )
+        .await
+        .map_err(ExecFailure::NotSent)?;
+
+        let hook = IAutopilotHook::new(self.hook, &self.submit);
+        let pending = hook
+            .rebalance(position_id, l, u, floor)
+            .send()
+            .await
+            .map_err(|e| ExecFailure::NotSent(e.into()))?;
+        let tx_hash = *pending.tx_hash();
+        let receipt = pending
+            .with_timeout(Some(self.tx_timeout))
+            .get_receipt()
+            .await
+            .map_err(|e| ExecFailure::Unconfirmed {
+                tx_hash: format!("{tx_hash:#x}"),
+                error: format!("after {}s: {e}", self.tx_timeout.as_secs()),
+            })?;
+        Ok(ExecReport {
+            tx_hash: format!("{:#x}", receipt.transaction_hash),
+            gas_used: receipt.gas_used,
+            success: receipt.status(),
+        })
+    }
+
+    /// Preflight and the `minLiquidity` floor. `None` sends a floor of 0, which is
+    /// what automation uses: a floor taken from a preflight quote turns any depth
+    /// change between preflight and inclusion into a reverted transaction the
+    /// daemon pays for, and undoes the hook's own handling of a thin pool, which
+    /// is to place what it can and hold the rest idle (re-audit DS-2). The hook's
+    /// value, impact and deviation guards bound the fill regardless.
+    async fn prepare(
+        &self,
+        position_id: B256,
+        lower: i32,
+        upper: i32,
+        slippage_bps: Option<u32>,
+    ) -> Result<u128> {
         let sim = self.simulate(position_id, lower, upper).await?;
         if !sim.ok {
             bail!(
@@ -187,19 +300,24 @@ impl Executor {
                 sim.revert.unwrap_or_default()
             );
         }
-        let bps = u128::from(slippage_bps).min(BPS_DENOMINATOR);
-        let floor = sim.quoted_liquidity.saturating_mul(BPS_DENOMINATOR - bps) / BPS_DENOMINATOR;
+        Ok(match slippage_bps {
+            None => 0,
+            Some(bps) => {
+                let bps = u128::from(bps).min(BPS_DENOMINATOR);
+                sim.quoted_liquidity.saturating_mul(BPS_DENOMINATOR - bps) / BPS_DENOMINATOR
+            }
+        })
+    }
 
-        let (l, u) = (to_i24(lower)?, to_i24(upper)?);
-        let read = IAutopilotHook::new(self.hook, &self.provider);
-        let gas = read
-            .rebalance(position_id, l, u, floor)
-            .from(self.signer)
-            .estimate_gas()
-            .await
-            .context("gas estimation failed")?;
-        // Refuse rather than fall back: the cap is meaningless priced against a
-        // seed constant, and an unpriced transaction is not an emergency.
+    /// Per-transaction cap, then the rolling hourly budget. Refuses rather than
+    /// falls back: a cap priced against a seed constant means nothing, and an
+    /// unpriced transaction is not an emergency.
+    async fn check_spend(
+        &self,
+        gas: u64,
+        max_gas_usd: f64,
+        eth_price: &crate::chain::oracle::EthPrice,
+    ) -> Result<()> {
         let eth_price_usd = eth_price
             .get_fresh()
             .ok_or_else(|| anyhow!("no fresh ETH/USD price; refusing to price the spend cap"))?;
@@ -208,25 +326,10 @@ impl Executor {
         if !cost::within_spend_cap(est, max_gas_usd) {
             bail!("spend cap exceeded: ${est:.2} > ${max_gas_usd:.2}");
         }
-
-        let hook = IAutopilotHook::new(self.hook, &self.submit);
-        let pending = hook.rebalance(position_id, l, u, floor).send().await?;
-        let tx_hash = *pending.tx_hash();
-        let receipt = pending
-            .with_timeout(Some(self.tx_timeout))
-            .get_receipt()
-            .await
-            .map_err(|e| {
-                anyhow!(
-                    "tx {tx_hash:#x} unconfirmed after {}s ({e})",
-                    self.tx_timeout.as_secs()
-                )
-            })?;
-        Ok(ExecReport {
-            tx_hash: format!("{:#x}", receipt.transaction_hash),
-            gas_used: receipt.gas_used,
-            success: receipt.status(),
-        })
+        if !self.budget.try_spend(est, std::time::Instant::now()) {
+            bail!("hourly spend budget exhausted (LPA_MAX_SPEND_USD_PER_HOUR)");
+        }
+        Ok(())
     }
 }
 
@@ -252,17 +355,11 @@ impl Executor {
         let gas = read
             .pokePriceRef(key.clone())
             .from(self.signer)
+            .block(alloy::eips::BlockId::pending())
             .estimate_gas()
             .await
             .context("poke gas estimation failed")?;
-        let eth_price_usd = eth_price
-            .get_fresh()
-            .ok_or_else(|| anyhow!("no fresh ETH/USD price; refusing to price a poke"))?;
-        let gas_price = self.provider.get_gas_price().await?;
-        let est = cost::rebalance_cost_usd(gas, gas_price, eth_price_usd);
-        if !cost::within_spend_cap(est, max_gas_usd) {
-            bail!("spend cap exceeded for poke: ${est:.2} > ${max_gas_usd:.2}");
-        }
+        self.check_spend(gas, max_gas_usd, eth_price).await?;
 
         let hook = IAutopilotHook::new(self.hook, &self.submit);
         let receipt = hook
@@ -291,13 +388,20 @@ pub struct RebalanceIntent {
 }
 
 pub struct AutoExec {
-    pub slippage_bps: u32,
     pub max_gas_usd: f64,
     /// Live handle, not a snapshot: the spend cap is only as honest as the ETH
     /// price it is denominated in.
     pub eth_price: crate::chain::oracle::EthPrice,
     pub min_interval: Duration,
 }
+
+/// Bound on one iteration of the executor: a preflight, gas estimate, send and
+/// receipt wait. Without it one hung RPC wedges the only executor for good, the
+/// queue fills, and every intent after it is dropped (re-audit DS-7).
+const ITERATION_SLACK: Duration = Duration::from_secs(60);
+/// Pokes in one pool, without a rebalance landing there, before the daemon says
+/// so: a reference that never catches up means someone is holding the price.
+const POKE_ALERT_AFTER: u32 = 50;
 
 pub async fn run_executor_loop(
     mut rx: tokio::sync::mpsc::Receiver<RebalanceIntent>,
@@ -312,10 +416,23 @@ pub async fn run_executor_loop(
         max_gas_usd = cfg.max_gas_usd,
         "AUTO-EXECUTE enabled — the daemon will send real rebalance transactions"
     );
+    let auto = automation();
+    let iteration_limit = executor.tx_timeout + ITERATION_SLACK;
     let mut last: HashMap<String, Instant> = HashMap::new();
-    let mut last_poke: HashMap<B256, Instant> = HashMap::new();
-    let mut last_block: HashMap<String, String> = HashMap::new();
+    let mut pokes = PokeState::default();
+    let mut last_block: HashMap<String, (String, Instant)> = HashMap::new();
+    let mut handled = 0u64;
     while let Some(intent) = rx.recv().await {
+        auto.mark_dequeued(&intent.position_id);
+        handled += 1;
+        if handled.is_multiple_of(256) {
+            let now = Instant::now();
+            let day = Duration::from_secs(86_400);
+            last.retain(|_, t| now.duration_since(*t) < day);
+            last_block.retain(|_, (_, t)| now.duration_since(*t) < day);
+            pokes.prune(now);
+            auto.prune(now);
+        }
         if last
             .get(&intent.position_id)
             .is_some_and(|t| t.elapsed() < cfg.min_interval)
@@ -326,60 +443,125 @@ pub async fn run_executor_loop(
             Ok(p) => p,
             Err(_) => continue,
         };
-
-        // Preflight first. A refused eth_call costs nothing, so it must not burn
-        // the per-position interval — that is reserved for transactions actually
-        // sent. Otherwise one blocked attempt would suppress retries for minutes.
-        let sim = match executor
-            .simulate(pid, intent.new_lower, intent.new_upper)
-            .await
-        {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(error = %e, position = %intent.position_id, "preflight call failed");
-                continue;
-            }
-        };
-        if !sim.ok {
-            let reason = sim.revert.unwrap_or_default();
-            let block = classify_preflight(&reason);
-            // Warn once per distinct reason, then stay quiet: the sweep retries
-            // every heartbeat and would otherwise repeat the same line forever.
-            if last_block.get(&intent.position_id) != Some(&reason) {
-                tracing::warn!(position = %intent.position_id, ?block, reason = %reason, "rebalance blocked at preflight");
-                last_block.insert(intent.position_id.clone(), reason);
-            }
-            if block == PreflightBlock::PriceDeviation {
-                poke_once(&executor, &cfg, pid, &intent.position_id, &mut last_poke).await;
-            }
-            continue;
+        let work = handle_intent(
+            &executor,
+            &cfg,
+            &intent,
+            pid,
+            &mut last,
+            &mut last_block,
+            &mut pokes,
+        );
+        if tokio::time::timeout(iteration_limit, work).await.is_err() {
+            tracing::warn!(position = %intent.position_id, limit_secs = iteration_limit.as_secs(), "executor iteration timed out; abandoned");
+            auto.strike(&intent.position_id, Instant::now());
         }
-        last_block.remove(&intent.position_id);
+    }
+}
 
-        last.insert(intent.position_id.clone(), Instant::now());
-        match executor
-            .execute(
-                pid,
-                intent.new_lower,
-                intent.new_upper,
-                cfg.slippage_bps,
-                cfg.max_gas_usd,
-                &cfg.eth_price,
-            )
-            .await
-        {
-            Ok(r) => tracing::info!(
-                tx = %r.tx_hash,
-                gas_used = r.gas_used,
-                position = %intent.position_id,
-                "auto-rebalanced on-chain"
-            ),
-            Err(e) => tracing::warn!(
-                error = %e,
-                position = %intent.position_id,
-                "auto-rebalance skipped (preflight/cap/cooldown)"
-            ),
+async fn handle_intent(
+    executor: &Executor,
+    cfg: &AutoExec,
+    intent: &RebalanceIntent,
+    pid: B256,
+    last: &mut std::collections::HashMap<String, std::time::Instant>,
+    last_block: &mut std::collections::HashMap<String, (String, std::time::Instant)>,
+    pokes: &mut PokeState,
+) {
+    use std::time::Instant;
+    let auto = automation();
+    // Preflight first. A refused eth_call costs nothing, so it must not burn the
+    // per-position interval — that is reserved for transactions actually sent.
+    let sim = match executor
+        .simulate(pid, intent.new_lower, intent.new_upper)
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, position = %intent.position_id, "preflight call failed");
+            auto.strike(&intent.position_id, Instant::now());
+            return;
         }
+    };
+    if !sim.ok {
+        let reason = sim.revert.unwrap_or_default();
+        let action = classify_preflight(&reason);
+        // Warn once per kind of refusal, then stay quiet: the sweep retries
+        // every pass and would otherwise repeat the same line forever.
+        let key = refusal_key(&reason);
+        if last_block.get(&intent.position_id).map(|(k, _)| k) != Some(&key) {
+            tracing::warn!(position = %intent.position_id, ?action, reason = %reason, "rebalance blocked at preflight");
+        } else {
+            tracing::debug!(position = %intent.position_id, ?action, "rebalance still blocked at preflight");
+        }
+        last_block.insert(intent.position_id.clone(), (key, Instant::now()));
+        let wait = auto.on_refusal(&intent.position_id, action, Instant::now());
+        if action == RefusalAction::Terminal {
+            tracing::info!(position = %intent.position_id, suppress_secs = wait.as_secs(), "position will not be proposed again for a while");
+        }
+        if action == RefusalAction::Poke {
+            poke_once(executor, cfg, pid, &intent.position_id, pokes).await;
+        }
+        return;
+    }
+    last_block.remove(&intent.position_id);
+
+    match executor
+        .execute(
+            pid,
+            intent.new_lower,
+            intent.new_upper,
+            None,
+            cfg.max_gas_usd,
+            &cfg.eth_price,
+        )
+        .await
+    {
+        Ok(r) if r.success => {
+            last.insert(intent.position_id.clone(), Instant::now());
+            auto.on_success(&intent.position_id);
+            if let Ok((_, pool_id)) = executor.pool_of(pid).await {
+                pokes.settled(pool_id);
+            }
+            tracing::info!(tx = %r.tx_hash, gas_used = r.gas_used, position = %intent.position_id, "auto-rebalanced on-chain")
+        }
+        Ok(r) => {
+            // Sent and mined, but reverted: something changed between preflight
+            // and inclusion. Back off so a position whose transactions keep
+            // reverting does not burn one every interval (re-audit DS-6).
+            last.insert(intent.position_id.clone(), Instant::now());
+            let wait = auto.strike(&intent.position_id, Instant::now());
+            tracing::warn!(tx = %r.tx_hash, gas_used = r.gas_used, position = %intent.position_id, backoff_secs = wait.as_secs(), "rebalance tx REVERTED on-chain")
+        }
+        Err(ExecFailure::Unconfirmed { tx_hash, error }) => {
+            last.insert(intent.position_id.clone(), Instant::now());
+            tracing::warn!(tx = %tx_hash, error = %error, position = %intent.position_id, "rebalance tx unconfirmed")
+        }
+        Err(ExecFailure::NotSent(e)) => {
+            let wait = auto.strike(&intent.position_id, Instant::now());
+            tracing::warn!(error = %e, position = %intent.position_id, backoff_secs = wait.as_secs(), "auto-rebalance not sent (preflight/cap/budget)")
+        }
+    }
+}
+
+/// Per-pool poke throttle, and a count of pokes since a rebalance last landed
+/// in the pool.
+#[derive(Default)]
+struct PokeState {
+    last: std::collections::HashMap<B256, std::time::Instant>,
+    since_settled: std::collections::HashMap<B256, u32>,
+}
+
+impl PokeState {
+    fn settled(&mut self, pool_id: B256) {
+        self.since_settled.remove(&pool_id);
+    }
+
+    fn prune(&mut self, now: std::time::Instant) {
+        let hour = Duration::from_secs(3600);
+        self.last.retain(|_, t| now.duration_since(*t) < hour);
+        let live: std::collections::HashSet<B256> = self.last.keys().copied().collect();
+        self.since_settled.retain(|k, _| live.contains(k));
     }
 }
 
@@ -392,7 +574,7 @@ async fn poke_once(
     cfg: &AutoExec,
     pid: B256,
     position_id: &str,
-    last_poke: &mut std::collections::HashMap<B256, std::time::Instant>,
+    pokes: &mut PokeState,
 ) {
     let (key, pool_id) = match executor.pool_of(pid).await {
         Ok(k) => k,
@@ -402,14 +584,22 @@ async fn poke_once(
         }
     };
     // Several positions can share a pool, and the sweep proposes each of them
-    // every heartbeat; throttle on the pool before spending anything.
-    if !poke_due(last_poke.get(&pool_id).copied(), std::time::Instant::now()) {
+    // every pass; throttle on the pool before spending anything.
+    if !poke_due(pokes.last.get(&pool_id).copied(), std::time::Instant::now()) {
         return;
     }
-    last_poke.insert(pool_id, std::time::Instant::now());
+    pokes.last.insert(pool_id, std::time::Instant::now());
     match executor.poke(key, cfg.max_gas_usd, &cfg.eth_price).await {
         Ok(tx) => {
-            tracing::info!(tx = %tx, position = %position_id, "poked price reference toward spot")
+            tracing::info!(tx = %tx, position = %position_id, "poked price reference toward spot");
+            let n = pokes.since_settled.entry(pool_id).or_insert(0);
+            *n += 1;
+            if *n == POKE_ALERT_AFTER {
+                // A reference that never settles means spot is not sitting still:
+                // genuine turbulence, or someone holding the price. Either way an
+                // operator should look (re-audit PR-3).
+                tracing::warn!(pool = %pool_id, pokes = *n, "price reference is not settling despite repeated pokes; rebalances in this pool are on hold");
+            }
         }
         Err(e) => {
             tracing::warn!(error = %e, position = %position_id, "price-reference poke failed")
@@ -433,10 +623,10 @@ mod tests {
         let text = format!(
             "server returned an error response: error code 3: execution reverted, data: \"0x{sel}00000000\""
         );
-        assert_eq!(classify_preflight(&text), PreflightBlock::PriceDeviation);
+        assert_eq!(classify_preflight(&text), RefusalAction::Poke);
         assert_eq!(
             classify_preflight(&text.to_uppercase()),
-            PreflightBlock::PriceDeviation
+            RefusalAction::Poke
         );
     }
 
@@ -445,9 +635,9 @@ mod tests {
         // RebalanceTooSoon — resolves with time, not with a poke.
         assert_eq!(
             classify_preflight("execution reverted, data: \"0x2ddcae9c0000\""),
-            PreflightBlock::Other
+            RefusalAction::Cooldown
         );
-        assert_eq!(classify_preflight(""), PreflightBlock::Other);
+        assert_eq!(classify_preflight(""), RefusalAction::Retry);
     }
 
     #[test]
@@ -466,5 +656,70 @@ mod tests {
         assert!(poke_due(None, now), "first poke of a pool is always due");
         assert!(!poke_due(Some(now), now), "not twice in one interval");
         assert!(poke_due(Some(now), now + POKE_MIN_INTERVAL));
+    }
+
+    #[test]
+    fn refusals_dedupe_on_selector_not_arguments() {
+        let a = "server returned an error response: error code 3: execution reverted: custom error 0x1782bd94: fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff9e4";
+        let b = "server returned an error response: error code 3: execution reverted: custom error 0x1782bd94: fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffbd8";
+        let c = "server returned an error response: error code 3: execution reverted: custom error 0x2ddcae9c: 000000000000000000000000000000000000000000000000000000006ab8a0df";
+        assert_eq!(refusal_key(a), "0x1782bd94");
+        assert_eq!(refusal_key(a), refusal_key(b));
+        assert_ne!(refusal_key(a), refusal_key(c));
+        assert_eq!(refusal_key("connection refused"), "connection refused");
+    }
+
+    #[test]
+    fn every_refusal_maps_to_its_action() {
+        use alloy::sol_types::SolError;
+        use IAutopilotHook as H;
+        let text = |sel: [u8; 4]| {
+            format!(
+                "execution reverted: custom error 0x{}: 00",
+                alloy::primitives::hex::encode(sel)
+            )
+        };
+        assert_eq!(
+            classify_preflight(&text(H::PriceUnsettled::SELECTOR)),
+            RefusalAction::Poke
+        );
+        for sel in [
+            H::AutomationDisabled::SELECTOR,
+            H::NotRebalancer::SELECTOR,
+            H::OutOfBounds::SELECTOR,
+            H::PositionNotActive::SELECTOR,
+        ] {
+            assert_eq!(classify_preflight(&text(sel)), RefusalAction::Terminal);
+        }
+        assert_eq!(
+            classify_preflight(&text(H::RebalanceTooSoon::SELECTOR)),
+            RefusalAction::Cooldown
+        );
+        // ValueLossExceeded and anything unknown: retried with backoff.
+        assert_eq!(
+            classify_preflight("custom error 0x79ae6f69: 00"),
+            RefusalAction::Retry
+        );
+    }
+
+    #[test]
+    fn hook_error_selectors_match_the_contract() {
+        use alloy::sol_types::SolError;
+        use IAutopilotHook as H;
+        let hex = |s: [u8; 4]| alloy::primitives::hex::encode(s);
+        // cast sig "<error>"
+        assert_eq!(
+            hex(H::PriceUnsettled::SELECTOR),
+            hex(alloy::primitives::keccak256("PriceUnsettled(uint8)")[..4]
+                .try_into()
+                .unwrap())
+        );
+        assert_eq!(
+            hex(H::AutomationDisabled::SELECTOR),
+            hex(alloy::primitives::keccak256("AutomationDisabled()")[..4]
+                .try_into()
+                .unwrap())
+        );
+        assert_eq!(hex(H::RebalanceTooSoon::SELECTOR), "2ddcae9c");
     }
 }
