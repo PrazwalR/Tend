@@ -157,29 +157,43 @@ deviation window, changing the price reference's per-block step **in either
 direction** (slowing it freezes the reference), shortening the cooldown, and
 replacing the sequencer feed. Queue the change with
 `queueChange(abi.encodeCall(...))` and run it with `executeChange` between 2 and 16
-days later. One change can be pending per setter; queuing again replaces it, an
-instant change to the same setter cancels it, and an ownership transfer voids the
-whole queue. Tightening, pausing and the pool allowlist take effect at once.
+days later. One change can be pending per setter (per address, for `setRebalancer`);
+queuing again replaces it, an instant change to the same setter (or address)
+cancels it, and an ownership transfer voids the whole queue. `changeKey(call)`
+gives the slot a call occupies, and `cancelChange(key)` takes it. Tightening, pausing and the pool allowlist take effect at once.
 Withdraw is never gated, so a depositor who disagrees with a queued change can leave
 before it applies. Undoing a tightening is itself a loosening and waits too — in an
 emergency, `pause` is the lever that can be reversed at once.
 
 ## Manipulation guards
 
-A rebalance runs only when the hook's price reference has sat on spot for five
-consecutive block ends (`MIN_STABLE_BLOCKS`) and spot is within 200 ticks of it.
-Its cost — swap fee, price impact and where the new range is placed — is measured
-as the position's value at the reference price before versus after, and must stay
-within `maxRebalanceLossBps`. What remains is an attacker able to hold a pushed
-price against arbitrage across more than five block ends: the reference then
-moves with it, and so do the guards measured from it. See
-`audits/tend-2026-10-03/AUDIT-REPORT.md`.
+A rebalance runs only when the hook's price reference has stayed within
+`maxDeviationTicks` (200) of one level, unclamped, for five consecutive block
+ends (`MIN_STABLE_BLOCKS`), and spot is within 200 ticks of it. A reference walked
+in steps — even steps small enough never to be clamped — restarts the count each
+time it leaves that band. The rebalance's cost — swap fee, price impact and where
+the new range is placed — is measured as the position's value at the reference
+price before versus after, and must stay within `maxRebalanceLossBps`.
+
+What remains is an attacker able to hold a pushed level against arbitrage for
+five consecutive block ends (about 10 s on Base): the reference then sits there,
+and every guard measures from it. The cost to honest users: after a price move
+faster than about 200 ticks per five blocks, rebalances wait until price has held
+still. See `audits/tend-2026-10-03-full/AUDIT-REPORT.md`.
+
+## Deposits
+
+`deposit(key, lower, upper, liquidity, minBound, maxBound, rebalancer,
+amount0Max, amount1Max, deadline)`. The token amounts a liquidity target needs
+depend on spot when the transaction executes, so quote `amount0Max`/`amount1Max`
+off-chain (the amounts at the current price plus a small margin): a deposit that
+would pull more reverts with `DepositExceedsMax` instead of being sandwiched.
 
 ## Range orders
 
 The daemon rebalances every out-of-range position toward spot, including one opened
 out of range on purpose. To keep a range order, open it with automation off:
-`deposit(key, lower, upper, liquidity, minBound, maxBound, AUTOMATION_OFF)`, or call
+`deposit(..., rebalancer = AUTOMATION_OFF, ...)`, or call
 `setPositionRebalancer(positionId, AUTOMATION_OFF)` afterwards.
 
 ## End-to-end

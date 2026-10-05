@@ -45,8 +45,18 @@ contract DosPoC is Test, Deployers {
     // ------------------------------------------------------------------ helpers
 
     function _deposit(PoolKey memory k, int24 lo, int24 hi, uint128 liq) internal returns (bytes32) {
-        return
-            hook.deposit(k, lo, hi, liq, TickMath.minUsableTick(k.tickSpacing), TickMath.maxUsableTick(k.tickSpacing));
+        return hook.deposit(
+            k,
+            lo,
+            hi,
+            liq,
+            TickMath.minUsableTick(k.tickSpacing),
+            TickMath.maxUsableTick(k.tickSpacing),
+            address(0),
+            type(uint256).max,
+            type(uint256).max,
+            type(uint256).max
+        );
     }
 
     function _lp(PoolKey memory k, int24 lo, int24 hi, int256 delta, bytes32 salt) internal {
@@ -186,10 +196,13 @@ contract DosPoC is Test, Deployers {
         // Griefer pulls its depth before the tx lands (honest 1e18 remains).
         _lp(key, -60000, 60000, -1e20, GRIEFER_SALT);
 
+        // Since the full audit's AM2-2 fix the fallback places the position on
+        // its held side when that deploys more value, so even the old 99% floor
+        // no longer turns the depth pull into a revert. (The daemon now sends 0.)
         snap = vm.snapshotState();
         vm.prank(rebalancer);
-        vm.expectPartialRevert(AutopilotHook.SlippageExceeded.selector);
-        hook.rebalance(pid, lower, upper, floor);
+        uint128 withOldFloor = hook.rebalance(pid, lower, upper, floor);
+        assertGe(withOldFloor, floor);
 
         // The contract itself would have handled it: with no floor the
         // rebalance lands and the unplaced part is held as idle.
@@ -201,7 +214,6 @@ contract DosPoC is Test, Deployers {
         console2.log("idle0", i0);
         console2.log("idle1", i1);
         assertGt(got, 0);
-        assertLt(got, floor);
     }
 
     // ------------------------------------------------------------------ DS-3
@@ -222,7 +234,18 @@ contract DosPoC is Test, Deployers {
         hook.setAllowedPool(key, true);
         hook.setAllowlistEnforced(true);
         vm.expectRevert(AutopilotHook.PoolNotAllowed.selector);
-        hook.deposit(k, -200, 200, 1e9, TickMath.minUsableTick(200), TickMath.maxUsableTick(200));
+        hook.deposit(
+            k,
+            -200,
+            200,
+            1e9,
+            TickMath.minUsableTick(200),
+            TickMath.maxUsableTick(200),
+            address(0),
+            type(uint256).max,
+            type(uint256).max,
+            type(uint256).max
+        );
         hook.setAllowlistEnforced(false);
 
         // Measured with enforcement off, as a record of why the daemon also caps

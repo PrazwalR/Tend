@@ -37,7 +37,18 @@ contract Reenterer is ITokenReceiverHook {
     }
 
     function open() external returns (bytes32) {
-        pid = hook.deposit(key, -600, 600, 1e18, TickMath.minUsableTick(60), TickMath.maxUsableTick(60));
+        pid = hook.deposit(
+            key,
+            -600,
+            600,
+            1e18,
+            TickMath.minUsableTick(60),
+            TickMath.maxUsableTick(60),
+            address(0),
+            type(uint256).max,
+            type(uint256).max,
+            type(uint256).max
+        );
         return pid;
     }
 
@@ -61,7 +72,18 @@ contract Reenterer is ITokenReceiverHook {
         catch (bytes memory e) {
             errRebalance = e;
         }
-        try hook.deposit(key, -600, 600, 1e15, TickMath.minUsableTick(60), TickMath.maxUsableTick(60)) {}
+        try hook.deposit(
+            key,
+            -600,
+            600,
+            1e15,
+            TickMath.minUsableTick(60),
+            TickMath.maxUsableTick(60),
+            address(0),
+            type(uint256).max,
+            type(uint256).max,
+            type(uint256).max
+        ) {}
         catch (bytes memory e) {
             errDeposit = e;
         }
@@ -109,7 +131,18 @@ contract TokenPoCTest is Test, Deployers {
 
     function _deposit(PoolKey memory k, int24 lo, int24 hi) internal returns (bytes32) {
         int24 s = k.tickSpacing;
-        return hook.deposit(k, lo, hi, 1e18, TickMath.minUsableTick(s), TickMath.maxUsableTick(s));
+        return hook.deposit(
+            k,
+            lo,
+            hi,
+            1e18,
+            TickMath.minUsableTick(s),
+            TickMath.maxUsableTick(s),
+            address(0),
+            type(uint256).max,
+            type(uint256).max,
+            type(uint256).max
+        );
     }
 
     function _rebalance(bytes32 pid, int24 lo, int24 hi) internal {

@@ -12,6 +12,11 @@ use crate::position::tracker::Tracker;
 use crate::proto::autopilot_strategy_server::AutopilotStrategyServer;
 use strategy_service::StrategyService;
 
+#[cfg(test)]
+pub(crate) fn strategy_service_for_audit(tracker: Arc<Tracker>) -> StrategyService {
+    StrategyService::new(tracker, None)
+}
+
 /// Constant-time byte comparison, so the auth check does not leak the token
 /// via response timing. Length is not secret (bearer tokens are fixed-length).
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
@@ -31,6 +36,7 @@ pub async fn run(
     db: &str,
     chain: &str,
     hook: Option<alloy::primitives::Address>,
+    insecure_no_auth: bool,
 ) -> anyhow::Result<()> {
     let addr = format!("{host}:{port}").parse()?;
     if host == "0.0.0.0" {
@@ -48,12 +54,12 @@ pub async fn run(
                 Ok(url) => match ChainReader::connect(&url, h, cfg.addrs.state_view).await {
                     Ok(r) => Some(Arc::new(r)),
                     Err(e) => {
-                        tracing::warn!(error = %e, "chain reader unavailable; serving un-enriched positions");
+                        tracing::warn!(error = %crate::redact(&e), "chain reader unavailable; serving un-enriched positions");
                         None
                     }
                 },
                 Err(e) => {
-                    tracing::warn!(error = %e, "no HTTP RPC configured; serving un-enriched positions");
+                    tracing::warn!(error = %crate::redact(&e), "no HTTP RPC configured; serving un-enriched positions");
                     None
                 }
             }
@@ -69,8 +75,14 @@ pub async fn run(
         .ok()
         .filter(|s| !s.is_empty())
         .map(|t| format!("Bearer {t}"));
+    // Refuse to run open by default: with no token anyone who can reach the port
+    // could delete the positions the watcher manages, and nothing re-indexes
+    // them (full audit DM-3).
     if expected.is_none() {
-        tracing::warn!("LPA_API_TOKEN unset — serve RPCs are UNAUTHENTICATED");
+        if !insecure_no_auth {
+            anyhow::bail!("LPA_API_TOKEN is not set; refusing to serve without auth (pass --insecure-no-auth to override)");
+        }
+        tracing::warn!("--insecure-no-auth: serve RPCs are UNAUTHENTICATED");
     }
     let auth = move |req: Request<()>| -> Result<Request<()>, Status> {
         match &expected {

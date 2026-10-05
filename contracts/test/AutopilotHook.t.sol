@@ -53,7 +53,18 @@ contract AutopilotHookTest is Test, Deployers {
     }
 
     function _deposit(int24 lo, int24 hi, uint128 liq) internal returns (bytes32) {
-        return hook.deposit(key, lo, hi, liq, TickMath.minUsableTick(60), TickMath.maxUsableTick(60));
+        return hook.deposit(
+            key,
+            lo,
+            hi,
+            liq,
+            TickMath.minUsableTick(60),
+            TickMath.maxUsableTick(60),
+            address(0),
+            type(uint256).max,
+            type(uint256).max,
+            type(uint256).max
+        );
     }
 
     function _swap() internal {
@@ -172,7 +183,9 @@ contract AutopilotHookTest is Test, Deployers {
         hook.pause();
 
         vm.expectRevert(Pausable.EnforcedPause.selector);
-        hook.deposit(key, -600, 600, 1e18, -600, 600);
+        hook.deposit(
+            key, -600, 600, 1e18, -600, 600, address(0), type(uint256).max, type(uint256).max, type(uint256).max
+        );
 
         hook.withdraw(pid);
         (,,,,, bool active,) = hook.positions(pid);
@@ -213,12 +226,14 @@ contract AutopilotHookTest is Test, Deployers {
 
     function test_deposit_zero_liquidity_reverts() public {
         vm.expectRevert(AutopilotHook.ZeroLiquidity.selector);
-        hook.deposit(key, -600, 600, 0, -600, 600);
+        hook.deposit(key, -600, 600, 0, -600, 600, address(0), type(uint256).max, type(uint256).max, type(uint256).max);
     }
 
     function test_deposit_unaligned_ticks_reverts() public {
         vm.expectRevert(AutopilotHook.TicksNotAligned.selector);
-        hook.deposit(key, -601, 600, 1e18, -660, 660);
+        hook.deposit(
+            key, -601, 600, 1e18, -660, 660, address(0), type(uint256).max, type(uint256).max, type(uint256).max
+        );
     }
 
     function test_double_withdraw_reverts() public {
@@ -349,7 +364,9 @@ contract AutopilotHookTest is Test, Deployers {
     function test_deposit_rejects_foreign_hook() public {
         PoolKey memory foreign = PoolKey(currency0, currency1, 3000, 60, IHooks(address(0xDEAD)));
         vm.expectRevert(AutopilotHook.HookMismatch.selector);
-        hook.deposit(foreign, -600, 600, 1e18, -600, 600);
+        hook.deposit(
+            foreign, -600, 600, 1e18, -600, 600, address(0), type(uint256).max, type(uint256).max, type(uint256).max
+        );
     }
 
     function test_rebalance_slippage_floor_reverts() public {
@@ -376,7 +393,7 @@ contract AutopilotHookTest is Test, Deployers {
     function test_deposit_zero_spacing_reverts() public {
         PoolKey memory bad = PoolKey(currency0, currency1, 3000, 0, IHooks(hook));
         vm.expectRevert(AutopilotHook.InvalidTickRange.selector);
-        hook.deposit(bad, 0, 60, 1e18, -600, 600);
+        hook.deposit(bad, 0, 60, 1e18, -600, 600, address(0), type(uint256).max, type(uint256).max, type(uint256).max);
     }
 
     function testFuzz_deposit_withdraw_conserves(uint128 liq) public {
@@ -417,16 +434,22 @@ contract AutopilotHookTest is Test, Deployers {
     function test_deposit_native_currency_reverts() public {
         PoolKey memory nativeKey = PoolKey(Currency.wrap(address(0)), currency1, 3000, 60, IHooks(hook));
         vm.expectRevert(AutopilotHook.NativeNotSupported.selector);
-        hook.deposit(nativeKey, -600, 600, 1e18, -600, 600);
+        hook.deposit(
+            nativeKey, -600, 600, 1e18, -600, 600, address(0), type(uint256).max, type(uint256).max, type(uint256).max
+        );
     }
 
     function test_deposit_range_outside_bounds_reverts() public {
         vm.expectRevert(AutopilotHook.OutOfBounds.selector);
-        hook.deposit(key, -600, 600, 1e18, -300, 300);
+        hook.deposit(
+            key, -600, 600, 1e18, -300, 300, address(0), type(uint256).max, type(uint256).max, type(uint256).max
+        );
     }
 
     function test_rebalance_respects_owner_bounds() public {
-        bytes32 pid = hook.deposit(key, -600, 600, 1e18, -600, 600);
+        bytes32 pid = hook.deposit(
+            key, -600, 600, 1e18, -600, 600, address(0), type(uint256).max, type(uint256).max, type(uint256).max
+        );
         _afterCooldown();
 
         vm.prank(rebalancer);
@@ -596,7 +619,18 @@ contract AutopilotHookTest is Test, Deployers {
             fat, ModifyLiquidityParams({tickLower: -60000, tickUpper: 60000, liquidityDelta: 1e21, salt: 0}), ""
         );
 
-        bytes32 pid = hook.deposit(fat, -600, 600, 1e18, TickMath.minUsableTick(200), TickMath.maxUsableTick(200));
+        bytes32 pid = hook.deposit(
+            fat,
+            -600,
+            600,
+            1e18,
+            TickMath.minUsableTick(200),
+            TickMath.maxUsableTick(200),
+            address(0),
+            type(uint256).max,
+            type(uint256).max,
+            type(uint256).max
+        );
         hook.setMaxRebalanceLossBps(hook.MIN_LOSS_TOLERANCE_BPS()); // 25 bps, tightest permitted
         _afterCooldown();
 
@@ -616,7 +650,18 @@ contract AutopilotHookTest is Test, Deployers {
             fat, ModifyLiquidityParams({tickLower: -60000, tickUpper: 60000, liquidityDelta: 1e21, salt: 0}), ""
         );
 
-        bytes32 pid = hook.deposit(fat, -600, 600, 1e18, TickMath.minUsableTick(200), TickMath.maxUsableTick(200));
+        bytes32 pid = hook.deposit(
+            fat,
+            -600,
+            600,
+            1e18,
+            TickMath.minUsableTick(200),
+            TickMath.maxUsableTick(200),
+            address(0),
+            type(uint256).max,
+            type(uint256).max,
+            type(uint256).max
+        );
         _queued(abi.encodeCall(hook.setMaxRebalanceLossBps, (hook.MAX_LOSS_TOLERANCE_BPS())));
         _afterCooldown();
 
@@ -921,10 +966,14 @@ contract AutopilotHookTest is Test, Deployers {
     function test_allowlist_blocks_unlisted_pair_when_enforced() public {
         hook.setAllowlistEnforced(true);
         vm.expectRevert(AutopilotHook.PoolNotAllowed.selector);
-        hook.deposit(key, -600, 600, 1e18, -1200, 1200);
+        hook.deposit(
+            key, -600, 600, 1e18, -1200, 1200, address(0), type(uint256).max, type(uint256).max, type(uint256).max
+        );
 
         hook.setAllowedPool(key, true);
-        bytes32 pid = hook.deposit(key, -600, 600, 1e18, -1200, 1200);
+        bytes32 pid = hook.deposit(
+            key, -600, 600, 1e18, -1200, 1200, address(0), type(uint256).max, type(uint256).max, type(uint256).max
+        );
         (,,,,, bool active,) = hook.positions(pid);
         assertTrue(active);
     }
@@ -934,7 +983,9 @@ contract AutopilotHookTest is Test, Deployers {
     function test_delisting_a_pool_still_allows_exit_and_rebalance() public {
         hook.setAllowlistEnforced(true);
         hook.setAllowedPool(key, true);
-        bytes32 pid = hook.deposit(key, -600, 600, 1e18, -1800, 1800);
+        bytes32 pid = hook.deposit(
+            key, -600, 600, 1e18, -1800, 1800, address(0), type(uint256).max, type(uint256).max, type(uint256).max
+        );
 
         hook.setAllowedPool(key, false); // de-list
 
@@ -1017,7 +1068,9 @@ contract AutopilotHookTest is Test, Deployers {
         manager.initialize(fotKey, SQRT_PRICE_1_1);
 
         vm.expectPartialRevert(AutopilotHook.FeeOnTransferNotSupported.selector);
-        hook.deposit(fotKey, -600, 600, 1e18, -1200, 1200);
+        hook.deposit(
+            fotKey, -600, 600, 1e18, -1200, 1200, address(0), type(uint256).max, type(uint256).max, type(uint256).max
+        );
     }
 
     /// The guard must not fire for a well-behaved token.
@@ -1044,7 +1097,18 @@ contract AutopilotHookTest is Test, Deployers {
         modifyLiquidityRouter.modifyLiquidity(
             key, ModifyLiquidityParams({tickLower: -60000, tickUpper: 60000, liquidityDelta: 1e22, salt: 0}), ""
         );
-        bytes32 pid = hook.deposit(key, -600, 600, liq, TickMath.minUsableTick(60), TickMath.maxUsableTick(60));
+        bytes32 pid = hook.deposit(
+            key,
+            -600,
+            600,
+            liq,
+            TickMath.minUsableTick(60),
+            TickMath.maxUsableTick(60),
+            address(0),
+            type(uint256).max,
+            type(uint256).max,
+            type(uint256).max
+        );
         _afterCooldown();
 
         vm.prank(rebalancer);
@@ -1080,7 +1144,9 @@ contract AutopilotHookTest is Test, Deployers {
         int24 lo = TickMath.minUsableTick(1);
         int24 hi = TickMath.maxUsableTick(1);
 
-        bytes32 pid = hook.deposit(k1, 100, 200, 1e18, lo, hi);
+        bytes32 pid = hook.deposit(
+            k1, 100, 200, 1e18, lo, hi, address(0), type(uint256).max, type(uint256).max, type(uint256).max
+        );
         _afterCooldown();
 
         vm.prank(rebalancer);
@@ -1093,8 +1159,18 @@ contract AutopilotHookTest is Test, Deployers {
     /// Scoping via a follow-up transaction leaves a window in which a rebalancer
     /// added later has authority the owner never chose. The overload closes it.
     function test_deposit_can_scope_rebalancer_atomically() public {
-        bytes32 pid =
-            hook.deposit(key, -600, 600, 1e18, TickMath.minUsableTick(60), TickMath.maxUsableTick(60), rebalancer);
+        bytes32 pid = hook.deposit(
+            key,
+            -600,
+            600,
+            1e18,
+            TickMath.minUsableTick(60),
+            TickMath.maxUsableTick(60),
+            rebalancer,
+            type(uint256).max,
+            type(uint256).max,
+            type(uint256).max
+        );
         assertEq(hook.positionRebalancer(pid), rebalancer);
 
         _queued(abi.encodeCall(hook.setRebalancer, (attacker, true))); // added AFTER the position existed
@@ -1107,7 +1183,16 @@ contract AutopilotHookTest is Test, Deployers {
 
     function test_deposit_can_disable_automation_atomically() public {
         bytes32 pid = hook.deposit(
-            key, -600, 600, 1e18, TickMath.minUsableTick(60), TickMath.maxUsableTick(60), hook.AUTOMATION_OFF()
+            key,
+            -600,
+            600,
+            1e18,
+            TickMath.minUsableTick(60),
+            TickMath.maxUsableTick(60),
+            hook.AUTOMATION_OFF(),
+            type(uint256).max,
+            type(uint256).max,
+            type(uint256).max
         );
         _afterCooldown();
         vm.prank(rebalancer);
@@ -1350,8 +1435,21 @@ contract AutopilotHookTest is Test, Deployers {
         hook.setAllowlistEnforced(true);
         (PoolKey memory other,) = initPool(currency0, currency1, IHooks(hook), 500, SQRT_PRICE_1_1);
         vm.expectRevert(AutopilotHook.PoolNotAllowed.selector);
-        hook.deposit(other, -600, 600, 1e18, TickMath.minUsableTick(10), TickMath.maxUsableTick(10));
-        hook.deposit(key, -600, 600, 1e18, -1200, 1200);
+        hook.deposit(
+            other,
+            -600,
+            600,
+            1e18,
+            TickMath.minUsableTick(10),
+            TickMath.maxUsableTick(10),
+            address(0),
+            type(uint256).max,
+            type(uint256).max,
+            type(uint256).max
+        );
+        hook.deposit(
+            key, -600, 600, 1e18, -1200, 1200, address(0), type(uint256).max, type(uint256).max, type(uint256).max
+        );
     }
 
     /// An owner change that loosens a protection: queue, wait out the delay, run.
@@ -1409,7 +1507,7 @@ contract AutopilotHookTest is Test, Deployers {
     function test_cancelled_change_cannot_run() public {
         bytes memory call = abi.encodeCall(hook.setRebalancer, (attacker, true));
         hook.queueChange(call);
-        hook.cancelChange(hook.setRebalancer.selector);
+        hook.cancelChange(hook.changeKey(call));
         vm.warp(vm.getBlockTimestamp() + hook.TIMELOCK_DELAY());
         vm.expectRevert(AutopilotHook.ChangeNotQueued.selector);
         hook.executeChange(call);
@@ -1450,7 +1548,7 @@ contract AutopilotHookTest is Test, Deployers {
     }
 
     function _ref() internal view returns (int24 tick, int24 anchor) {
-        (tick, anchor,,,,) = hook.priceRef(id);
+        (tick, anchor,,,,,) = hook.priceRef(id);
     }
 
     /// R-2(a): the anchor must come from the depositor's own transaction, not
@@ -1521,7 +1619,18 @@ contract AutopilotHookTest is Test, Deployers {
         }
         (, int24 spot,,) = manager.getSlot0(id);
 
-        bytes32 second = hook.deposit(key, -5400, -4800, 1e18, TickMath.minUsableTick(60), TickMath.maxUsableTick(60));
+        bytes32 second = hook.deposit(
+            key,
+            -5400,
+            -4800,
+            1e18,
+            TickMath.minUsableTick(60),
+            TickMath.maxUsableTick(60),
+            address(0),
+            type(uint256).max,
+            type(uint256).max,
+            type(uint256).max
+        );
         (int24 t,) = _ref();
         assertEq(t, spot, "reseeded at current spot");
 
@@ -1578,7 +1687,7 @@ contract AutopilotHookTest is Test, Deployers {
 
     function test_poke_is_a_noop_on_a_pool_without_positions() public {
         hook.pokePriceRef(key);
-        (,,, bool seeded,,) = hook.priceRef(id);
+        (,,, bool seeded,,,) = hook.priceRef(id);
         assertFalse(seeded);
     }
 

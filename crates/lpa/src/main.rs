@@ -7,9 +7,39 @@ mod serve;
 mod strategy;
 
 #[cfg(test)]
+mod audit_dm_tests;
+#[cfg(test)]
 mod pipeline_tests;
 
 use std::sync::Arc;
+
+/// An error for logging, with every URL cut to scheme://host. Provider URLs carry
+/// the API key in their path, and transport errors echo the URL (full audit DM-8).
+pub fn redact(e: &dyn std::fmt::Display) -> String {
+    let s = e.to_string();
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s.as_str();
+    while let Some(i) = rest.find("://") {
+        let start = rest[..i]
+            .rfind(|c: char| !c.is_ascii_alphanumeric())
+            .map_or(0, |j| j + 1);
+        out.push_str(&rest[..i + 3]);
+        let after = &rest[i + 3..];
+        let host_end = after
+            .find(['/', '?', ' ', ')', '"', '\''])
+            .unwrap_or(after.len());
+        out.push_str(&after[..host_end]);
+        let tail = &after[host_end..];
+        let url_end = tail.find([' ', ')', '"', '\'']).unwrap_or(tail.len());
+        if url_end > 0 {
+            out.push_str("/<redacted>");
+        }
+        rest = &tail[url_end..];
+        let _ = start;
+    }
+    out.push_str(rest);
+    out
+}
 
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -46,6 +76,10 @@ enum Command {
         chain: Option<String>,
         #[arg(long, env = "AUTOPILOT_HOOK_ADDRESS")]
         hook: Option<String>,
+        /// Serve without LPA_API_TOKEN. Anyone who can reach the port can then
+        /// register and delete tracked positions.
+        #[arg(long)]
+        insecure_no_auth: bool,
     },
     Watch {
         #[arg(long)]
@@ -147,6 +181,7 @@ async fn main() -> anyhow::Result<()> {
             db,
             chain,
             hook,
+            insecure_no_auth,
         } => {
             let file = cfg::load(cli.config.as_deref())?;
             let db = db.or(file.db).unwrap_or_else(|| "lpa.sqlite".into());
@@ -157,7 +192,7 @@ async fn main() -> anyhow::Result<()> {
                 .map(|h| h.parse::<alloy::primitives::Address>())
                 .transpose()
                 .map_err(|_| anyhow::anyhow!("invalid hook address"))?;
-            serve::run(&host, port, &db, &chain, hook_addr).await?;
+            serve::run(&host, port, &db, &chain, hook_addr, insecure_no_auth).await?;
         }
         Command::Watch {
             chain,
@@ -205,7 +240,8 @@ async fn main() -> anyhow::Result<()> {
                 let private = std::env::var("FLASHBOTS_RPC")
                     .ok()
                     .filter(|s| !s.trim().is_empty());
-                let executor = exec::Executor::connect(&rpc, &pk, hook_addr, private).await?;
+                let executor =
+                    exec::Executor::connect(&rpc, &pk, hook_addr, private, cfg.chain_id).await?;
                 let auto = exec::AutoExec {
                     max_gas_usd: file
                         .max_gas_usd
@@ -251,6 +287,9 @@ async fn main() -> anyhow::Result<()> {
         } => {
             if tick_lower >= tick_upper {
                 anyhow::bail!("tick_lower must be < tick_upper");
+            }
+            if !strategy::ticks_in_domain(&[tick_lower, tick_upper]) {
+                anyhow::bail!("ticks outside the tick domain [-887272, 887272]");
             }
             let file = cfg::load(cli.config.as_deref())?;
             let chain = chain.or(file.chain).unwrap_or_else(|| "base".into());
@@ -316,7 +355,8 @@ async fn main() -> anyhow::Result<()> {
             let private = std::env::var("FLASHBOTS_RPC")
                 .ok()
                 .filter(|s| !s.trim().is_empty());
-            let executor = exec::Executor::connect(&rpc, &pk, hook_addr, private).await?;
+            let executor =
+                exec::Executor::connect(&rpc, &pk, hook_addr, private, cfg.chain_id).await?;
             let eth_price = chain::oracle::connect_eth_price(
                 Some(rpc.clone()),
                 cfg.addrs.eth_usd_feed,

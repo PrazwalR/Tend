@@ -78,7 +78,18 @@ contract PriceRefPoC is Test, Deployers {
     function _victimDeposit(int24 lo, int24 hi, uint128 liq) internal returns (bytes32 pid) {
         int24 s = key.tickSpacing;
         vm.prank(victim);
-        pid = hook.deposit(key, lo, hi, liq, TickMath.minUsableTick(s), TickMath.maxUsableTick(s));
+        pid = hook.deposit(
+            key,
+            lo,
+            hi,
+            liq,
+            TickMath.minUsableTick(s),
+            TickMath.maxUsableTick(s),
+            address(0),
+            type(uint256).max,
+            type(uint256).max,
+            type(uint256).max
+        );
     }
 
     function _swapTo(int24 target) internal {
@@ -514,7 +525,7 @@ contract PriceRefPoC is Test, Deployers {
             _nextBlock();
             hook.pokePriceRef(key);
         }
-        (int24 tick,,,,,) = hook.priceRef(id);
+        (int24 tick,,,,,,) = hook.priceRef(id);
         emit log_named_int("spot", _spot());
         emit log_named_int("ref.tick", tick);
         assertLe(tick, TickMath.MAX_TICK);
@@ -530,14 +541,14 @@ contract PriceRefPoC is Test, Deployers {
         bytes32 seedPid = _victimDeposit(2400, 3600, 1e15); // "attacker" dust seed
         seedPid;
         _swapTo(0);
-        (int24 tick, int24 anchor,,,,) = hook.priceRef(id);
+        (int24 tick, int24 anchor,,,,,) = hook.priceRef(id);
         emit log_named_int("seed block ref.tick", tick);
         emit log_named_int("seed block ref.anchor", anchor);
         uint256 blocks;
         while (tick != 0 && blocks < 20) {
             _nextBlock();
             hook.pokePriceRef(key);
-            (tick,,,,,) = hook.priceRef(id);
+            (tick,,,,,,) = hook.priceRef(id);
             blocks++;
         }
         emit log_named_uint("blocks to converge", blocks);

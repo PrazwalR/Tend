@@ -47,7 +47,18 @@ contract TimelockPoC is Test, Deployers {
     // ------------------------------------------------------------------ helpers
 
     function _deposit(int24 lo, int24 hi, uint128 liq) internal returns (bytes32) {
-        return hook.deposit(key, lo, hi, liq, TickMath.minUsableTick(60), TickMath.maxUsableTick(60));
+        return hook.deposit(
+            key,
+            lo,
+            hi,
+            liq,
+            TickMath.minUsableTick(60),
+            TickMath.maxUsableTick(60),
+            address(0),
+            type(uint256).max,
+            type(uint256).max,
+            type(uint256).max
+        );
     }
 
     function _deepPool() internal {
@@ -75,7 +86,7 @@ contract TimelockPoC is Test, Deployers {
     }
 
     function _refTick() internal view returns (int24 t) {
-        (t,,,,,) = hook.priceRef(id);
+        (t,,,,,,) = hook.priceRef(id);
     }
 
     /// Value of a withdrawal in token1, at the FAIR price.
@@ -238,7 +249,7 @@ contract TimelockPoC is Test, Deployers {
             vm.expectPartialRevert(AutopilotHook.ChangeNotReady.selector);
             hook.executeChange(c);
         }
-        (, uint64 eta,) = hook.pendingChange(hook.setRebalancer.selector);
+        (, uint64 eta,) = hook.pendingChange(hook.changeKey(c));
         assertEq(eta, vm.getBlockTimestamp() - 1 days + hook.TIMELOCK_DELAY(), "only the latest queue counts");
         assertFalse(hook.isRebalancer(attacker));
     }

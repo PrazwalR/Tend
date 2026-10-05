@@ -26,6 +26,9 @@ const MAX_ANSWER_AGE_SECS: u64 = 3600;
 const REFRESH_SECS: u64 = 60;
 /// Price is shared as micro-dollars so it fits an atomic without a lock.
 const USD_SCALE: f64 = 1e6;
+/// ETH/USD answers outside this band are rejected as implausible.
+const MIN_PLAUSIBLE_USD: f64 = 1.0;
+const MAX_PLAUSIBLE_USD: f64 = 1_000_000.0;
 /// A cached price older than this is not fresh enough to gate spending. Two
 /// refresh intervals, so one missed poll is tolerated and a dead feed is not.
 const MAX_CACHE_AGE_SECS: u64 = REFRESH_SECS * 2;
@@ -123,7 +126,10 @@ impl EthPrice {
     }
 
     fn set(&self, usd: f64) {
-        if usd.is_finite() && usd > 0.0 {
+        // A plausible band, not just > 0: an answer of $0.00000001 used to store
+        // as 0 *and* stamp fresh, pricing every transaction at $0 against both
+        // spend caps (full audit DM-4).
+        if usd.is_finite() && (MIN_PLAUSIBLE_USD..=MAX_PLAUSIBLE_USD).contains(&usd) {
             self.micro_usd
                 .store((usd * USD_SCALE) as u64, Ordering::Relaxed);
             self.updated_at.store(now_secs(), Ordering::Relaxed);
@@ -157,9 +163,9 @@ impl EthPrice {
                         // being a config error; say so loudly rather than warning
                         // on a loop forever.
                         if consecutive_failures >= 3 {
-                            error!(error = %e, consecutive_failures, "ETH price feed is not answering; spending is gated off until it does");
+                            error!(error = %crate::redact(&e), consecutive_failures, "ETH price feed is not answering; spending is gated off until it does");
                         } else {
-                            warn!(error = %e, last_known = price.get(), "ETH price refresh failed");
+                            warn!(error = %crate::redact(&e), last_known = price.get(), "ETH price refresh failed");
                         }
                     }
                 }
@@ -184,12 +190,12 @@ pub async fn connect_eth_price(http_url: Option<String>, feed: Address, seed_usd
     match EthPriceOracle::connect(&url, feed).await {
         Ok(o) => {
             if let Err(e) = price.refresh_now(&o).await {
-                warn!(error = %e, "first ETH price read failed");
+                warn!(error = %crate::redact(&e), "first ETH price read failed");
             }
             price.spawn_refresher(o);
         }
         Err(e) => {
-            warn!(error = %e, seed = seed_usd, "ETH/USD oracle unavailable; spending stays gated off")
+            warn!(error = %crate::redact(&e), seed = seed_usd, "ETH/USD oracle unavailable; spending stays gated off")
         }
     }
     price

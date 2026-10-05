@@ -87,6 +87,8 @@ pub struct Tracker {
 impl Tracker {
     pub fn open(path: &str) -> Result<Self> {
         let conn = Connection::open(path)?;
+        // WAL: readers (the API) do not block the watcher's writes.
+        conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.execute_batch(SCHEMA)?;
         migrate(&conn);
         Ok(Self {
@@ -135,37 +137,31 @@ impl Tracker {
         }
     }
 
-    pub fn positions_for_pool(&self, pool_id: &str) -> Result<Vec<PositionRow>> {
+    /// One statement for the whole pool. A per-position UPDATE, each its own
+    /// commit, made one swap cost 724 ms with 2,000 dust positions, all of it on
+    /// the log path under the tracker mutex (full audit DM-6). One read, one write.
+    pub fn update_pool_tick(&self, pool_id: &str, tick: i32) -> Result<Vec<TickCross>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT position_id, owner, pool_id, chain_id, tick_lower, tick_upper, current_tick, in_range, entry_tick, fee, tick_spacing
-             FROM positions WHERE pool_id = ?1",
+            "SELECT position_id, in_range, tick_lower, tick_upper FROM positions WHERE pool_id = ?1",
         )?;
-        let rows = stmt.query_map(params![pool_id], row_to_position)?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r?);
-        }
-        Ok(out)
-    }
-
-    pub fn update_pool_tick(&self, pool_id: &str, tick: i32) -> Result<Vec<TickCross>> {
-        let positions = self.positions_for_pool(pool_id)?;
-        let mut crosses = Vec::with_capacity(positions.len());
-        let conn = self.conn.lock().unwrap();
-        for p in positions {
-            let now_in_range = tick >= p.tick_lower && tick <= p.tick_upper;
-            crosses.push(TickCross {
-                position_id: p.position_id.clone(),
-                was_in_range: p.in_range,
-                now_in_range,
-            });
-            conn.execute(
-                "UPDATE positions SET current_tick = ?1, in_range = ?2, last_updated_at = strftime('%s','now')
-                 WHERE position_id = ?3",
-                params![tick, now_in_range as i64, p.position_id],
-            )?;
-        }
+        let crosses = stmt
+            .query_map(params![pool_id], |r| {
+                let (lo, hi): (i32, i32) = (r.get(2)?, r.get(3)?);
+                Ok(TickCross {
+                    position_id: r.get(0)?,
+                    was_in_range: r.get(1)?,
+                    now_in_range: tick >= lo && tick <= hi,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        conn.execute(
+            "UPDATE positions SET current_tick = ?1,
+                 in_range = (?1 >= tick_lower AND ?1 <= tick_upper),
+                 last_updated_at = strftime('%s','now')
+             WHERE pool_id = ?2",
+            params![tick, pool_id],
+        )?;
         Ok(crosses)
     }
 

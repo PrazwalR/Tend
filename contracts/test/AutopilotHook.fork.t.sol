@@ -61,7 +61,18 @@ contract AutopilotHookForkTest is Test {
             return;
         }
 
-        bytes32 pid = hook.deposit(key, -600, 600, 1e18, TickMath.minUsableTick(60), TickMath.maxUsableTick(60));
+        bytes32 pid = hook.deposit(
+            key,
+            -600,
+            600,
+            1e18,
+            TickMath.minUsableTick(60),
+            TickMath.maxUsableTick(60),
+            address(0),
+            type(uint256).max,
+            type(uint256).max,
+            type(uint256).max
+        );
         (,,,, uint128 liq, bool active,) = hook.positions(pid);
         assertEq(liq, 1e18);
         assertTrue(active);

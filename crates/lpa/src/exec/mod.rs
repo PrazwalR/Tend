@@ -1,10 +1,11 @@
 pub mod automation;
 pub mod cost;
 
-use alloy::network::EthereumWallet;
+use alloy::network::{EthereumWallet, TransactionBuilder};
 use alloy::primitives::aliases::I24;
 use alloy::primitives::{Address, B256};
 use alloy::providers::{DynProvider, Provider, ProviderBuilder};
+use alloy::rpc::types::TransactionRequest;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
 use anyhow::{anyhow, bail, Context, Result};
@@ -36,6 +37,12 @@ sol! {
             uint64 lastRebalanceAt
         );
 
+        function boundLower(bytes32 positionId) external view returns (int24);
+        function boundUpper(bytes32 positionId) external view returns (int24);
+        function priceRef(bytes32 poolId) external view returns (
+            int24 tick, int24 anchor, uint64 atBlock, bool seeded, bool clamped, uint8 stable, int24 base
+        );
+
         error PriceDeviation(int24 spotTick, int24 referenceTick);
         error PriceUnsettled(uint8 stableBlocks);
         error AutomationDisabled();
@@ -46,25 +53,47 @@ sol! {
     }
 }
 
+/// The custom-error selector a revert carries: the first four bytes of its data.
+/// Searching the whole text for a selector also matched one that happened to
+/// appear inside another error's arguments (full audit LV-12).
+pub fn revert_selector(revert: &str) -> Option<String> {
+    let r = revert.to_lowercase();
+    for marker in ["custom error 0x", "data: \"0x", "data:\"0x"] {
+        if let Some(i) = r.find(marker) {
+            let start = i + marker.len();
+            if let Some(sel) = r.get(start..start + 8) {
+                if sel.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return Some(sel.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 /// What the daemon does about a refused preflight, from the hook's error.
 pub fn classify_preflight(revert: &str) -> RefusalAction {
     use alloy::sol_types::SolError;
     use IAutopilotHook as H;
-    let r = revert.to_lowercase();
-    let has = |sel: [u8; 4]| r.contains(&alloy::primitives::hex::encode(sel));
+    let Some(sel) = revert_selector(revert) else {
+        return RefusalAction::Retry;
+    };
+    let is = |s: [u8; 4]| sel == alloy::primitives::hex::encode(s);
     // The reference lags spot, or has not yet sat on spot for long enough: a
-    // poke is the only thing that moves it on a pool nobody else is trading.
-    if has(H::PriceDeviation::SELECTOR) || has(H::PriceUnsettled::SELECTOR) {
+    // poke is what moves it on a pool nobody else is trading.
+    if is(H::PriceDeviation::SELECTOR) || is(H::PriceUnsettled::SELECTOR) {
         RefusalAction::Poke
-    } else if has(H::AutomationDisabled::SELECTOR)
-        || has(H::NotRebalancer::SELECTOR)
-        || has(H::OutOfBounds::SELECTOR)
-        || has(H::PositionNotActive::SELECTOR)
+    } else if is(H::AutomationDisabled::SELECTOR)
+        || is(H::NotRebalancer::SELECTOR)
+        || is(H::PositionNotActive::SELECTOR)
     {
         RefusalAction::Terminal
-    } else if has(H::RebalanceTooSoon::SELECTOR) {
+    } else if is(H::RebalanceTooSoon::SELECTOR) {
         RefusalAction::Cooldown
     } else {
+        // OutOfBounds included: whether a range crosses the owner's bounds depends
+        // on where price is, so it is transient, not terminal. Proposals are
+        // clipped to the bounds anyway (full audit LV-3).
         RefusalAction::Retry
     }
 }
@@ -120,6 +149,56 @@ pub struct Executor {
     hook: Address,
     tx_timeout: Duration,
     budget: SpendBudget,
+    chain_id: u64,
+    max_priority_fee_wei: u128,
+    /// Nonce and fees of the last transaction sent, so a replacement at the same
+    /// nonce outbids it.
+    last_sent: std::sync::Mutex<Option<(u64, u128, u128)>>,
+}
+
+/// Default ceiling on the priority fee the daemon will ever sign. Base needs a
+/// fraction of a gwei; mainnet a gwei or two.
+pub const DEFAULT_MAX_PRIORITY_FEE_GWEI: f64 = 5.0;
+
+/// The fee fields of one transaction, fixed by the daemon rather than filled
+/// by whichever RPC it is sent to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FeePlan {
+    pub nonce: u64,
+    pub gas_limit: u64,
+    pub max_fee_per_gas: u128,
+    pub max_priority_fee_per_gas: u128,
+}
+
+/// Pure, so the bounds are testable:
+/// - priority fee: the node's suggestion, capped at `cap`;
+/// - max fee: twice the latest base fee plus the priority fee;
+/// - gas limit: the estimate plus 25%;
+/// - replacing our own transaction stuck at the same nonce: both fees at least
+///   12.5% above it, the minimum nodes accept for a replacement, priority still
+///   capped.
+pub fn plan_fees(
+    nonce: u64,
+    gas_estimate: u64,
+    base_fee: u128,
+    suggested_priority: u128,
+    cap: u128,
+    stuck: Option<(u64, u128, u128)>,
+) -> FeePlan {
+    let mut prio = suggested_priority.min(cap);
+    let mut max_fee = base_fee.saturating_mul(2).saturating_add(prio);
+    if let Some((n, old_max, old_prio)) = stuck {
+        if n == nonce {
+            prio = prio.max(old_prio.saturating_mul(9) / 8 + 1).min(cap);
+            max_fee = max_fee.max(old_max.saturating_mul(9) / 8 + 1);
+        }
+    }
+    FeePlan {
+        nonce,
+        gas_limit: gas_estimate.saturating_add(gas_estimate / 4),
+        max_fee_per_gas: max_fee,
+        max_priority_fee_per_gas: prio,
+    }
 }
 
 /// Why `execute` did not produce a receipt. The split matters to the caller:
@@ -144,28 +223,62 @@ impl std::fmt::Display for ExecFailure {
 impl std::error::Error for ExecFailure {}
 
 impl Executor {
+    /// Every field of every transaction is set by the daemon, not by alloy's
+    /// fillers on whichever RPC the transaction goes to. With the default fillers
+    /// the submit RPC chose the priority fee (a lying relay got $7,047 signed past
+    /// a $50 cap) and the chain id (full audit DM-1), and the cached nonce manager
+    /// advanced on sends that never happened, stalling every later transaction
+    /// until restart (DM-2 / LV-7).
     pub async fn connect(
         rpc_url: &str,
         pk: &str,
         hook: Address,
         private_rpc: Option<String>,
+        chain_id: u64,
     ) -> Result<Self> {
         let signer: PrivateKeySigner = pk.parse().context("invalid REBALANCER_PRIVATE_KEY")?;
         let addr = signer.address();
         let wallet = EthereumWallet::from(signer);
 
         let provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
             .wallet(wallet.clone())
             .connect_http(rpc_url.parse().context("invalid rpc url")?)
             .erased();
+        let rpc_chain = provider
+            .get_chain_id()
+            .await
+            .context("eth_chainId on the RPC")?;
+        if rpc_chain != chain_id {
+            bail!("RPC reports chain {rpc_chain}, expected {chain_id}; refusing to sign");
+        }
 
         let submit = match private_rpc {
-            Some(url) => ProviderBuilder::new()
-                .wallet(wallet)
-                .connect_http(url.parse().context("invalid private rpc url")?)
-                .erased(),
+            Some(url) => {
+                let p = ProviderBuilder::new()
+                    .disable_recommended_fillers()
+                    .wallet(wallet)
+                    .connect_http(url.parse().context("invalid private rpc url")?)
+                    .erased();
+                // A relay that answers eth_chainId must agree. The chain id is
+                // fixed in the signed transaction either way.
+                if let Ok(c) = p.get_chain_id().await {
+                    if c != chain_id {
+                        bail!(
+                            "private RPC reports chain {c}, expected {chain_id}; refusing to sign"
+                        );
+                    }
+                }
+                p
+            }
             None => provider.clone(),
         };
+        let max_priority_fee_wei = (std::env::var("LPA_MAX_PRIORITY_FEE_GWEI")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(DEFAULT_MAX_PRIORITY_FEE_GWEI)
+            * 1e9) as u128;
 
         let tx_timeout = Duration::from_secs(
             std::env::var("LPA_TX_TIMEOUT_SECS")
@@ -181,6 +294,9 @@ impl Executor {
             hook,
             tx_timeout,
             budget: SpendBudget::from_env(),
+            chain_id,
+            max_priority_fee_wei,
+            last_sent: std::sync::Mutex::new(None),
         })
     }
 
@@ -243,27 +359,43 @@ impl Executor {
             to_i24(lower).map_err(ExecFailure::NotSent)?,
             to_i24(upper).map_err(ExecFailure::NotSent)?,
         );
-        self.check_spend(
-            IAutopilotHook::new(self.hook, &self.provider)
-                .rebalance(position_id, l, u, floor)
-                .from(self.signer)
-                .block(alloy::eips::BlockId::pending())
-                .estimate_gas()
-                .await
-                .context("gas estimation failed")
-                .map_err(ExecFailure::NotSent)?,
-            max_gas_usd,
-            eth_price,
-        )
-        .await
-        .map_err(ExecFailure::NotSent)?;
+        let hook = IAutopilotHook::new(self.hook, &self.provider);
+        let call = hook.rebalance(position_id, l, u, floor);
+        let tx = TransactionRequest::default()
+            .with_from(self.signer)
+            .with_to(self.hook)
+            .with_input(call.calldata().clone());
+        self.send_capped(tx, max_gas_usd, eth_price).await
+    }
 
-        let hook = IAutopilotHook::new(self.hook, &self.submit);
-        let pending = hook
-            .rebalance(position_id, l, u, floor)
-            .send()
+    /// Plans every field, prices the worst case the signature allows against both
+    /// caps, signs locally and sends. The receipt wait is bounded by `tx_timeout`.
+    async fn send_capped(
+        &self,
+        tx: TransactionRequest,
+        max_gas_usd: f64,
+        eth_price: &crate::chain::oracle::EthPrice,
+    ) -> std::result::Result<ExecReport, ExecFailure> {
+        let plan = self.plan(&tx).await.map_err(ExecFailure::NotSent)?;
+        self.check_spend(plan.gas_limit, plan.max_fee_per_gas, max_gas_usd, eth_price)
+            .await
+            .map_err(ExecFailure::NotSent)?;
+        let tx = tx
+            .with_nonce(plan.nonce)
+            .with_gas_limit(plan.gas_limit)
+            .with_max_fee_per_gas(plan.max_fee_per_gas)
+            .with_max_priority_fee_per_gas(plan.max_priority_fee_per_gas)
+            .with_chain_id(self.chain_id);
+        let pending = self
+            .submit
+            .send_transaction(tx)
             .await
             .map_err(|e| ExecFailure::NotSent(e.into()))?;
+        *self.last_sent.lock().unwrap() = Some((
+            plan.nonce,
+            plan.max_fee_per_gas,
+            plan.max_priority_fee_per_gas,
+        ));
         let tx_hash = *pending.tx_hash();
         let receipt = pending
             .with_timeout(Some(self.tx_timeout))
@@ -278,6 +410,44 @@ impl Executor {
             gas_used: receipt.gas_used,
             success: receipt.status(),
         })
+    }
+
+    /// The nonce comes from the confirmed count on the primary RPC every time. A
+    /// send that never landed leaves no gap, and a transaction stuck at that
+    /// nonce is replaced (outbid) rather than queued behind. Gas is estimated at
+    /// `pending`, like the preflight.
+    async fn plan(&self, tx: &TransactionRequest) -> Result<FeePlan> {
+        let nonce = self
+            .provider
+            .get_transaction_count(self.signer)
+            .latest()
+            .await?;
+        let gas = self
+            .provider
+            .estimate_gas(tx.clone())
+            .block(alloy::eips::BlockId::pending())
+            .await
+            .context("gas estimation failed")?;
+        let base = self
+            .provider
+            .get_block_by_number(alloy::eips::BlockNumberOrTag::Latest)
+            .await?
+            .and_then(|b| b.header.base_fee_per_gas)
+            .ok_or_else(|| anyhow!("latest block has no base fee"))? as u128;
+        let suggested = self
+            .provider
+            .get_max_priority_fee_per_gas()
+            .await
+            .unwrap_or(0);
+        let stuck = *self.last_sent.lock().unwrap();
+        Ok(plan_fees(
+            nonce,
+            gas,
+            base,
+            suggested,
+            self.max_priority_fee_wei,
+            stuck,
+        ))
     }
 
     /// Preflight and the `minLiquidity` floor. `None` sends a floor of 0, which is
@@ -314,15 +484,16 @@ impl Executor {
     /// unpriced transaction is not an emergency.
     async fn check_spend(
         &self,
-        gas: u64,
+        gas_limit: u64,
+        max_fee_per_gas: u128,
         max_gas_usd: f64,
         eth_price: &crate::chain::oracle::EthPrice,
     ) -> Result<()> {
         let eth_price_usd = eth_price
             .get_fresh()
             .ok_or_else(|| anyhow!("no fresh ETH/USD price; refusing to price the spend cap"))?;
-        let gas_price = self.provider.get_gas_price().await?;
-        let est = cost::rebalance_cost_usd(gas, gas_price, eth_price_usd);
+        // The worst case the signed fields allow, not an estimate at today's price.
+        let est = cost::rebalance_cost_usd(gas_limit, max_fee_per_gas, eth_price_usd);
         if !cost::within_spend_cap(est, max_gas_usd) {
             bail!("spend cap exceeded: ${est:.2} > ${max_gas_usd:.2}");
         }
@@ -334,6 +505,44 @@ impl Executor {
 }
 
 impl Executor {
+    /// The proposed range clipped to the owner's bounds; `None` when nothing of
+    /// it is left.
+    pub async fn clip_to_bounds(
+        &self,
+        position_id: B256,
+        lower: i32,
+        upper: i32,
+    ) -> Result<Option<(i32, i32)>> {
+        let hook = IAutopilotHook::new(self.hook, &self.provider);
+        let lo_b = hook.boundLower(position_id).call().await?.as_i32();
+        let hi_b = hook.boundUpper(position_id).call().await?.as_i32();
+        Ok(clip_range(lower, upper, lo_b, hi_b))
+    }
+
+    /// A `PriceDeviation` always warrants a poke. A `PriceUnsettled` only when the
+    /// reference is clamped short of spot: a reference already on spot settles
+    /// by itself as quiet blocks pass, and a poke would change nothing (full
+    /// audit LV-9).
+    pub async fn poke_would_help(&self, position_id: B256, reason: &str) -> bool {
+        use alloy::sol_types::SolError;
+        let unsettled = revert_selector(reason)
+            == Some(alloy::primitives::hex::encode(
+                IAutopilotHook::PriceUnsettled::SELECTOR,
+            ));
+        if !unsettled {
+            return true;
+        }
+        let Ok((_, pool_id)) = self.pool_of(position_id).await else {
+            return true;
+        };
+        let hook = IAutopilotHook::new(self.hook, &self.provider);
+        hook.priceRef(pool_id)
+            .call()
+            .await
+            .map(|r| r.clamped)
+            .unwrap_or(true)
+    }
+
     /// The pool a position lives in: its key, and the v4 pool id derived from it.
     pub async fn pool_of(&self, position_id: B256) -> Result<(HookPoolKey, B256)> {
         use alloy::sol_types::SolValue;
@@ -351,27 +560,28 @@ impl Executor {
         max_gas_usd: f64,
         eth_price: &crate::chain::oracle::EthPrice,
     ) -> Result<String> {
-        let read = IAutopilotHook::new(self.hook, &self.provider);
-        let gas = read
-            .pokePriceRef(key.clone())
-            .from(self.signer)
-            .block(alloy::eips::BlockId::pending())
-            .estimate_gas()
+        let hook = IAutopilotHook::new(self.hook, &self.provider);
+        let call = hook.pokePriceRef(key);
+        let tx = TransactionRequest::default()
+            .with_from(self.signer)
+            .with_to(self.hook)
+            .with_input(call.calldata().clone());
+        let r = self
+            .send_capped(tx, max_gas_usd, eth_price)
             .await
-            .context("poke gas estimation failed")?;
-        self.check_spend(gas, max_gas_usd, eth_price).await?;
-
-        let hook = IAutopilotHook::new(self.hook, &self.submit);
-        let receipt = hook
-            .pokePriceRef(key)
-            .send()
-            .await?
-            .with_timeout(Some(self.tx_timeout))
-            .get_receipt()
-            .await
-            .map_err(|e| anyhow!("poke unconfirmed: {e}"))?;
-        Ok(format!("{:#x}", receipt.transaction_hash))
+            .map_err(|e| anyhow!("poke {e}"))?;
+        if !r.success {
+            bail!("poke tx {} reverted", r.tx_hash);
+        }
+        Ok(r.tx_hash)
     }
+}
+
+/// `[lower, upper]` clipped to `[min, max]`. The hook aligns bounds to the
+/// pool's spacing, so the clipped ends stay aligned.
+pub fn clip_range(lower: i32, upper: i32, min: i32, max: i32) -> Option<(i32, i32)> {
+    let (lo, hi) = (lower.max(min), upper.min(max));
+    (lo < hi).then_some((lo, hi))
 }
 
 fn to_i24(v: i32) -> Result<I24> {
@@ -454,6 +664,9 @@ pub async fn run_executor_loop(
         );
         if tokio::time::timeout(iteration_limit, work).await.is_err() {
             tracing::warn!(position = %intent.position_id, limit_secs = iteration_limit.as_secs(), "executor iteration timed out; abandoned");
+            // A send may already be out; treat the position as just acted on so
+            // a second transaction is not raced against it (full audit LV-11).
+            last.insert(intent.position_id.clone(), Instant::now());
             auto.strike(&intent.position_id, Instant::now());
         }
     }
@@ -470,15 +683,30 @@ async fn handle_intent(
 ) {
     use std::time::Instant;
     let auto = automation();
-    // Preflight first. A refused eth_call costs nothing, so it must not burn the
-    // per-position interval — that is reserved for transactions actually sent.
-    let sim = match executor
-        .simulate(pid, intent.new_lower, intent.new_upper)
+    // The strategy centres on spot without knowing the owner's bounds; clip to
+    // them here, so a position near a bound is not refused for crossing it.
+    let (lower, upper) = match executor
+        .clip_to_bounds(pid, intent.new_lower, intent.new_upper)
         .await
     {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            tracing::debug!(position = %intent.position_id, "proposed range lies outside the owner's bounds");
+            auto.strike(&intent.position_id, Instant::now());
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(error = %crate::redact(&e), position = %intent.position_id, "could not read bounds");
+            auto.strike(&intent.position_id, Instant::now());
+            return;
+        }
+    };
+    // Preflight first. A refused eth_call costs nothing, so it must not burn the
+    // per-position interval — that is reserved for transactions actually sent.
+    let sim = match executor.simulate(pid, lower, upper).await {
         Ok(s) => s,
         Err(e) => {
-            tracing::warn!(error = %e, position = %intent.position_id, "preflight call failed");
+            tracing::warn!(error = %crate::redact(&e), position = %intent.position_id, "preflight call failed");
             auto.strike(&intent.position_id, Instant::now());
             return;
         }
@@ -499,7 +727,7 @@ async fn handle_intent(
         if action == RefusalAction::Terminal {
             tracing::info!(position = %intent.position_id, suppress_secs = wait.as_secs(), "position will not be proposed again for a while");
         }
-        if action == RefusalAction::Poke {
+        if action == RefusalAction::Poke && executor.poke_would_help(pid, &reason).await {
             poke_once(executor, cfg, pid, &intent.position_id, pokes).await;
         }
         return;
@@ -507,14 +735,7 @@ async fn handle_intent(
     last_block.remove(&intent.position_id);
 
     match executor
-        .execute(
-            pid,
-            intent.new_lower,
-            intent.new_upper,
-            None,
-            cfg.max_gas_usd,
-            &cfg.eth_price,
-        )
+        .execute(pid, lower, upper, None, cfg.max_gas_usd, &cfg.eth_price)
         .await
     {
         Ok(r) if r.success => {
@@ -535,11 +756,11 @@ async fn handle_intent(
         }
         Err(ExecFailure::Unconfirmed { tx_hash, error }) => {
             last.insert(intent.position_id.clone(), Instant::now());
-            tracing::warn!(tx = %tx_hash, error = %error, position = %intent.position_id, "rebalance tx unconfirmed")
+            tracing::warn!(tx = %tx_hash, error = %crate::redact(&error), position = %intent.position_id, "rebalance tx unconfirmed")
         }
         Err(ExecFailure::NotSent(e)) => {
             let wait = auto.strike(&intent.position_id, Instant::now());
-            tracing::warn!(error = %e, position = %intent.position_id, backoff_secs = wait.as_secs(), "auto-rebalance not sent (preflight/cap/budget)")
+            tracing::warn!(error = %crate::redact(&e), position = %intent.position_id, backoff_secs = wait.as_secs(), "auto-rebalance not sent (preflight/cap/budget)")
         }
     }
 }
@@ -579,7 +800,7 @@ async fn poke_once(
     let (key, pool_id) = match executor.pool_of(pid).await {
         Ok(k) => k,
         Err(e) => {
-            tracing::warn!(error = %e, position = %position_id, "could not resolve pool to poke");
+            tracing::warn!(error = %crate::redact(&e), position = %position_id, "could not resolve pool to poke");
             return;
         }
     };
@@ -602,7 +823,7 @@ async fn poke_once(
             }
         }
         Err(e) => {
-            tracing::warn!(error = %e, position = %position_id, "price-reference poke failed")
+            tracing::warn!(error = %crate::redact(&e), position = %position_id, "price-reference poke failed")
         }
     }
 }
@@ -683,10 +904,13 @@ mod tests {
             classify_preflight(&text(H::PriceUnsettled::SELECTOR)),
             RefusalAction::Poke
         );
+        assert_eq!(
+            classify_preflight(&text(H::OutOfBounds::SELECTOR)),
+            RefusalAction::Retry
+        );
         for sel in [
             H::AutomationDisabled::SELECTOR,
             H::NotRebalancer::SELECTOR,
-            H::OutOfBounds::SELECTOR,
             H::PositionNotActive::SELECTOR,
         ] {
             assert_eq!(classify_preflight(&text(sel)), RefusalAction::Terminal);
@@ -721,5 +945,62 @@ mod tests {
                 .unwrap())
         );
         assert_eq!(hex(H::RebalanceTooSoon::SELECTOR), "2ddcae9c");
+    }
+
+    #[test]
+    fn fee_plan_caps_the_priority_fee_and_outbids_a_stuck_nonce() {
+        let gwei = 1_000_000_000u128;
+        // A node or relay suggesting 100,000 gwei is capped.
+        let p = plan_fees(7, 200_000, 10 * gwei, 100_000 * gwei, 5 * gwei, None);
+        assert_eq!(p.max_priority_fee_per_gas, 5 * gwei);
+        assert_eq!(p.max_fee_per_gas, 25 * gwei);
+        assert_eq!(p.gas_limit, 250_000);
+        assert_eq!(p.nonce, 7);
+        // Replacing our own stuck transaction at the same nonce outbids it.
+        let r = plan_fees(
+            7,
+            200_000,
+            10 * gwei,
+            gwei,
+            5 * gwei,
+            Some((7, 40 * gwei, 2 * gwei)),
+        );
+        assert!(r.max_fee_per_gas > 40 * gwei * 9 / 8);
+        assert!(r.max_priority_fee_per_gas > 2 * gwei * 9 / 8);
+        assert!(r.max_priority_fee_per_gas <= 5 * gwei, "still capped");
+        // A stuck transaction at an older nonce does not affect the next one.
+        let next = plan_fees(
+            8,
+            200_000,
+            10 * gwei,
+            gwei,
+            5 * gwei,
+            Some((7, 40 * gwei, 2 * gwei)),
+        );
+        assert_eq!(next.max_fee_per_gas, 21 * gwei);
+    }
+
+    #[test]
+    fn selector_is_read_from_the_leading_bytes_only() {
+        // PriceDeviation's selector inside another error's argument must not
+        // reclassify it (full audit LV-12).
+        let t = "execution reverted: custom error 0x2ddcae9c: 000000000000000000000000000000000000000000000000000000001782bd94";
+        assert_eq!(revert_selector(t).as_deref(), Some("2ddcae9c"));
+        assert_eq!(classify_preflight(t), RefusalAction::Cooldown);
+        assert_eq!(
+            revert_selector(
+                "server returned an error response: execution reverted, data: \"0x1782bd94000000\""
+            ),
+            Some("1782bd94".to_string())
+        );
+        assert_eq!(revert_selector("connection refused"), None);
+    }
+
+    #[test]
+    fn proposals_are_clipped_to_the_owner_bounds() {
+        assert_eq!(clip_range(780, 1260, -1200, 1200), Some((780, 1200)));
+        assert_eq!(clip_range(-1500, -300, -1200, 1200), Some((-1200, -300)));
+        assert_eq!(clip_range(1260, 1500, -1200, 1200), None);
+        assert_eq!(clip_range(-600, 600, -1200, 1200), Some((-600, 600)));
     }
 }

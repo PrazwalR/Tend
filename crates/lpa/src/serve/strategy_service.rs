@@ -57,6 +57,11 @@ impl AutopilotStrategy for StrategyService {
         if range.tick_lower >= range.tick_upper {
             return Err(Status::invalid_argument("tick_lower must be < tick_upper"));
         }
+        if !crate::strategy::ticks_in_domain(&[range.tick_lower, range.tick_upper]) {
+            return Err(Status::invalid_argument(
+                "ticks outside the int24 tick domain",
+            ));
+        }
         let pool_id = pool_id_from_key(&pool_key)?;
         let position_id =
             compute_position_id(&req.owner, &pool_id, range.tick_lower, range.tick_upper)
@@ -157,7 +162,12 @@ impl AutopilotStrategy for StrategyService {
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(STREAM_POLL_SECS));
             loop {
-                ticker.tick().await;
+                // Exit as soon as the client goes away. Waiting for a failed send
+                // never ended a stream whose ids matched nothing (full audit DM-5).
+                tokio::select! {
+                    _ = ticker.tick() => {}
+                    _ = tx.closed() => return,
+                }
                 let targets = if ids.is_empty() {
                     tracker.all_position_ids().unwrap_or_default()
                 } else {
@@ -225,7 +235,7 @@ async fn enrich(
     {
         Ok(s) => s,
         Err(e) => {
-            tracing::debug!(error = %e, position_id = %p.position_id, "position enrichment read failed");
+            tracing::debug!(error = %crate::redact(&e), position_id = %p.position_id, "position enrichment read failed");
             return;
         }
     };

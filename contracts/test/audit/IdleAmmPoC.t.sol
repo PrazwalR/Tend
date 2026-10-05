@@ -55,7 +55,18 @@ contract IdleAmmPoCTest is Test, Deployers {
     // ------------------------------------------------------------------ helpers
 
     function _dep(PoolKey memory k, int24 lo, int24 hi, uint128 liq) internal returns (bytes32) {
-        return hook.deposit(k, lo, hi, liq, TickMath.minUsableTick(60), TickMath.maxUsableTick(60));
+        return hook.deposit(
+            k,
+            lo,
+            hi,
+            liq,
+            TickMath.minUsableTick(60),
+            TickMath.maxUsableTick(60),
+            address(0),
+            type(uint256).max,
+            type(uint256).max,
+            type(uint256).max
+        );
     }
 
     function _nextBlock() internal {
@@ -257,8 +268,12 @@ contract IdleAmmPoCTest is Test, Deployers {
             assertLe(uint256(after_), uint256(origin) * (10_000 + bps) / 10_000 + 1, "above impact bound");
         } catch (bytes memory err) {
             bytes4 sel = bytes4(err);
+            // NoOpRebalance: the one-sided fallback (AM2-2) can narrow a request
+            // onto the range the position already holds, which CO-3 refuses
+            // rather than churn swap fees.
             assertTrue(
-                sel == AutopilotHook.ZeroLiquidity.selector || sel == AutopilotHook.ValueLossExceeded.selector,
+                sel == AutopilotHook.ZeroLiquidity.selector || sel == AutopilotHook.ValueLossExceeded.selector
+                    || sel == AutopilotHook.NoOpRebalance.selector,
                 "unexpected revert from swap legs"
             );
         }

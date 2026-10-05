@@ -156,6 +156,11 @@ fair.**
 
 ## 6. Fix status
 
+> **Superseded in part by the full audit (`audits/tend-2026-10-03-full/AUDIT-REPORT.md`).** The PR-1
+> stability fix below does not hold: steps of ≤ 500 ticks are never clamped, so one held block end
+> still moves the reference (OR-1, High). The DS-1 fallback is skipped when fee dust is present
+> (AM2-2 / LV-1). The executor's nonce and fee handling has two Highs (DM-1, DM-2).
+
 Every finding above Info was either fixed with a regression test or declined
 with evidence. The reviewers' PoC files are now regression tests in
 `contracts/test/audit/`, plus the `dos_poc` Rust module. Each one asserts that its

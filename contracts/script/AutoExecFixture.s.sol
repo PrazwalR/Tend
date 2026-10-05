@@ -33,7 +33,9 @@ contract AutoExecFixture is Script {
         PoolKey memory key = PoolKey(Currency.wrap(address(t0)), Currency.wrap(address(t1)), 3000, 60, IHooks(hook));
         IPoolManager(manager).initialize(key, SQRT_PRICE_1_1);
 
-        bytes32 pid = hook.deposit(key, -600, 600, 1e18, -120000, 120000);
+        bytes32 pid = hook.deposit(
+            key, -600, 600, 1e18, -120000, 120000, address(0), type(uint256).max, type(uint256).max, type(uint256).max
+        );
 
         PoolModifyLiquidityTest lp = new PoolModifyLiquidityTest(IPoolManager(manager));
         t0.approve(address(lp), type(uint256).max);

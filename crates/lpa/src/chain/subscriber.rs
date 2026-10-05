@@ -138,12 +138,12 @@ pub async fn run_watch(
             Ok(url) => match ChainReader::connect(&url, h, cfg.addrs.state_view).await {
                 Ok(r) => Some(r),
                 Err(e) => {
-                    warn!(error = %e, "HTTP reader unavailable; reorg resync disabled");
+                    warn!(error = %crate::redact(&e), "HTTP reader unavailable; reorg resync disabled");
                     None
                 }
             },
             Err(e) => {
-                warn!(error = %e, "no HTTP RPC configured; reorg resync disabled");
+                warn!(error = %crate::redact(&e), "no HTTP RPC configured; reorg resync disabled");
                 None
             }
         },
@@ -169,7 +169,7 @@ pub async fn run_watch(
                 return Ok(());
             }
             Ok(WatchEnd::StreamEnded) => warn!("WS log stream ended"),
-            Err(e) => error!(error = %e, "WS watch connection error"),
+            Err(e) => error!(error = %crate::redact(&e), "WS watch connection error"),
         }
 
         if started.elapsed() >= Duration::from_secs(CONNECTION_STABLE_SECS) {
@@ -241,7 +241,7 @@ async fn watch_once(
     // Subscriptions only deliver logs from now on. Anything that happened while
     // the daemon was down is replayed here before the live stream is served.
     if let Err(e) = backfill(&provider, cfg, ctx, hook, true).await {
-        warn!(error = %e, "backfill failed; continuing on live stream only");
+        warn!(error = %crate::redact(&e), "backfill failed; continuing on live stream only");
     }
 
     let heartbeat = Duration::from_secs(
@@ -278,7 +278,7 @@ async fn watch_once(
                         // log the stream dropped is still processed, and it is
                         // the only thing that advances the watermark.
                         if let Err(e) = backfill(provider, cfg, ctx, hook, false).await {
-                            warn!(error = %e, "catch-up backfill failed");
+                            warn!(error = %crate::redact(&e), "catch-up backfill failed");
                         }
                         sweep_out_of_range(ctx).await;
                         sweep_idle(ctx).await;
@@ -295,13 +295,13 @@ async fn watch_once(
             maybe_log = stream.next() => match maybe_log {
                 Some(log) => {
                     if let Err(e) = handle(ctx, log).await {
-                        error!(error = %e, "log handling error");
+                        error!(error = %crate::redact(&e), "log handling error");
                     }
                     since_prune += 1;
                     if since_prune >= PRUNE_EVERY {
                         since_prune = 0;
                         if let Err(e) = ctx.tracker.prune_all_ticks(TICK_RETENTION) {
-                            warn!(error = %e, "tick prune failed");
+                            warn!(error = %crate::redact(&e), "tick prune failed");
                         }
                     }
                 }
@@ -376,45 +376,81 @@ async fn backfill<P: Provider>(
         debug!(from, to = head, "catching up from watermark");
     }
 
-    let mut start = from;
+    // Ranges still to fetch, last on top. A range the provider refuses (a result
+    // cap, a frame-size limit, a range limit) is split in half until it fits, and
+    // a single block that still fails is skipped with a loud error. Before, one
+    // refused chunk stopped the watermark for good, and every sweep replayed the
+    // same chunk (full audit LV-4).
+    let mut ranges: Vec<(u64, u64)> = Vec::new();
+    let mut s0 = from;
+    let mut chunks = Vec::new();
+    while s0 <= head {
+        let e0 = (s0 + BACKFILL_CHUNK_BLOCKS - 1).min(head);
+        chunks.push((s0, e0));
+        s0 = e0 + 1;
+    }
+    ranges.extend(chunks.into_iter().rev());
     let mut replayed = 0usize;
-    while start <= head {
-        let end = (start + BACKFILL_CHUNK_BLOCKS - 1).min(head);
-
-        if let Some(h) = hook {
-            let f = Filter::new()
-                .address(h)
-                .event_signature(vec![
-                    PositionOpened::SIGNATURE_HASH,
-                    PositionClosed::SIGNATURE_HASH,
-                    Rebalanced::SIGNATURE_HASH,
-                ])
-                .from_block(start)
-                .to_block(end);
-            for log in provider.get_logs(&f).await? {
-                handle(ctx, log).await?;
-                replayed += 1;
+    while let Some((start, end)) = ranges.pop() {
+        match fetch_logs(provider, cfg, hook, &pool_topics, start, end).await {
+            Ok(logs) => {
+                for log in logs {
+                    handle(ctx, log).await?;
+                    replayed += 1;
+                }
+            }
+            Err(e) if end > start => {
+                let mid = start + (end - start) / 2;
+                debug!(start, end, error = %crate::redact(&e), "log range refused; splitting");
+                ranges.push((mid + 1, end));
+                ranges.push((start, mid));
+                continue;
+            }
+            Err(e) => {
+                error!(block = start, error = %crate::redact(&e), "logs for this block could not be fetched; skipping it — positions it touched may need a resync");
             }
         }
-
-        if !pool_topics.is_empty() {
-            let f = Filter::new()
-                .address(cfg.addrs.pool_manager)
-                .event_signature(Swap::SIGNATURE_HASH)
-                .topic1(pool_topics.clone())
-                .from_block(start)
-                .to_block(end);
-            for log in provider.get_logs(&f).await? {
-                handle(ctx, log).await?;
-                replayed += 1;
-            }
-        }
-
         ctx.tracker.set_last_indexed_block(&ctx.chain_key(), end)?;
-        start = end + 1;
     }
     debug!(replayed, "backfill complete");
     Ok(())
+}
+
+/// Hook and Swap logs for `[start, end]`, merged and in chain order. Fetched
+/// separately, replaying all hook events before all swaps judged early swaps
+/// against later ranges (full audit LV-8).
+async fn fetch_logs<P: Provider>(
+    provider: &P,
+    cfg: &ChainConfig,
+    hook: Option<Address>,
+    pool_topics: &[B256],
+    start: u64,
+    end: u64,
+) -> Result<Vec<Log>> {
+    let mut logs = Vec::new();
+    if let Some(h) = hook {
+        let f = Filter::new()
+            .address(h)
+            .event_signature(vec![
+                PositionOpened::SIGNATURE_HASH,
+                PositionClosed::SIGNATURE_HASH,
+                Rebalanced::SIGNATURE_HASH,
+            ])
+            .from_block(start)
+            .to_block(end);
+        logs.extend(provider.get_logs(&f).await?);
+    }
+    if !pool_topics.is_empty() {
+        let f = Filter::new()
+            .address(cfg.addrs.pool_manager)
+            .event_signature(Swap::SIGNATURE_HASH)
+            .topic1(pool_topics.to_vec())
+            .from_block(start)
+            .to_block(end);
+        logs.extend(provider.get_logs(&f).await?);
+    }
+    logs.sort_by_key(|l| (l.block_number, l.log_index));
+    Ok(logs)
 }
 
 fn next_backoff(attempt: u32) -> Duration {
@@ -488,7 +524,7 @@ async fn resync_position(ctx: &Ctx<'_>, position_id: B256) -> Result<()> {
             ctx.tracker.delete_position(&id_hex)?;
             info!(position_id = %id_hex, "position absent on canonical chain; dropped");
         }
-        Err(e) => warn!(error = %e, position_id = %id_hex, "resync read failed"),
+        Err(e) => warn!(error = %crate::redact(&e), position_id = %id_hex, "resync read failed"),
     }
     Ok(())
 }
@@ -497,7 +533,7 @@ async fn handle_swap(ctx: &Ctx<'_>, log: Log) -> Result<()> {
     let ev = match Swap::decode_log(&log.inner) {
         Ok(e) => e,
         Err(e) => {
-            debug!(error = %e, "event decode failed; skipping log");
+            debug!(error = %crate::redact(&e), "event decode failed; skipping log");
             return Ok(());
         }
     };
@@ -510,7 +546,12 @@ async fn handle_swap(ctx: &Ctx<'_>, log: Log) -> Result<()> {
     for cx in &crosses {
         if cx.was_in_range && !cx.now_in_range {
             warn!(position_id = %cx.position_id, tick, "position EXITED range");
-            propose_rebalance(ctx, &pool_hex, tick, &cx.position_id).await;
+            // In auto-execute mode the sweep proposes it within one pass. Doing it
+            // here put up to four RPCs per position on the log path, inside the
+            // swap handler (full audit DM-6).
+            if ctx.intent_tx.is_none() {
+                propose_rebalance(ctx, &pool_hex, tick, &cx.position_id).await;
+            }
         } else if !cx.was_in_range && cx.now_in_range {
             info!(position_id = %cx.position_id, tick, "position re-entered range");
         }
@@ -536,13 +577,20 @@ fn handle_opened(ctx: &Ctx<'_>, log: Log) -> Result<()> {
     let ev = match PositionOpened::decode_log(&log.inner) {
         Ok(e) => e,
         Err(e) => {
-            debug!(error = %e, "event decode failed; skipping log");
+            debug!(error = %crate::redact(&e), "event decode failed; skipping log");
             return Ok(());
         }
     };
     let position_id = format!("{:#x}", ev.positionId);
     let tick_lower = ev.tickLower.as_i32();
     let tick_upper = ev.tickUpper.as_i32();
+    // A position is opened once. A replayed `PositionOpened` for a row that
+    // exists would reset its range to the opening one, undoing every rebalance
+    // since (full audit LV-4).
+    if ctx.tracker.get_position(&position_id)?.is_some() {
+        debug!(position_id = %position_id, "PositionOpened replayed for a known position; ignored");
+        return Ok(());
+    }
     ctx.tracker.register(&PositionRow {
         position_id: position_id.clone(),
         owner: format!("{:#x}", ev.owner),
@@ -564,7 +612,7 @@ fn handle_closed(ctx: &Ctx<'_>, log: Log) -> Result<()> {
     let ev = match PositionClosed::decode_log(&log.inner) {
         Ok(e) => e,
         Err(e) => {
-            debug!(error = %e, "event decode failed; skipping log");
+            debug!(error = %crate::redact(&e), "event decode failed; skipping log");
             return Ok(());
         }
     };
@@ -580,7 +628,7 @@ fn handle_rebalanced(ctx: &Ctx<'_>, log: Log) -> Result<()> {
     let ev = match Rebalanced::decode_log(&log.inner) {
         Ok(e) => e,
         Err(e) => {
-            debug!(error = %e, "event decode failed; skipping log");
+            debug!(error = %crate::redact(&e), "event decode failed; skipping log");
             return Ok(());
         }
     };
@@ -641,14 +689,30 @@ async fn sweep_out_of_range(ctx: &Ctx<'_>) {
     let positions = match ctx.tracker.out_of_range_positions() {
         Ok(p) => p,
         Err(e) => {
-            warn!(error = %e, "out-of-range sweep query failed");
+            warn!(error = %crate::redact(&e), "out-of-range sweep query failed");
             return;
         }
     };
-    // Start each pass somewhere else, so that when the queue is full it is not
-    // always the same positions, the first by insertion order, that get in.
-    let start = rotation_start(&OOR_CURSOR, positions.len());
-    for p in positions.iter().cycle().skip(start).take(positions.len()) {
+    // A bounded batch per pass, carried on by a cursor, like the idle sweep: an
+    // unbatched pass over a few hundred dust positions, each costing RPCs before
+    // the strategy decides, ran past the sweep timeout every time and starved
+    // the idle sweep after it (full audit LV-6).
+    let n = positions.len();
+    let start = if n == 0 {
+        0
+    } else {
+        OOR_CURSOR.fetch_add(SWEEP_BATCH, Ordering::Relaxed) % n
+    };
+    for p in positions
+        .iter()
+        .cycle()
+        .skip(start)
+        .take(n.min(SWEEP_BATCH))
+    {
+        if ctx.intent_tx.is_some_and(|tx| tx.capacity() == 0) {
+            debug!("auto-execute queue full; out-of-range sweep stops for this pass");
+            break;
+        }
         if let Some(tick) = p.current_tick {
             propose_rebalance(ctx, &p.pool_id, tick, &p.position_id).await;
         }
@@ -658,19 +722,13 @@ async fn sweep_out_of_range(ctx: &Ctx<'_>) {
 static OOR_CURSOR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static IDLE_CURSOR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// Where this pass starts in a list of `len`, advancing the cursor for the next.
-fn rotation_start(cursor: &std::sync::atomic::AtomicUsize, len: usize) -> usize {
-    if len == 0 {
-        return 0;
-    }
-    cursor.fetch_add(1, Ordering::Relaxed) % len
-}
-
 /// Positions examined per idle-sweep pass. Each costs up to two RPCs, so an
 /// uncapped pass over a few hundred positions ran into the sweep timeout and the
 /// next pass started from the top again: the tail was never examined (re-audit
 /// DS-5). The cursor carries on where the last pass stopped.
 const IDLE_SWEEP_BATCH: usize = 40;
+/// Positions examined per out-of-range sweep pass.
+const SWEEP_BATCH: usize = 40;
 
 /// Queues a same-range rebalance for any in-range position holding a material
 /// idle balance: what an earlier rebalance's bounded swap could not place. The
@@ -686,7 +744,7 @@ async fn sweep_idle(ctx: &Ctx<'_>) {
     let positions = match ctx.tracker.in_range_positions() {
         Ok(p) => p,
         Err(e) => {
-            warn!(error = %e, "idle sweep query failed");
+            warn!(error = %crate::redact(&e), "idle sweep query failed");
             return;
         }
     };
@@ -713,7 +771,7 @@ async fn sweep_idle(ctx: &Ctx<'_>) {
         let (idle0, idle1) = match reader.idle_balance(position_id).await {
             Ok(v) => v,
             Err(e) => {
-                debug!(position_id = %p.position_id, error = %e, "idle balance read failed");
+                debug!(position_id = %p.position_id, error = %crate::redact(&e), "idle balance read failed");
                 continue;
             }
         };
@@ -757,12 +815,18 @@ async fn sweep_idle(ctx: &Ctx<'_>) {
             new_lower: p.tick_lower,
             new_upper: p.tick_upper,
         };
+        // Mark first, then send: marking after the send raced a fast executor
+        // that had already dequeued the intent, and the leaked marker blocked
+        // the position for good (full audit LV-5).
+        if !automation().mark_queued(&p.position_id) {
+            continue;
+        }
         match tx.try_send(intent) {
             Ok(()) => {
-                automation().mark_queued(&p.position_id);
                 info!(position_id = %p.position_id, idle_bps = share, "idle balance redeploy queued")
             }
             Err(_) => {
+                automation().mark_dequeued(&p.position_id);
                 warn!(position_id = %p.position_id, "auto-execute queue full; dropped idle redeploy")
             }
         }
@@ -891,12 +955,17 @@ async fn propose_rebalance(ctx: &Ctx<'_>, pool_hex: &str, tick: i32, position_id
                 new_lower: d.new_lower,
                 new_upper: d.new_upper,
             };
+            // Mark first (LV-5). A false return means another path already
+            // queued this position while we awaited the strategy (LV-10).
+            if !automation().mark_queued(&pos.position_id) {
+                return;
+            }
             match tx.try_send(intent) {
                 Ok(()) => {
-                    automation().mark_queued(&pos.position_id);
                     info!(position_id = %pos.position_id, new_lower = d.new_lower, new_upper = d.new_upper, "auto-execute intent queued")
                 }
                 Err(_) => {
+                    automation().mark_dequeued(&pos.position_id);
                     warn!(position_id = %pos.position_id, "auto-execute queue full; dropped intent")
                 }
             }
@@ -1255,6 +1324,10 @@ mod tests {
     }
 }
 
+/// Full-audit liveness PoCs (LV-*). Test-only.
+#[cfg(test)]
+pub(crate) mod liveness_poc;
+
 /// Audit 2026-10-03 DoS PoCs (audits/tend-2026-10-03/findings-dos.md). Test-only.
 #[cfg(test)]
 mod dos_poc {
@@ -1329,6 +1402,7 @@ mod dos_poc {
         // the attacker's positions record the hook's terminal refusal (they opted
         // out of automation, so the hook answers AutomationDisabled).
         let mut honest_served_on = None;
+        let mut refused = std::collections::HashSet::new();
         for pass in 0..3 {
             sweep_out_of_range(&ctx).await;
             let mut queued = Vec::new();
@@ -1351,10 +1425,10 @@ mod dos_poc {
             if honest && honest_served_on.is_none() {
                 honest_served_on = Some(pass);
             }
-            if pass > 0 {
+            for p in &queued {
                 assert!(
-                    queued.iter().all(|p| !p.starts_with("0xa")),
-                    "terminally refused positions are not re-proposed"
+                    refused.insert(p.clone()) || !p.starts_with("0xa"),
+                    "a terminally refused position was proposed again: {p}"
                 );
             }
         }

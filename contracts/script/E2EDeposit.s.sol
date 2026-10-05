@@ -23,8 +23,18 @@ contract E2EDeposit is Script {
         t0.approve(address(hook), type(uint256).max);
         t1.approve(address(hook), type(uint256).max);
         PoolKey memory key = PoolKey(Currency.wrap(address(t0)), Currency.wrap(address(t1)), 3000, 60, IHooks(hook));
-        bytes32 positionId =
-            hook.deposit(key, lower, upper, 1e18, TickMath.minUsableTick(60), TickMath.maxUsableTick(60));
+        bytes32 positionId = hook.deposit(
+            key,
+            lower,
+            upper,
+            1e18,
+            TickMath.minUsableTick(60),
+            TickMath.maxUsableTick(60),
+            address(0),
+            type(uint256).max,
+            type(uint256).max,
+            type(uint256).max
+        );
         vm.stopBroadcast();
 
         console2.log("POSITION=%s", vm.toString(positionId));

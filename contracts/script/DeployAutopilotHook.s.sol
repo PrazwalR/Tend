@@ -26,6 +26,10 @@ interface IFeedDescription {
 contract DeployAutopilotHook is Script {
     address constant CREATE2_DEPLOYER = 0x4e59b44847b379578588920cA78FbF26c0B4956C;
     string constant SEQUENCER_FEED_DESCRIPTION = "L2 Sequencer Uptime Status Feed";
+    /// Chainlink's L2 sequencer uptime feed on Base (verified on-chain: its
+    /// description() is SEQUENCER_FEED_DESCRIPTION and it answers 0 = up).
+    address constant BASE_SEQUENCER_FEED = 0xBCF85224fc0756B9Fa45aA7892530B47e10b6433;
+    uint256 constant BASE_CHAIN_ID = 8453;
 
     function run() external returns (AutopilotHook hook) {
         address manager = vm.envAddress("POOL_MANAGER");
@@ -39,6 +43,20 @@ contract DeployAutopilotHook is Script {
         int24 spacing = int24(int256(vm.envOr("ALLOWED_POOL_TICK_SPACING", uint256(0))));
         // Chainlink L2 sequencer uptime feed; leave unset on L1.
         address seqFeed = vm.envOr("SEQUENCER_UPTIME_FEED", address(0));
+        // On Base the feed is required and pinned. A description check alone
+        // accepted any contract returning the right string, whose owner could
+        // then report "up" forever (full audit GV-1); and a Base deploy with no
+        // feed silently had no post-outage grace period.
+        if (block.chainid == BASE_CHAIN_ID) {
+            if (seqFeed == address(0)) seqFeed = BASE_SEQUENCER_FEED;
+            require(seqFeed == BASE_SEQUENCER_FEED, "Base requires Chainlink's sequencer uptime feed");
+        }
+        // A pool key needs its fee and spacing: listing tokens alone listed a key
+        // no pool can have, and the intended pool stayed closed (full audit GV-3).
+        if (token0 != address(0) || token1 != address(0)) {
+            require(token0 != address(0) && token1 != address(0), "set both ALLOWED_POOL_TOKEN0 and _TOKEN1");
+            require(spacing > 0, "set ALLOWED_POOL_TICK_SPACING (and ALLOWED_POOL_FEE)");
+        }
 
         vm.startBroadcast();
         // The address actually signing, whatever the signer type. `msg.sender`

@@ -100,6 +100,12 @@ impl CostModel for LiveCostModel {
     }
 }
 
+/// Whether every tick lies in v4's tick domain.
+pub fn ticks_in_domain(ticks: &[i32]) -> bool {
+    use crate::chain::tickmath::{MAX_TICK, MIN_TICK};
+    ticks.iter().all(|t| (MIN_TICK..=MAX_TICK).contains(t))
+}
+
 pub fn config_from(
     il_threshold_pct: Option<f64>,
     bollinger_period: Option<u32>,
@@ -158,6 +164,17 @@ impl Default for StrategyEngine {
 
 impl StrategyEngine {
     pub fn decide(&self, input: &DecideInput, cost: &dyn CostModel) -> Option<Decision> {
+        // Ticks can arrive through the API or CLI; arithmetic on values outside
+        // the tick domain overflowed (full audit DM-7).
+        if !ticks_in_domain(&[
+            input.current_tick,
+            input.entry_tick,
+            input.cur_lower,
+            input.cur_upper,
+        ]) || input.tick_spacing <= 0
+        {
+            return None;
+        }
         if input.ticks.len() < self.min_ticks {
             return None;
         }

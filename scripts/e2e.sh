@@ -30,10 +30,11 @@ RPC="http://127.0.0.1:$PORT"
 WS="ws://127.0.0.1:$PORT"
 WORK="$(mktemp -d)"
 DB="$WORK/e2e.sqlite"
-# The run takes ~15 minutes, long enough for macOS idle sleep, which freezes
+# The run takes ~15 minutes, long enough for macOS idle or maintenance sleep
+# (-i, -s: the latter blocks system sleep on AC), which freezes
 # anvil and the daemon mid-stage and fails whichever stage is waiting.
 CAFFEINATE_PID=""
-command -v caffeinate >/dev/null && { caffeinate -i -w $$ & CAFFEINATE_PID=$!; }
+command -v caffeinate >/dev/null && { caffeinate -i -s -w $$ & CAFFEINATE_PID=$!; }
 ANVIL_LOG="$WORK/anvil.log"
 DAEMON_LOG="$WORK/daemon.log"
 
