@@ -427,7 +427,13 @@ fn migrate(conn: &Connection) {
         "ALTER TABLE positions ADD COLUMN tick_spacing INTEGER",
         "ALTER TABLE positions ADD COLUMN opened_at INTEGER",
     ] {
-        let _ = conn.execute(stmt, []);
+        // Re-running an applied migration fails with "duplicate column"; any
+        // other failure leaves the schema short and is worth knowing about.
+        if let Err(e) = conn.execute(stmt, []) {
+            if !e.to_string().contains("duplicate column") {
+                tracing::error!(error = %e, statement = stmt, "schema migration failed");
+            }
+        }
     }
 }
 

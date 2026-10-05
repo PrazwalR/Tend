@@ -170,7 +170,10 @@ enum ConfigAction {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    dotenvy::dotenv().ok();
+    // Only ./.env. `dotenv()` walks up through parent directories, so a .env
+    // anywhere above the working directory could supply the signing key, the
+    // RPC URLs or the hook address (full audit, daemon Info).
+    dotenvy::from_path(".env").ok();
     let cli = Cli::parse();
     init_logging(cli.log_format);
 

@@ -189,13 +189,26 @@ Withdraw is unaffected. Mitigated in the daemon:
   - GV-5: the constructor allowlist default; the deploy script enforces it in the same broadcast.
   - GV-4: Base `pending` semantics; only delays, and the OR-1 stability rule now dominates.
   - OR-3: grief cost, accepted.
-  - OR-4: answer age; 3,600 s is mainnet's heartbeat and the threshold is not per chain.
   - AM2-4: extreme-price floor.
   - TS-1: best-effort check, documented.
   - CO-5: Info.
   - T-5: direct approval, Low; Permit2 is out of scope for this round.
-  - Daemon Info: dotenv parent-directory search, unzeroized key, unsupervised executor, ignored
-    per-position configs, mismatched API ids, swallowed migrations.
+  - Daemon Info, the key: it stays in the process environment. Clearing it with `remove_var`
+    races tokio's worker threads, so the README's advice stands: use a keystore or an external
+    signer in production.
+  - Daemon Info, API-registered ids: these don't match hook position ids. That is by design: the
+    API and CLI `register` are for monitoring, and the hook refuses those ids as terminal. Now
+    documented in the CLI table.
+- **Fixed in a follow-up commit (2026-10-05):**
+  - OR-4: answer age is per feed, the heartbeat plus 5 minutes (Base 1,500 s, Ethereum 3,900 s).
+    Test: `answer_age_follows_each_feeds_heartbeat`.
+  - Executor supervision: a panic in one intent is caught and logged, and the loop continues. If
+    the loop ever exits, it says so, and the sweep reports a closed channel as "executor not
+    running", not "queue full".
+  - `.env` is read from the working directory only (`dotenvy::from_path`), never a parent.
+  - Per-position configs stored with `UpdateConfig` now drive the strategy, and the lower of the
+    position's and the global spend cap is used. Test: `stored_position_config_drives_the_strategy`.
+  - Migration failures other than "duplicate column" are logged.
 
 ### Verification
 - `forge test`: **207 passed**, 1 skipped.

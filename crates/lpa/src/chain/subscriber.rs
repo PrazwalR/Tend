@@ -814,6 +814,7 @@ async fn sweep_idle(ctx: &Ctx<'_>) {
             position_id: p.position_id.clone(),
             new_lower: p.tick_lower,
             new_upper: p.tick_upper,
+            max_gas_usd: position_config(ctx, &p.position_id).max_gas_usd.into(),
         };
         // Mark first, then send: marking after the send raced a fast executor
         // that had already dequeued the intent, and the leaked marker blocked
@@ -910,6 +911,26 @@ pub(crate) fn idle_share_bps(idle: (f64, f64), deployed: (f64, f64), tick: i32) 
     idle_value / total * 10_000.0
 }
 
+/// The position's own strategy config when one was stored through `UpdateConfig`,
+/// else the daemon's default. The stored configs used to be written and never
+/// read (full audit, daemon Info).
+fn position_config(ctx: &Ctx<'_>, position_id: &str) -> PositionConfig {
+    match ctx.tracker.get_config(position_id) {
+        Ok(Some(c)) => PositionConfig {
+            position_id: position_id.to_string(),
+            strategy: c.strategy,
+            il_threshold_pct: c.il_threshold_pct,
+            fee_capture_ratio: c.fee_capture_ratio,
+            bollinger_period: c.bollinger_period,
+            bollinger_stddev: c.bollinger_stddev,
+            max_gas_usd: c.max_gas_usd,
+            auto_compound_fees: c.auto_compound_fees,
+            use_flashbots: c.use_flashbots,
+        },
+        _ => ctx.config.clone(),
+    }
+}
+
 async fn propose_rebalance(ctx: &Ctx<'_>, pool_hex: &str, tick: i32, position_id: &str) {
     // Queued already, or refused recently in a way that will not change by
     // itself: proposing again would only take a queue slot from a position the
@@ -920,6 +941,7 @@ async fn propose_rebalance(ctx: &Ctx<'_>, pool_hex: &str, tick: i32, position_id
     let Ok(Some(pos)) = ctx.tracker.get_position(position_id) else {
         return;
     };
+    let config = position_config(ctx, position_id);
     let ticks = ctx
         .tracker
         .recent_ticks(pool_hex, STRATEGY_TICK_WINDOW)
@@ -942,7 +964,7 @@ async fn propose_rebalance(ctx: &Ctx<'_>, pool_hex: &str, tick: i32, position_id
         fee_pips: pos.fee.unwrap_or(DEFAULT_FEE_PIPS),
         ticks: &ticks,
         weighted: &weighted,
-        config: ctx.config,
+        config: &config,
         position_value_usd: position_value_usd(ctx, &pos).await,
     };
     let Some(d) = ctx.engine.decide(&input, ctx.cost) else {
@@ -954,6 +976,7 @@ async fn propose_rebalance(ctx: &Ctx<'_>, pool_hex: &str, tick: i32, position_id
                 position_id: pos.position_id.clone(),
                 new_lower: d.new_lower,
                 new_upper: d.new_upper,
+                max_gas_usd: Some(config.max_gas_usd),
             };
             // Mark first (LV-5). A false return means another path already
             // queued this position while we awaited the strategy (LV-10).
@@ -964,9 +987,13 @@ async fn propose_rebalance(ctx: &Ctx<'_>, pool_hex: &str, tick: i32, position_id
                 Ok(()) => {
                     info!(position_id = %pos.position_id, new_lower = d.new_lower, new_upper = d.new_upper, "auto-execute intent queued")
                 }
-                Err(_) => {
+                Err(e) => {
                     automation().mark_dequeued(&pos.position_id);
-                    warn!(position_id = %pos.position_id, "auto-execute queue full; dropped intent")
+                    if matches!(e, mpsc::error::TrySendError::Closed(_)) {
+                        error!(position_id = %pos.position_id, "executor is not running; intent dropped")
+                    } else {
+                        warn!(position_id = %pos.position_id, "auto-execute queue full; dropped intent")
+                    }
                 }
             }
         }
@@ -1438,6 +1465,62 @@ mod dos_poc {
             "honest position served on the pass after the spam is refused"
         );
         automation().forget("0xhonest");
+    }
+
+    /// A config stored through UpdateConfig is the one the strategy uses: a
+    /// position set to Manual is never proposed, however far out of range.
+    #[tokio::test]
+    async fn stored_position_config_drives_the_strategy() {
+        use crate::position::tracker::ConfigRow;
+        let tracker = Arc::new(Tracker::open_in_memory().unwrap());
+        let pool = "0xc0nf19";
+        tracker
+            .register(&row("0xmanual", pool, 5000, 6000, 0))
+            .unwrap();
+        tracker
+            .register(&row("0xdefault", pool, 5000, 6000, 0))
+            .unwrap();
+        feed(&tracker, pool);
+        tracker
+            .set_config(
+                "0xmanual",
+                &ConfigRow {
+                    strategy: crate::proto::Strategy::Manual as i32,
+                    il_threshold_pct: 5.0,
+                    fee_capture_ratio: 0.5,
+                    bollinger_period: 20,
+                    bollinger_stddev: 2.0,
+                    max_gas_usd: 1.0,
+                    auto_compound_fees: false,
+                    use_flashbots: false,
+                },
+            )
+            .unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+        let engine = StrategyEngine::default();
+        let cfg = default_config();
+        let ctx = Ctx {
+            tracker: &tracker,
+            engine: &engine,
+            cost: &EstimateCostModel,
+            config: &cfg,
+            chain_id: 8453,
+            reader: None,
+            intent_tx: Some(&tx),
+            last_block: DashMap::new(),
+        };
+        propose_rebalance(&ctx, pool, 0, "0xmanual").await;
+        propose_rebalance(&ctx, pool, 0, "0xdefault").await;
+        let mut queued = Vec::new();
+        while let Ok(i) = rx.try_recv() {
+            automation().mark_dequeued(&i.position_id);
+            queued.push(i.position_id);
+        }
+        assert_eq!(
+            queued,
+            vec!["0xdefault".to_string()],
+            "the Manual position is left alone"
+        );
     }
 
     /// Minimal JSON-RPC over HTTP: answers every request with 64 zero bytes

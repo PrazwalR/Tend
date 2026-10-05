@@ -595,6 +595,9 @@ pub struct RebalanceIntent {
     pub position_id: String,
     pub new_lower: i32,
     pub new_upper: i32,
+    /// The position's own spend cap, from its stored config. The executor uses
+    /// the lower of this and the global cap.
+    pub max_gas_usd: Option<f64>,
 }
 
 pub struct AutoExec {
@@ -618,6 +621,7 @@ pub async fn run_executor_loop(
     executor: Executor,
     cfg: AutoExec,
 ) {
+    use futures_util::FutureExt;
     use std::collections::HashMap;
     use std::time::Instant;
 
@@ -653,7 +657,10 @@ pub async fn run_executor_loop(
             Ok(p) => p,
             Err(_) => continue,
         };
-        let work = handle_intent(
+        // A panic in one intent must not take the only executor down with it:
+        // the queue would fill and every later intent be dropped, logged as
+        // "queue full" (full audit, daemon Info).
+        let work = std::panic::AssertUnwindSafe(handle_intent(
             &executor,
             &cfg,
             &intent,
@@ -661,15 +668,26 @@ pub async fn run_executor_loop(
             &mut last,
             &mut last_block,
             &mut pokes,
-        );
-        if tokio::time::timeout(iteration_limit, work).await.is_err() {
-            tracing::warn!(position = %intent.position_id, limit_secs = iteration_limit.as_secs(), "executor iteration timed out; abandoned");
-            // A send may already be out; treat the position as just acted on so
-            // a second transaction is not raced against it (full audit LV-11).
-            last.insert(intent.position_id.clone(), Instant::now());
-            auto.strike(&intent.position_id, Instant::now());
+        ))
+        .catch_unwind();
+        match tokio::time::timeout(iteration_limit, work).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                tracing::error!(position = %intent.position_id, "executor iteration panicked; continuing");
+                auto.strike(&intent.position_id, Instant::now());
+            }
+            Err(_) => {
+                tracing::warn!(position = %intent.position_id, limit_secs = iteration_limit.as_secs(), "executor iteration timed out; abandoned");
+                // A send may already be out; treat the position as just acted on so
+                // a second transaction is not raced against it (full audit LV-11).
+                last.insert(intent.position_id.clone(), Instant::now());
+                auto.strike(&intent.position_id, Instant::now());
+            }
         }
     }
+    tracing::error!(
+        "intent channel closed; the executor has stopped and nothing will be rebalanced"
+    );
 }
 
 async fn handle_intent(
@@ -683,6 +701,10 @@ async fn handle_intent(
 ) {
     use std::time::Instant;
     let auto = automation();
+    let cap = intent
+        .max_gas_usd
+        .filter(|c| c.is_finite() && *c > 0.0)
+        .map_or(cfg.max_gas_usd, |c| c.min(cfg.max_gas_usd));
     // The strategy centres on spot without knowing the owner's bounds; clip to
     // them here, so a position near a bound is not refused for crossing it.
     let (lower, upper) = match executor
@@ -735,7 +757,7 @@ async fn handle_intent(
     last_block.remove(&intent.position_id);
 
     match executor
-        .execute(pid, lower, upper, None, cfg.max_gas_usd, &cfg.eth_price)
+        .execute(pid, lower, upper, None, cap, &cfg.eth_price)
         .await
     {
         Ok(r) if r.success => {

@@ -37,6 +37,21 @@ pub struct EthPriceOracle {
     provider: DynProvider,
     feed: Address,
     decimals: u8,
+    /// Oldest answer accepted, from the feed's heartbeat plus a margin.
+    max_age_secs: u64,
+}
+
+/// Answer age accepted per known feed: its heartbeat plus five minutes. One flat
+/// hour accepted a Base answer three heartbeats old (full audit OR-4).
+pub fn max_answer_age_secs(feed: Address) -> u64 {
+    use alloy::primitives::address;
+    if feed == address!("0x71041dddad3595f9ced3dccfbe3d1f4b0a16bb70") {
+        1_200 + 300 // Base ETH/USD, 20 min heartbeat
+    } else if feed == address!("0x5f4ec3df9cbd43714fe2740f5e3616155c5b8419") {
+        3_600 + 300 // Ethereum ETH/USD, 1 h heartbeat
+    } else {
+        MAX_ANSWER_AGE_SECS
+    }
 }
 
 impl EthPriceOracle {
@@ -65,6 +80,7 @@ impl EthPriceOracle {
             provider,
             feed,
             decimals,
+            max_age_secs: max_answer_age_secs(feed),
         })
     }
 
@@ -76,8 +92,8 @@ impl EthPriceOracle {
         }
         let updated_at: u64 = round.updatedAt.try_into().unwrap_or(0);
         let age = now_secs().saturating_sub(updated_at);
-        if age > MAX_ANSWER_AGE_SECS {
-            bail!("feed answer is {age}s old (max {MAX_ANSWER_AGE_SECS}s)");
+        if age > self.max_age_secs {
+            bail!("feed answer is {age}s old (max {}s)", self.max_age_secs);
         }
         let raw: f64 = round
             .answer
@@ -263,5 +279,15 @@ mod tests {
             (p.get() - 3000.0).abs() < 1e-6,
             "a bad read must not clobber the last good price"
         );
+    }
+
+    #[test]
+    fn answer_age_follows_each_feeds_heartbeat() {
+        use alloy::primitives::address;
+        let base = address!("0x71041dddad3595f9ced3dccfbe3d1f4b0a16bb70");
+        let eth = address!("0x5f4ec3df9cbd43714fe2740f5e3616155c5b8419");
+        assert_eq!(super::max_answer_age_secs(base), 1_500);
+        assert_eq!(super::max_answer_age_secs(eth), 3_900);
+        assert_eq!(super::max_answer_age_secs(Address::ZERO), super::MAX_ANSWER_AGE_SECS);
     }
 }

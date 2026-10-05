@@ -98,14 +98,17 @@ Global flags: `--config <path>` (TOML), `--log-format json|pretty`.
 
 | Command | Purpose |
 |---|---|
-| `lpa serve [--host --port --db --chain --hook]` | gRPC(-web) API for the SDK (bearer auth via `LPA_API_TOKEN`); `--hook` enables on-chain position enrichment |
+| `lpa serve [--host --port --db --chain --hook --insecure-no-auth]` | gRPC(-web) API for the SDK. Requires `LPA_API_TOKEN` (bearer auth) and refuses to start without it unless `--insecure-no-auth`; `--hook` enables on-chain position enrichment |
 | `lpa watch [--chain --hook --db --execute]` | monitor a chain; `--execute` sends real rebalance txs for indexed positions |
-| `lpa register --pool-id --owner --tick-lower --tick-upper [--fee --tick-spacing]` | track a position off-chain |
+| `lpa register --pool-id --owner --tick-lower --tick-upper [--fee --tick-spacing]` | track a position off-chain (for monitoring: its id is not a hook position id, so it is never rebalanced) |
 | `lpa simulate --position-id` | dry-run the strategy on a stored position |
 | `lpa rebalance --position-id --new-lower --new-upper --hook [--dry-run]` | preflight or execute a single rebalance |
 | `lpa config init\|show\|path` | manage the TOML config file |
 
-Config precedence: CLI flag > env var > config file > built-in default.
+Config precedence: CLI flag > env var > config file > built-in default. Environment
+variables are read from `./.env` in the working directory only, never from a parent
+directory. A strategy config stored for a position with `UpdateConfig` overrides the
+default for that position, including a lower `max_gas_usd` spend cap.
 
 ## Deploy the hook
 
