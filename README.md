@@ -6,11 +6,12 @@ a volatility-aware strategy with an EV gate, and executes the move on-chain
 through a custom v4 hook — with a spend cap, slippage floor, preflight
 simulation, and optional private-orderflow submission.
 
-> Status: research. An internal multi-agent audit is in
-> [`audits/tend-2026-09-20/`](audits/tend-2026-09-20/AUDIT-REPORT.md); both
-> Criticals, all five Highs and most Mediums are fixed. The fixes have **not**
-> been re-audited, and the hook has never been professionally audited. Do not use
-> with real funds. See [Security](#security).
+> Status: research. The hook and daemon have been through four rounds of internal
+> multi-agent audit ([`audits/`](audits/); latest:
+> [`tend-2026-10-03-full`](audits/tend-2026-10-03-full/AUDIT-REPORT.md)). Every
+> finding is fixed or declined with a recorded reason, and every proof of concept
+> runs as a regression test. The hook has never been professionally audited. Do
+> not use with real funds. See [Security](#security).
 
 ## Why
 
@@ -129,16 +130,16 @@ Put the deployed address in `AUTOPILOT_HOOK_ADDRESS`.
 - **Never commit secrets.** `.env` is gitignored; use `.env.example` as the
   template. `REBALANCER_PRIVATE_KEY` in `.env` is for testnet only — use a
   keystore or external signer in production.
-- **Trust model.** The rebalancer key is trusted but only *partly* bounded. It
-  cannot withdraw funds and cannot move a position outside the owner-set tick
-  envelope. It can still churn a position inside that envelope, paying the pool
-  fee each cycle — an audit measured ~0.3%/cycle. The envelope bounds where a
-  position sits, not what a rebalance does to it. `minLiquidity` is **not** a
-  safety valve: it is supplied by the rebalancer itself and bounds a liquidity
-  number rather than value. Pause and the cooldown do work as described.
-  See [`audits/`](audits/) for the full picture before trusting a rebalancer key.
+- **Trust model.** The rebalancer key is trusted but bounded. It cannot withdraw
+  funds and cannot move a position outside the owner-set tick envelope. Each
+  rebalance must keep the position's value, measured at the price reference
+  before and after, within `maxRebalanceLossBps`; no-op rebalances are rejected
+  and the cooldown limits how often it can act. `minLiquidity` is the
+  rebalancer's own floor, not a protection against it. See [`audits/`](audits/)
+  before trusting a rebalancer key.
 - **serve** binds `127.0.0.1` by default and requires a bearer token
-  (`LPA_API_TOKEN`) on every RPC when set.
+  (`LPA_API_TOKEN`) on every RPC; it refuses to start without one unless
+  `--insecure-no-auth` is passed.
 - The executor's spend cap uses a live gas price **and** the chain's Chainlink
   ETH/USD feed, verified by `description()` at connect and rejected when stale.
   The cap requires a *fresh* read and refuses to send a transaction without one,

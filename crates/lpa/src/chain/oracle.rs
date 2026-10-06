@@ -288,6 +288,9 @@ mod tests {
         let eth = address!("0x5f4ec3df9cbd43714fe2740f5e3616155c5b8419");
         assert_eq!(super::max_answer_age_secs(base), 1_500);
         assert_eq!(super::max_answer_age_secs(eth), 3_900);
-        assert_eq!(super::max_answer_age_secs(Address::ZERO), super::MAX_ANSWER_AGE_SECS);
+        assert_eq!(
+            super::max_answer_age_secs(Address::ZERO),
+            super::MAX_ANSWER_AGE_SECS
+        );
     }
 }

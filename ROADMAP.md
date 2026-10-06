@@ -1,6 +1,6 @@
 # LP Autopilot — Build Roadmap
 
-Status: P0–P8 landed. Build is strictly phased; each phase ends in build → test → audit → commit.
+Status: P0–P9 landed. Build is strictly phased; each phase ends in build → test → audit → commit.
 
 Verify the tree with `cargo test --workspace`, `forge test`, and
 `npm run typecheck`; `scripts/e2e.sh` runs the whole loop against an anvil
@@ -85,19 +85,52 @@ are present, so none of them caught it. Fixed by re-ratioing through
 `poolManager.swap` inside the same unlock; the regression tests fail with
 `ZeroLiquidity()` against the old code.
 
+**P9 — Audit and remediation.** Done. Four rounds, each with reviewers working
+from evm-audit-skills checklists and every Medium-or-above finding backed by a PoC
+that was run. Each fix is a regression test that fails against the unfixed code.
+Reports are in `audits/`:
+
+| Round | Report | Outcome |
+|---|---|---|
+| 2026-09-20 | `tend-2026-09-20/AUDIT-REPORT.md` | 8-domain audit of the hook: 2 Critical, 6 High, fixed |
+| 2026-09-23 | `tend-2026-09-23/REMEDIATION-AUDIT.md` | audit of the fixes: 2 regressions found and fixed |
+| 2026-10-03 | `tend-2026-10-03/AUDIT-REPORT.md` | re-audit of the new surface: 2 High, 7 Medium, fixed |
+| 2026-10-03/05 | `tend-2026-10-03-full/AUDIT-REPORT.md` | full codebase, 7 reviewers: 3 High, 9 Medium, fixed |
+
+*What the rounds taught:* a fix's own regression test can share the fix's blind
+spot. The 10-03 price-reference fix passed its test because the test pushed 700
+ticks at once, and the next round broke it with 500-tick steps. Since then each
+fix is checked against the reviewers' original attack *and* against variations
+of it.
+
 ## Still open
 
-- Pool volume (`LPA_VOLUME_USD_PER_BLOCK`) and token1 USD price
-  (`LPA_TOKEN1_USD`) are operator assumptions. Without the latter a position
-  cannot be valued, so the EV gate's IL/slippage/MEV terms stay switched off.
-- Reorg recovery resyncs position lifecycle state from the hook, but tick
-  history from orphaned blocks is not rewound.
-- The hook remains unaudited. The re-ratio swap is new and security-sensitive:
-  it moves funds through the pool inside the rebalance, bounded only by the
-  caller's `minLiquidity` floor.
+- **Residual price-manipulation risk.** An attacker who can hold a pushed price
+  level against arbitrage for `MIN_STABLE_BLOCKS` (5) consecutive block ends gets
+  that level trusted, and every guard measures from it: 342 bps in the harness,
+  which does not model arbitrage. Deep pools make that hold expensive; thin pools
+  do not.
+- **Pools with no liquidity at spot** (LV-2). A third party can keep rebalancing
+  refused there for gas only, because nothing in such a pool is a trustworthy
+  price. Withdraw is unaffected. The daemon bounds its own spend and alerts.
+- **Operator assumptions.** Pool volume (`LPA_VOLUME_USD_PER_BLOCK`) and token1
+  USD price (`LPA_TOKEN1_USD`) are inputs. Without the latter a position can't be
+  valued, so the EV gate's IL, slippage and MEV terms stay off.
+- **Reorgs.** Reorg recovery resyncs position lifecycle state from the hook, but
+  tick history from orphaned blocks is not rewound.
+- **Key handling.** The rebalancer key is read from the environment. Use a
+  keystore or external signer in production.
+- **Approvals.** Depositors approve the hook directly, not through Permit2 (T-5).
+- **External audit.** The rounds above were run inside this project. An
+  independent external audit is still the bar before real funds.
+
+## Decided
+
+- **Target chain:** Base (cheap rebalances), with Ethereum configured. Chain
+  addresses, the sequencer feed and the oracle heartbeats are per chain.
+- **Custody:** the hook custodies liquidity itself in the PoolManager, keyed by
+  salt = positionId, instead of holding an LP NFT from PositionManager.
 
 ## Open questions for later
 
-- Target chain(s) for v1? (affects addresses + gas model — leaning Base for cheap rebalances)
-- Hook execution: route liquidity moves through canonical PositionManager from inside the hook, or self-custody the LP NFT in the hook?
 - Caveman/cavekit: terse output style only, or you run cavekit's validation loop on each phase?
